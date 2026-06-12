@@ -1,0 +1,27 @@
+# build artifacts
+/ccg
+/bin/
+/dist/
+
+# go
+*.test
+*.out
+coverage.*
+*.prof
+go.work
+go.work.sum
+
+# local-only working material
+/docs/
+.env
+.env.*
+
+# editors / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
