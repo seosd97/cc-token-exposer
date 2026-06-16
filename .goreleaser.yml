@@ -1,0 +1,53 @@
+version: 2
+
+project_name: ccx
+
+builds:
+  - id: ccx
+    main: ./cmd/ccx
+    binary: ccx
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: seosd97
+    name: cc-token-exposer
+
+brews:
+  - name: ccx
+    repository:
+      owner: seosd97
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/seosd97/cc-token-exposer
+    description: Zero-config Claude Pro/Max plan credit-limit window tracker
+    license: MIT
+    install: |
+      bin.install "ccx"
+    test: |
+      system "#{bin}/ccx", "version"
