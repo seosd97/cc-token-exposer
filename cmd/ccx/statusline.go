@@ -121,7 +121,6 @@ func formatStatusline(st *schema.State, now time.Time, colored bool) string {
 	return line
 }
 
-
 type statuslineInput struct {
 	RateLimits json.RawMessage `json:"rate_limits"`
 }
