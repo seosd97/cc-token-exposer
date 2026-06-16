@@ -8,17 +8,27 @@ Reads the same authoritative source as Claude Code's built-in `/usage` — no se
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install seosd97/tap/ccx
+```
+
+### Go
+
 ```sh
 go install github.com/seosd97/cc-token-exposer/cmd/ccx@latest
 ```
 
-Or build from source:
+### From source
 
 ```sh
 git clone https://github.com/seosd97/cc-token-exposer
 cd cc-token-exposer
 go build -o ccx ./cmd/ccx
 ```
+
+Prebuilt binaries for macOS and Linux are also attached to each [release](https://github.com/seosd97/cc-token-exposer/releases).
 
 ---
 
