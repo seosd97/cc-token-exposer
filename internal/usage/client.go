@@ -113,12 +113,12 @@ func (c *Client) Fetch(ctx context.Context, token string) (*Snapshot, error) {
 		_ = resp.Body.Close()
 	}()
 
-	switch {
-	case resp.StatusCode == http.StatusOK:
+	switch resp.StatusCode {
+	case http.StatusOK:
 		return c.decode(resp.Body)
-	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
+	case http.StatusUnauthorized, http.StatusForbidden:
 		return nil, fmt.Errorf("%w (status %d)", ErrAuth, resp.StatusCode)
-	case resp.StatusCode == http.StatusTooManyRequests:
+	case http.StatusTooManyRequests:
 		return nil, &RateLimitError{
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), c.now()),
 			StatusCode: resp.StatusCode,
