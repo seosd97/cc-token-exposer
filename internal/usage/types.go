@@ -14,9 +14,10 @@ type ExtraUsage struct {
 }
 
 type Snapshot struct {
-	FetchedAt    time.Time   `json:"fetched_at"`
-	FiveHour     *Window     `json:"five_hour,omitempty"`
-	SevenDay     *Window     `json:"seven_day,omitempty"`
-	SevenDayOpus *Window     `json:"seven_day_opus,omitempty"`
-	ExtraUsage   *ExtraUsage `json:"extra_usage,omitempty"`
+	FetchedAt     time.Time   `json:"fetched_at"`
+	FiveHour      *Window     `json:"five_hour,omitempty"`
+	SevenDay      *Window     `json:"seven_day,omitempty"`
+	SevenDayOpus  *Window     `json:"seven_day_opus,omitempty"`
+	SevenDayFable *Window     `json:"seven_day_fable,omitempty"`
+	ExtraUsage    *ExtraUsage `json:"extra_usage,omitempty"`
 }

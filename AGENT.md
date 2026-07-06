@@ -7,7 +7,8 @@ in-repo source of truth for design decisions and constraints.
 ## What this is
 
 `ccx` is a zero-config CLI that tracks Claude Pro/Max plan credit-limit
-windows (5-hour session, 7-day, 7-day Opus) using the **same authoritative
+windows (5-hour session, 7-day, plus per-model weekly limits like Opus and
+Fable) using the **same authoritative
 source as Claude Code's built-in `/usage`**: the OAuth usage endpoint. It
 reuses Claude Code's existing OAuth token read-only, so if `claude` works on
 the machine, `ccx` works with no setup.
@@ -91,9 +92,19 @@ carrying the best known truth plus its freshness):
 ## Data source notes
 
 - Endpoint: `GET https://api.anthropic.com/api/oauth/usage` — **unofficial**,
-  may change or vanish. Response: `five_hour` / `seven_day` /
-  `seven_day_opus` windows, each `{utilization: 0-100 float, resets_at}`,
-  plus `extra_usage`.
+  may change or vanish. Response carries legacy top-level `five_hour` /
+  `seven_day` / `seven_day_opus` windows, each `{utilization: 0-100 float,
+  resets_at}`, plus `extra_usage`.
+- **Per-model weekly limits live in a newer `limits[]` array**, not in
+  top-level fields. Each entry is `{kind, group, percent, resets_at, scope,
+  is_active}`; scoped-model limits are `kind: "weekly_scoped"` keyed by
+  `scope.model.display_name` (e.g. "Opus", "Fable"). As of 2026-07 the live
+  response sends `seven_day_opus: null` (dead top-level field) and has **no
+  `seven_day_fable` field at all** — Fable usage exists ONLY in `limits[]`.
+  `usage.decode` lifts scoped Opus/Fable out of `limits[]` into
+  `SevenDayOpus` / `SevenDayFable`, falling back to the legacy top-level
+  `seven_day_opus` when `limits[]` is absent (older API/CC versions). Adding
+  another scoped model = one `scopedWindow(..., "Name")` call + a schema field.
 - Token location: `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`,
   `expiresAt` epoch-ms); some machines store it in the macOS Keychain item
   "Claude Code-credentials" instead (creds falls back to `security` CLI).

@@ -15,6 +15,7 @@ func Reconcile(prev, next *Snapshot, now time.Time) *Snapshot {
 	out.FiveHour = reconcileWindow(prev.FiveHour, next.FiveHour, now)
 	out.SevenDay = reconcileWindow(prev.SevenDay, next.SevenDay, now)
 	out.SevenDayOpus = reconcileWindow(prev.SevenDayOpus, next.SevenDayOpus, now)
+	out.SevenDayFable = reconcileWindow(prev.SevenDayFable, next.SevenDayFable, now)
 	return &out
 }
 
