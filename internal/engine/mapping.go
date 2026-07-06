@@ -47,11 +47,12 @@ func mapSnapshot(s *usage.Snapshot) *schema.Snapshot {
 		return nil
 	}
 	return &schema.Snapshot{
-		FetchedAt:    s.FetchedAt,
-		FiveHour:     mapWindow(s.FiveHour),
-		SevenDay:     mapWindow(s.SevenDay),
-		SevenDayOpus: mapWindow(s.SevenDayOpus),
-		ExtraUsage:   mapExtra(s.ExtraUsage),
+		FetchedAt:     s.FetchedAt,
+		FiveHour:      mapWindow(s.FiveHour),
+		SevenDay:      mapWindow(s.SevenDay),
+		SevenDayOpus:  mapWindow(s.SevenDayOpus),
+		SevenDayFable: mapWindow(s.SevenDayFable),
+		ExtraUsage:    mapExtra(s.ExtraUsage),
 	}
 }
 

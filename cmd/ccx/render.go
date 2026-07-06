@@ -28,9 +28,10 @@ func renderHuman(st *schema.State, now time.Time) string {
 
 	var b strings.Builder
 	if s := st.Snapshot; s != nil {
-		writeWindow(&b, "5h  ", s.FiveHour, now)
-		writeWindow(&b, "7d  ", s.SevenDay, now)
-		writeWindow(&b, "Opus", s.SevenDayOpus, now)
+		writeWindow(&b, "5h   ", s.FiveHour, now)
+		writeWindow(&b, "7d   ", s.SevenDay, now)
+		writeWindow(&b, "Opus ", s.SevenDayOpus, now)
+		writeWindow(&b, "Fable", s.SevenDayFable, now)
 		if s.ExtraUsage != nil && s.ExtraUsage.Utilization != nil {
 			fmt.Fprintf(&b, "extra %d%%\n", int(math.Round(*s.ExtraUsage.Utilization)))
 		}

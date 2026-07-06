@@ -88,6 +88,15 @@ func TestReconcile(t *testing.T) {
 		}
 	})
 
+	t.Run("scoped fable window reconciles like the others", func(t *testing.T) {
+		prev := &Snapshot{SevenDayFable: win(90, future)}
+		next := &Snapshot{SevenDayFable: win(40, future)} // 50pt drop, suspect
+		got := Reconcile(prev, next, now)
+		if got.SevenDayFable.Utilization != 90 || !got.SevenDayFable.Suspect {
+			t.Errorf("seven_day_fable = %+v, want retained 90 suspect", got.SevenDayFable)
+		}
+	})
+
 	t.Run("per-window independence", func(t *testing.T) {
 		prev := &Snapshot{
 			FiveHour: win(90, future),

@@ -94,6 +94,80 @@ func TestFetchOK(t *testing.T) {
 	}
 }
 
+// scopedLimitsBody mirrors the current live endpoint, which no longer fills the
+// top-level seven_day_opus (it sends null) and instead carries per-model weekly
+// limits in a limits[] array keyed by scope.model.display_name. Fable has no
+// top-level field at all — limits[] is its only source.
+const scopedLimitsBody = `{
+  "five_hour":      {"utilization": 19.0, "resets_at": "2026-07-06T07:19:59Z"},
+  "seven_day":      {"utilization": 58.0, "resets_at": "2026-07-08T20:59:59Z"},
+  "seven_day_opus": null,
+  "seven_day_fable": null,
+  "extra_usage":    {"is_enabled": false, "utilization": null},
+  "limits": [
+    {"kind": "session",        "group": "session", "percent": 19, "severity": "normal",   "resets_at": "2026-07-06T07:19:59Z", "scope": null, "is_active": false},
+    {"kind": "weekly_all",     "group": "weekly",  "percent": 58, "severity": "normal",   "resets_at": "2026-07-08T20:59:59Z", "scope": null, "is_active": false},
+    {"kind": "weekly_scoped",  "group": "weekly",  "percent": 30, "severity": "normal",   "resets_at": "2026-07-08T20:59:59Z", "scope": {"model": {"display_name": "Opus"}}, "is_active": true},
+    {"kind": "weekly_scoped",  "group": "weekly",  "percent": 94, "severity": "critical", "resets_at": "2026-07-08T20:59:59Z", "scope": {"model": {"display_name": "Fable"}}, "is_active": true}
+  ]
+}`
+
+func TestFetchParsesScopedLimits(t *testing.T) {
+	now := time.Date(2026, 7, 6, 5, 30, 0, 0, time.UTC)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(scopedLimitsBody))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, now)
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	// Fable exists only in limits[]; it must be lifted into SevenDayFable.
+	if snap.SevenDayFable == nil || snap.SevenDayFable.Utilization != 94 {
+		t.Errorf("seven_day_fable = %+v, want utilization 94 from limits[]", snap.SevenDayFable)
+	}
+	wantReset := time.Date(2026, 7, 8, 20, 59, 59, 0, time.UTC)
+	if snap.SevenDayFable == nil || !snap.SevenDayFable.ResetsAt.Equal(wantReset) {
+		t.Errorf("fable resets_at = %v, want %v", snap.SevenDayFable.ResetsAt, wantReset)
+	}
+	// limits[] scoped Opus must win over the null top-level seven_day_opus.
+	if snap.SevenDayOpus == nil || snap.SevenDayOpus.Utilization != 30 {
+		t.Errorf("seven_day_opus = %+v, want 30 sourced from limits[]", snap.SevenDayOpus)
+	}
+	if snap.FiveHour == nil || snap.FiveHour.Utilization != 19 {
+		t.Errorf("five_hour = %+v, want 19", snap.FiveHour)
+	}
+	if snap.SevenDay == nil || snap.SevenDay.Utilization != 58 {
+		t.Errorf("seven_day = %+v, want 58", snap.SevenDay)
+	}
+}
+
+func TestFetchScopedLimitsAbsentLeavesWindowsNil(t *testing.T) {
+	// A response with neither a top-level fable field nor a Fable limits[] entry
+	// must leave SevenDayFable nil (so the window is simply omitted downstream).
+	now := time.Date(2026, 7, 6, 5, 30, 0, 0, time.UTC)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(sampleBody))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, now)
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if snap.SevenDayFable != nil {
+		t.Errorf("seven_day_fable = %+v, want nil when absent", snap.SevenDayFable)
+	}
+	// The legacy top-level seven_day_opus is still honored when limits[] is absent.
+	if snap.SevenDayOpus == nil || snap.SevenDayOpus.Utilization != 10 {
+		t.Errorf("seven_day_opus = %+v, want 10 from top-level fallback", snap.SevenDayOpus)
+	}
+}
+
 func TestFetchEmptyToken(t *testing.T) {
 	c := New()
 	_, err := c.Fetch(context.Background(), "")

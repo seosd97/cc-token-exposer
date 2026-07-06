@@ -38,10 +38,14 @@ Prebuilt binaries for macOS and Linux are also attached to each [release](https:
 
 ```
 $ ccx now
-5h    47% · resets in 3h35m
-7d    23% · resets in 3d16h
+5h     47% · resets in 3h35m
+7d     23% · resets in 3d16h
+Fable  94% · resets in 2d15h
 source: live
 ```
+
+Per-model weekly limits (Opus, Fable) appear as their own rows when the plan
+reports them; they are omitted when unused.
 
 JSON output for scripts:
 
@@ -56,7 +60,7 @@ $ ccx now --json
 Prints a single line for the Claude Code statusline:
 
 ```
-◷ 5h ▮▮▯▯▯ 47% ↻ 3h50m · ◷ 7d ▮▯▯▯▯ 23% ↻ 3d16h · ✦ opus ▯▯▯▯▯ 5% ↻ 3d16h
+◷ 5h ▮▮▯▯▯ 47% ↻ 3h50m · ◷ 7d ▮▯▯▯▯ 23% ↻ 3d16h · ✧ fable ▮▮▮▮▮ 94% ↻ 2d15h
 ```
 
 Register in `~/.claude/settings.json`:

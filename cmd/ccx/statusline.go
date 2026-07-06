@@ -83,7 +83,7 @@ func formatStatusline(st *schema.State, now time.Time, colored bool) string {
 			icon  string
 			label string
 			w     *schema.Window
-		}{{"◷", "5h", s.FiveHour}, {"◷", "7d", s.SevenDay}, {"✦", "opus", s.SevenDayOpus}} {
+		}{{"◷", "5h", s.FiveHour}, {"◷", "7d", s.SevenDay}, {"✦", "opus", s.SevenDayOpus}, {"✧", "fable", s.SevenDayFable}} {
 			if win.w == nil {
 				continue
 			}

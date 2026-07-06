@@ -128,14 +128,62 @@ func (c *Client) Fetch(ctx context.Context, token string) (*Snapshot, error) {
 	}
 }
 
+type apiResponse struct {
+	FiveHour      *Window      `json:"five_hour"`
+	SevenDay      *Window      `json:"seven_day"`
+	SevenDayOpus  *Window      `json:"seven_day_opus"`
+	SevenDayFable *Window      `json:"seven_day_fable"`
+	ExtraUsage    *ExtraUsage  `json:"extra_usage"`
+	Limits        []limitEntry `json:"limits"`
+}
+
+type limitEntry struct {
+	Kind     string    `json:"kind"`
+	Group    string    `json:"group"`
+	Percent  float64   `json:"percent"`
+	ResetsAt time.Time `json:"resets_at"`
+	Scope    *struct {
+		Model *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+	} `json:"scope"`
+}
+
 func (c *Client) decode(body io.Reader) (*Snapshot, error) {
-	var snap Snapshot
+	var r apiResponse
 	dec := json.NewDecoder(io.LimitReader(body, maxBodyBytes))
-	if err := dec.Decode(&snap); err != nil {
+	if err := dec.Decode(&r); err != nil {
 		return nil, fmt.Errorf("%w: decode usage response: %v", ErrTransient, err)
 	}
-	snap.FetchedAt = c.now()
-	return &snap, nil
+	snap := &Snapshot{
+		FetchedAt:     c.now(),
+		FiveHour:      r.FiveHour,
+		SevenDay:      r.SevenDay,
+		SevenDayOpus:  r.SevenDayOpus,
+		SevenDayFable: r.SevenDayFable,
+		ExtraUsage:    r.ExtraUsage,
+	}
+	if w := scopedWindow(r.Limits, "Opus"); w != nil {
+		snap.SevenDayOpus = w
+	}
+	if w := scopedWindow(r.Limits, "Fable"); w != nil {
+		snap.SevenDayFable = w
+	}
+	return snap, nil
+}
+
+// scopedWindow extracts a per-model weekly limit from the limits[] array,
+// matching the scope model display name (case-insensitive); nil if absent.
+func scopedWindow(limits []limitEntry, model string) *Window {
+	for _, l := range limits {
+		if l.Scope == nil || l.Scope.Model == nil {
+			continue
+		}
+		if strings.EqualFold(l.Scope.Model.DisplayName, model) {
+			return &Window{Utilization: l.Percent, ResetsAt: l.ResetsAt}
+		}
+	}
+	return nil
 }
 
 // parseRetryAfter interprets a Retry-After header (seconds or HTTP-date);

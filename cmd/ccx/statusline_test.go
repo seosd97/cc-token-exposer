@@ -63,6 +63,18 @@ func TestFormatStatusline(t *testing.T) {
 			want: "◷ 5h ▮▯▯▯▯ 10% ↻ 4h12m · ◷ 7d ▮▯▯▯▯ 20% ↻ 3d0h · ✦ opus ▯▯▯▯▯ 5% ↻ 3d0h",
 		},
 		{
+			name: "includes fable window",
+			st: &schema.State{
+				Auth: schema.AuthOK,
+				Snapshot: &schema.Snapshot{
+					FiveHour:      win(10, reset5h),
+					SevenDay:      win(20, reset7d),
+					SevenDayFable: win(94, reset7d),
+				},
+			},
+			want: "◷ 5h ▮▯▯▯▯ 10% ↻ 4h12m · ◷ 7d ▮▯▯▯▯ 20% ↻ 3d0h · ✧ fable ▮▮▮▮▮ 94% ↻ 3d0h",
+		},
+		{
 			name: "stale prefixes approx sign",
 			st: &schema.State{
 				Auth:  schema.AuthOK,
