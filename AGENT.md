@@ -57,8 +57,12 @@ internal/
   schema/      The wire contract (State, schema_version=1). Leaf package,
                imports nothing internal. The PUBLIC CONTRACT is the JSON
                emitted by `now --json`, not the Go types (internal/ blocks
-               external import by design).
+               external import by design). ScopedLimits (map[string]*Window)
+               is additive over schema_version=1; seven_day_opus/fable remain
+               as backward-compat aliases.
   usage/       oauth/usage HTTP client + Reconcile consistency guard.
+               decode populates Snapshot.ScopedLimits dynamically from all
+               weekly_scoped entries in limits[]; no model name is hardcoded.
   creds/       credential acquisition: file > macOS keychain shell-out.
   cache/       flock-protected, atomic-write disk cache of opaque JSON.
   transcript/  last-resort fallback: parses limit-hit messages from
@@ -99,7 +103,9 @@ carrying the best known truth plus its freshness):
 6. **Wire stability.** `schema.State` (schema_version=1) is the public
    contract. Changes must be additive (new optional fields); breaking changes
    bump the version. `utilization` is float64 on the wire (the real API sends
-   fractionals); round only at display time.
+   fractionals); round only at display time. `scoped_limits`
+   (map[string]*Window) was added additively; `seven_day_opus` /
+   `seven_day_fable` remain as aliases for backward compat.
 7. **Transcript files are read-only.** Never write under `~/.claude/`.
 
 ## Data source notes
@@ -111,13 +117,17 @@ carrying the best known truth plus its freshness):
 - **Per-model weekly limits live in a newer `limits[]` array**, not in
   top-level fields. Each entry is `{kind, group, percent, resets_at, scope,
   is_active}`; scoped-model limits are `kind: "weekly_scoped"` keyed by
-  `scope.model.display_name` (e.g. "Opus", "Fable"). As of 2026-07 the live
-  response sends `seven_day_opus: null` (dead top-level field) and has **no
-  `seven_day_fable` field at all** — Fable usage exists ONLY in `limits[]`.
-  `usage.decode` lifts scoped Opus/Fable out of `limits[]` into
-  `SevenDayOpus` / `SevenDayFable`, falling back to the legacy top-level
-  `seven_day_opus` when `limits[]` is absent (older API/CC versions). Adding
-  another scoped model = one `scopedWindow(..., "Name")` call + a schema field.
+  `scope.model.display_name` (e.g. "Opus", "Fable", "Sonnet"). `usage.decode`
+  lifts **all** `weekly_scoped` entries into `Snapshot.ScopedLimits`
+  (`map[string]*Window`) dynamically — no model name is hardcoded. The legacy
+  top-level `seven_day_opus` is used as a fallback when `limits[]` is absent
+  (older API/CC versions). The wire contract (`schema.Snapshot`) keeps
+  `seven_day_opus` / `seven_day_fable` as additive aliases of
+  `ScopedLimits["Opus"]` / `ScopedLimits["Fable"]` for backward compat with
+  existing `--json` consumers; new models appear only in `scoped_limits`.
+  As of 2026-07 the live response also sends `seven_day_sonnet`,
+  `seven_day_cowork`, `seven_day_omelette` (all null) and several codename
+  fields (`tangelo`, `iguana_necktie`, etc.) — all ignored.
 - Token location: `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`,
   `expiresAt` epoch-ms); some machines store it in the macOS Keychain item
   "Claude Code-credentials" instead (creds falls back to `security` CLI).

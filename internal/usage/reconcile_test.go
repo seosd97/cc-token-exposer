@@ -88,12 +88,24 @@ func TestReconcile(t *testing.T) {
 		}
 	})
 
-	t.Run("scoped fable window reconciles like the others", func(t *testing.T) {
-		prev := &Snapshot{SevenDayFable: win(90, future)}
-		next := &Snapshot{SevenDayFable: win(40, future)} // 50pt drop, suspect
+	t.Run("scoped window reconciles like the others", func(t *testing.T) {
+		prev := &Snapshot{ScopedLimits: map[string]*Window{"Fable": win(90, future)}}
+		next := &Snapshot{ScopedLimits: map[string]*Window{"Fable": win(40, future)}}
 		got := Reconcile(prev, next, now)
-		if got.SevenDayFable.Utilization != 90 || !got.SevenDayFable.Suspect {
-			t.Errorf("seven_day_fable = %+v, want retained 90 suspect", got.SevenDayFable)
+		if w := got.ScopedLimits["Fable"]; w == nil || w.Utilization != 90 || !w.Suspect {
+			t.Errorf("scoped_limits[Fable] = %+v, want retained 90 suspect", w)
+		}
+	})
+
+	t.Run("scoped key disappears from next is dropped", func(t *testing.T) {
+		prev := &Snapshot{ScopedLimits: map[string]*Window{"Fable": win(90, future)}}
+		next := &Snapshot{ScopedLimits: map[string]*Window{"Opus": win(40, future)}}
+		got := Reconcile(prev, next, now)
+		if _, ok := got.ScopedLimits["Fable"]; ok {
+			t.Errorf("Fable should be dropped when absent from next")
+		}
+		if w := got.ScopedLimits["Opus"]; w == nil || w.Utilization != 40 {
+			t.Errorf("scoped_limits[Opus] = %+v, want 40", w)
 		}
 	})
 

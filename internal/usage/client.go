@@ -15,7 +15,7 @@ import (
 const (
 	DefaultEndpoint = "https://api.anthropic.com/api/oauth/usage"
 
-	DefaultUserAgent = "claude-code/2.0.14"
+	DefaultUserAgent = "claude-code/2.1.216"
 
 	betaVersion = "oauth-2025-04-20"
 
@@ -129,12 +129,11 @@ func (c *Client) Fetch(ctx context.Context, token string) (*Snapshot, error) {
 }
 
 type apiResponse struct {
-	FiveHour      *Window      `json:"five_hour"`
-	SevenDay      *Window      `json:"seven_day"`
-	SevenDayOpus  *Window      `json:"seven_day_opus"`
-	SevenDayFable *Window      `json:"seven_day_fable"`
-	ExtraUsage    *ExtraUsage  `json:"extra_usage"`
-	Limits        []limitEntry `json:"limits"`
+	FiveHour     *Window      `json:"five_hour"`
+	SevenDay     *Window      `json:"seven_day"`
+	SevenDayOpus *Window      `json:"seven_day_opus"`
+	ExtraUsage   *ExtraUsage  `json:"extra_usage"`
+	Limits       []limitEntry `json:"limits"`
 }
 
 type limitEntry struct {
@@ -155,35 +154,37 @@ func (c *Client) decode(body io.Reader) (*Snapshot, error) {
 	if err := dec.Decode(&r); err != nil {
 		return nil, fmt.Errorf("%w: decode usage response: %v", ErrTransient, err)
 	}
+	scoped := decodeScopedLimits(r.Limits)
+	if r.SevenDayOpus != nil {
+		if _, ok := scoped["Opus"]; !ok {
+			if scoped == nil {
+				scoped = make(map[string]*Window)
+			}
+			scoped["Opus"] = r.SevenDayOpus
+		}
+	}
 	snap := &Snapshot{
-		FetchedAt:     c.now(),
-		FiveHour:      r.FiveHour,
-		SevenDay:      r.SevenDay,
-		SevenDayOpus:  r.SevenDayOpus,
-		SevenDayFable: r.SevenDayFable,
-		ExtraUsage:    r.ExtraUsage,
-	}
-	if w := scopedWindow(r.Limits, "Opus"); w != nil {
-		snap.SevenDayOpus = w
-	}
-	if w := scopedWindow(r.Limits, "Fable"); w != nil {
-		snap.SevenDayFable = w
+		FetchedAt:    c.now(),
+		FiveHour:     r.FiveHour,
+		SevenDay:     r.SevenDay,
+		ScopedLimits: scoped,
+		ExtraUsage:   r.ExtraUsage,
 	}
 	return snap, nil
 }
 
-// scopedWindow extracts a per-model weekly limit from the limits[] array,
-// matching the scope model display name (case-insensitive); nil if absent.
-func scopedWindow(limits []limitEntry, model string) *Window {
+func decodeScopedLimits(limits []limitEntry) map[string]*Window {
+	var m map[string]*Window
 	for _, l := range limits {
-		if l.Scope == nil || l.Scope.Model == nil {
+		if l.Scope == nil || l.Scope.Model == nil || l.Scope.Model.DisplayName == "" {
 			continue
 		}
-		if strings.EqualFold(l.Scope.Model.DisplayName, model) {
-			return &Window{Utilization: l.Percent, ResetsAt: l.ResetsAt}
+		if m == nil {
+			m = make(map[string]*Window)
 		}
+		m[l.Scope.Model.DisplayName] = &Window{Utilization: l.Percent, ResetsAt: l.ResetsAt}
 	}
-	return nil
+	return m
 }
 
 // parseRetryAfter interprets a Retry-After header (seconds or HTTP-date);

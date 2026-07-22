@@ -46,14 +46,31 @@ func mapSnapshot(s *usage.Snapshot) *schema.Snapshot {
 	if s == nil {
 		return nil
 	}
-	return &schema.Snapshot{
-		FetchedAt:     s.FetchedAt,
-		FiveHour:      mapWindow(s.FiveHour),
-		SevenDay:      mapWindow(s.SevenDay),
-		SevenDayOpus:  mapWindow(s.SevenDayOpus),
-		SevenDayFable: mapWindow(s.SevenDayFable),
-		ExtraUsage:    mapExtra(s.ExtraUsage),
+	snap := &schema.Snapshot{
+		FetchedAt:    s.FetchedAt,
+		FiveHour:     mapWindow(s.FiveHour),
+		SevenDay:     mapWindow(s.SevenDay),
+		ScopedLimits: mapScoped(s.ScopedLimits),
+		ExtraUsage:   mapExtra(s.ExtraUsage),
 	}
+	if w, ok := snap.ScopedLimits["Opus"]; ok {
+		snap.SevenDayOpus = w
+	}
+	if w, ok := snap.ScopedLimits["Fable"]; ok {
+		snap.SevenDayFable = w
+	}
+	return snap
+}
+
+func mapScoped(m map[string]*usage.Window) map[string]*schema.Window {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]*schema.Window, len(m))
+	for k, w := range m {
+		out[k] = mapWindow(w)
+	}
+	return out
 }
 
 func mapWindow(w *usage.Window) *schema.Window {

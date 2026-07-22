@@ -79,21 +79,22 @@ func formatStatusline(st *schema.State, now time.Time, colored bool) string {
 
 	var parts []string
 	if s := st.Snapshot; s != nil {
-		for _, win := range []struct {
+		for _, e := range []struct {
 			icon  string
 			label string
 			w     *schema.Window
-		}{{"◷", "5h", s.FiveHour}, {"◷", "7d", s.SevenDay}, {"✦", "opus", s.SevenDayOpus}, {"✧", "fable", s.SevenDayFable}} {
-			if win.w == nil {
-				continue
+		}{
+			{"◷", "5h", s.FiveHour},
+			{"◷", "7d", s.SevenDay},
+		} {
+			if seg := statusSegment(e.icon, e.label, e.w, now, paintWindows); seg != "" {
+				parts = append(parts, seg)
 			}
-			head := paint(win.icon+" "+win.label, ansiGray, paintWindows)
-			gaugeAndPct := fmt.Sprintf("%s %d%%", gauge(win.w.Utilization), pct(win.w.Utilization))
-			seg := paint(gaugeAndPct, utilColor(win.w.Utilization), paintWindows)
-			if win.w.ResetsAt.After(now) {
-				seg += " " + paint("↻ "+humanizeDuration(win.w.ResetsAt.Sub(now)), ansiGray, paintWindows)
+		}
+		for _, name := range sortedScopedNames(s.ScopedLimits) {
+			if seg := statusSegment("✧", strings.ToLower(name), s.ScopedLimits[name], now, paintWindows); seg != "" {
+				parts = append(parts, seg)
 			}
-			parts = append(parts, head+" "+seg)
 		}
 	}
 
@@ -119,6 +120,19 @@ func formatStatusline(st *schema.State, now time.Time, colored bool) string {
 		line = paint("≈ "+line, ansiGray, colored)
 	}
 	return line
+}
+
+func statusSegment(icon, label string, w *schema.Window, now time.Time, colored bool) string {
+	if w == nil {
+		return ""
+	}
+	head := paint(icon+" "+label, ansiGray, colored)
+	gaugeAndPct := fmt.Sprintf("%s %d%%", gauge(w.Utilization), pct(w.Utilization))
+	seg := paint(gaugeAndPct, utilColor(w.Utilization), colored)
+	if w.ResetsAt.After(now) {
+		seg += " " + paint("↻ "+humanizeDuration(w.ResetsAt.Sub(now)), ansiGray, colored)
+	}
+	return head + " " + seg
 }
 
 type statuslineInput struct {

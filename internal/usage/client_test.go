@@ -86,8 +86,8 @@ func TestFetchOK(t *testing.T) {
 	if snap.SevenDay == nil || snap.SevenDay.Utilization != 41 {
 		t.Errorf("seven_day = %+v, want utilization 41", snap.SevenDay)
 	}
-	if snap.SevenDayOpus == nil || snap.SevenDayOpus.Utilization != 10 {
-		t.Errorf("seven_day_opus = %+v, want utilization 10", snap.SevenDayOpus)
+	if w := snap.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
+		t.Errorf("scoped_limits[Opus] = %+v, want utilization 10 (legacy top-level fallback)", w)
 	}
 	if snap.ExtraUsage == nil || snap.ExtraUsage.Utilization == nil || *snap.ExtraUsage.Utilization != 5 {
 		t.Errorf("extra_usage = %+v, want utilization 5", snap.ExtraUsage)
@@ -125,17 +125,18 @@ func TestFetchParsesScopedLimits(t *testing.T) {
 		t.Fatalf("Fetch: %v", err)
 	}
 
-	// Fable exists only in limits[]; it must be lifted into SevenDayFable.
-	if snap.SevenDayFable == nil || snap.SevenDayFable.Utilization != 94 {
-		t.Errorf("seven_day_fable = %+v, want utilization 94 from limits[]", snap.SevenDayFable)
+	if len(snap.ScopedLimits) != 2 {
+		t.Fatalf("scoped_limits has %d entries, want 2", len(snap.ScopedLimits))
+	}
+	if w := snap.ScopedLimits["Fable"]; w == nil || w.Utilization != 94 {
+		t.Errorf("scoped_limits[Fable] = %+v, want utilization 94 from limits[]", w)
 	}
 	wantReset := time.Date(2026, 7, 8, 20, 59, 59, 0, time.UTC)
-	if snap.SevenDayFable == nil || !snap.SevenDayFable.ResetsAt.Equal(wantReset) {
-		t.Errorf("fable resets_at = %v, want %v", snap.SevenDayFable.ResetsAt, wantReset)
+	if w := snap.ScopedLimits["Fable"]; w == nil || !w.ResetsAt.Equal(wantReset) {
+		t.Errorf("fable resets_at = %v, want %v", snap.ScopedLimits["Fable"], wantReset)
 	}
-	// limits[] scoped Opus must win over the null top-level seven_day_opus.
-	if snap.SevenDayOpus == nil || snap.SevenDayOpus.Utilization != 30 {
-		t.Errorf("seven_day_opus = %+v, want 30 sourced from limits[]", snap.SevenDayOpus)
+	if w := snap.ScopedLimits["Opus"]; w == nil || w.Utilization != 30 {
+		t.Errorf("scoped_limits[Opus] = %+v, want 30 sourced from limits[]", w)
 	}
 	if snap.FiveHour == nil || snap.FiveHour.Utilization != 19 {
 		t.Errorf("five_hour = %+v, want 19", snap.FiveHour)
@@ -146,8 +147,6 @@ func TestFetchParsesScopedLimits(t *testing.T) {
 }
 
 func TestFetchScopedLimitsAbsentLeavesWindowsNil(t *testing.T) {
-	// A response with neither a top-level fable field nor a Fable limits[] entry
-	// must leave SevenDayFable nil (so the window is simply omitted downstream).
 	now := time.Date(2026, 7, 6, 5, 30, 0, 0, time.UTC)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(sampleBody))
@@ -159,12 +158,42 @@ func TestFetchScopedLimitsAbsentLeavesWindowsNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if snap.SevenDayFable != nil {
-		t.Errorf("seven_day_fable = %+v, want nil when absent", snap.SevenDayFable)
+	if _, ok := snap.ScopedLimits["Fable"]; ok {
+		t.Errorf("scoped_limits[Fable] should be absent, got %+v", snap.ScopedLimits["Fable"])
 	}
-	// The legacy top-level seven_day_opus is still honored when limits[] is absent.
-	if snap.SevenDayOpus == nil || snap.SevenDayOpus.Utilization != 10 {
-		t.Errorf("seven_day_opus = %+v, want 10 from top-level fallback", snap.SevenDayOpus)
+	if w := snap.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
+		t.Errorf("scoped_limits[Opus] = %+v, want 10 from top-level fallback", w)
+	}
+}
+
+func TestFetchDynamicScopedModels(t *testing.T) {
+	now := time.Date(2026, 7, 6, 5, 30, 0, 0, time.UTC)
+	body := `{
+	  "five_hour": {"utilization": 5.0, "resets_at": "2026-07-06T07:00:00Z"},
+	  "seven_day": {"utilization": 10.0, "resets_at": "2026-07-08T20:59:59Z"},
+	  "limits": [
+	    {"kind": "weekly_scoped", "group": "weekly", "percent": 33, "resets_at": "2026-07-08T20:59:59Z", "scope": {"model": {"display_name": "Sonnet"}}, "is_active": true},
+	    {"kind": "weekly_scoped", "group": "weekly", "percent": 88, "resets_at": "2026-07-08T20:59:59Z", "scope": {"model": {"display_name": "Cowork"}}, "is_active": true}
+	  ]
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, now)
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.ScopedLimits) != 2 {
+		t.Fatalf("scoped_limits has %d entries, want 2", len(snap.ScopedLimits))
+	}
+	if w := snap.ScopedLimits["Sonnet"]; w == nil || w.Utilization != 33 {
+		t.Errorf("scoped_limits[Sonnet] = %+v, want 33", w)
+	}
+	if w := snap.ScopedLimits["Cowork"]; w == nil || w.Utilization != 88 {
+		t.Errorf("scoped_limits[Cowork] = %+v, want 88", w)
 	}
 }
 

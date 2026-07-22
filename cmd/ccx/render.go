@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -10,6 +11,15 @@ import (
 )
 
 func pct(u float64) int { return int(math.Round(u)) }
+
+func sortedScopedNames(m map[string]*schema.Window) []string {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
 
 func renderHuman(st *schema.State, now time.Time) string {
 	if st == nil {
@@ -30,8 +40,9 @@ func renderHuman(st *schema.State, now time.Time) string {
 	if s := st.Snapshot; s != nil {
 		writeWindow(&b, "5h   ", s.FiveHour, now)
 		writeWindow(&b, "7d   ", s.SevenDay, now)
-		writeWindow(&b, "Opus ", s.SevenDayOpus, now)
-		writeWindow(&b, "Fable", s.SevenDayFable, now)
+		for _, name := range sortedScopedNames(s.ScopedLimits) {
+			writeWindow(&b, fmt.Sprintf("%-5s", name), s.ScopedLimits[name], now)
+		}
 		if s.ExtraUsage != nil && s.ExtraUsage.Utilization != nil {
 			fmt.Fprintf(&b, "extra %d%%\n", int(math.Round(*s.ExtraUsage.Utilization)))
 		}
