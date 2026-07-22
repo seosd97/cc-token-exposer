@@ -18,11 +18,19 @@ limits and drift from the real lockout; linuxlewis/claude-usage uses
 authoritative values but requires manually extracted browser cookies. `ccx`
 gives authoritative numbers with zero setup.
 
-**v1 scope (current, deliberately minimal): exactly two commands.**
+**v1 scope (current, deliberately minimal): two usage commands plus
+housekeeping.**
 
 - `ccx now [--json]` — one-shot lookup (human or single-line JSON)
 - `ccx statusline` — one-line output for the Claude Code statusline
   (registered via `~/.claude/settings.json` → `statusLine.command`)
+- `ccx version` — print the injected build version
+- `ccx update [--check]` — self-update to the latest GitHub release
+  (download the matching release archive, verify its SHA-256 against
+  `checksums.txt`, atomically replace the running binary). `--check` only
+  reports whether a newer version exists. Homebrew installs defer to
+  `brew upgrade`. This is a *binary* update; it never touches OAuth
+  credentials (unrelated to invariant #3's "no self refresh").
 
 Removed from v1 after working implementations existed (preserved in git
 history, planned to return in v2): `ccx watch` (NDJSON polling stream),
@@ -37,7 +45,12 @@ cmd/ccx/main.go      composition root: builds the ONE production engine and
                      injects it into commands as a `resolver` interface
 cmd/ccx/now.go       rendering + exit-code policy
 cmd/ccx/statusline.go  statusline formatting + opportunistic stdin rate_limits
+cmd/ccx/update.go    self-update command (thin) over internal/selfupdate
 internal/
+  selfupdate/  GitHub-release self-update: Latest (releases/latest) ->
+               FetchAsset -> VerifyChecksum (checksums.txt) -> ExtractBinary
+               (tar.gz) -> Apply (atomic rename over os.Executable). Stdlib
+               only; injectable http client + apiBase + platform for tests.
   engine/      THE BRAIN. Resolve(ctx) -> *schema.State, runs the degrade
                ladder. Depends only on 5 consumer-side interfaces it defines:
                CredResolver / Fetcher / Cache / TranscriptProbe / Clock.

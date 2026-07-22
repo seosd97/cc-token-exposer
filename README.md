@@ -71,6 +71,22 @@ Register in `~/.claude/settings.json`:
 
 Gauges turn muted yellow at ≥60% and red above 85%. A leading `≈` marks stale cached data; `⚠ login` means credentials need attention. Set `NO_COLOR` to disable ANSI.
 
+### `ccx update`
+
+Self-update to the latest GitHub release:
+
+```
+$ ccx update
+current: v0.1.0
+latest:  v0.2.0
+downloading ccx_darwin_arm64.tar.gz ...
+verifying checksum ... ok
+replacing /Users/you/go/bin/ccx ...
+updated v0.1.0 -> v0.2.0
+```
+
+It checks the latest release, downloads the binary for your OS/arch, verifies its SHA-256 against `checksums.txt`, and atomically replaces the running executable. Use `--check` to only report whether a newer version exists. Homebrew installs are left to `brew upgrade ccx`.
+
 ---
 
 ## How it works
