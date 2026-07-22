@@ -71,6 +71,7 @@ func main() {
 
 	root.AddCommand(newNowCmd(eng))
 	root.AddCommand(newStatuslineCmd(eng))
+	root.AddCommand(newUpdateCmd(defaultUpdater()))
 
 	if err := root.Execute(); err != nil {
 		if !errors.Is(err, errSilentExit) {
