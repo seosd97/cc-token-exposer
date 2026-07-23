@@ -82,12 +82,16 @@ carrying the best known truth plus its freshness):
    otherwise `auth: "expired"` (still with stale data if available).
 5. No cache at all → transcript limit-hit probe → else error State.
 
-ResolveStdin (statusline only) bypasses the ladder: the parsed stdin
-snapshot is overlaid on the cache (`usage.Overlay` — per window, stdin wins,
-gaps fill from cache, ExtraUsage always from the fresh side) and served with
-`source: "stdin"`. It NEVER calls the API and never writes the cache; the
-disk-cache read is its only I/O. Cache-sourced windows from a cache older
-than the TTL mark the state stale.
+ResolveStdin (statusline only) overlays the parsed stdin snapshot on the cache
+(`usage.Overlay` — per window, stdin wins, gaps fill from cache, ExtraUsage
+always from the fresh side) and serves it with `source: "stdin"`. When stdin is
+incomplete and the cache is stale it does one bounded refresh (≤1/TTL, reusing
+`resolveToken`/`fetchWithToken` + `Reconcile` + `storeCache`) to heal the gaps,
+then re-overlays; on refresh failure it serves the cache-backed merge marked
+`stale`. Cache-sourced windows older than the TTL mark the state stale. No
+suspect guard runs here — the statusline mirrors Claude Code's own displayed
+values; the ≥30pt-drop guard (`Reconcile`) and its `(suspect)` marker live on
+the ladder (`now`), where the marker is actually visible.
 
 ## Invariants — do not break these
 
@@ -95,8 +99,10 @@ than the TTL mark the state stale.
    seconds. Within the cache TTL ccx must NEVER touch the API; the disk cache
    (+ flock) caps request volume at ~1 per TTL across ALL invocations.
    Breaking this gets the user rate-limited (the endpoint 429s aggressively).
-   The stdin rate_limits path is stricter still: it never calls the API at
-   all — a disk-cache read to fill windows stdin lacks is its only I/O.
+   The stdin rate_limits path keeps that cap: it does at most one bounded
+   refresh per TTL, and only when stdin is incomplete AND the cache is stale;
+   a complete stdin snapshot means zero calls. Both paths share the flock'd
+   cache, so the overall bound holds.
 2. **Token hygiene.** The OAuth token is read-only and in-memory only. It must
    never appear in logs, error messages, the cache file, test fixtures, or
    `String()` output (creds redacts). The cache stores only
@@ -238,3 +244,13 @@ go vet ./... && gofmt -l .
 - `utilization` int → float64 after a live API test caught fractional values
   (also needed for future burn-rate math).
 - Engine returns State-only (no error): every failure is a degraded State.
+- stdin path cache freshness: when Claude Code reliably pipes rate_limits the
+  ladder rarely runs. ResolveStdin does a bounded refresh (≤1/TTL) only when
+  stdin is incomplete and the cache is stale, so the overall API cap holds and
+  older-CC / allowlist-filtered deployments self-heal instead of showing
+  perpetually-stale ≈ windows.
+- stdin path suspect guard: intentionally absent. The statusline mirrors
+  Claude Code's own displayed values; the ≥30pt-drop guard (`Reconcile`)
+  applies only to fetched/ladder data and renders its `(suspect)` marker in
+  `now`, where the marker is visible. Guarding on the statusline would make
+  ccx diverge from CC's UI while hiding the reason.
