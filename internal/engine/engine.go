@@ -14,6 +14,8 @@ import (
 
 const DefaultTTL = 120 * time.Second
 
+const stdinRefreshTimeout = 5 * time.Second
+
 var ErrNoCache = errors.New("engine: no cached snapshot")
 
 type Clock interface{ Now() time.Time }
@@ -86,20 +88,15 @@ func (e *Engine) Resolve(ctx context.Context) *schema.State {
 		}
 	}
 
-	cr, cerr := e.creds.Resolve()
-	if cerr != nil || cr == nil || cr.AccessToken == "" {
-		return e.degradeNoCreds(now, cachedSnap, storedAt, haveCache)
-	}
-
-	if cr.Expired(now) {
-		if cr2, err := e.creds.Resolve(); err == nil && cr2 != nil && !cr2.Expired(now) {
-			cr = cr2
-		} else {
-			return e.degradeAuthExpired(now, cachedSnap, storedAt, haveCache)
+	cr, auth := e.resolveToken(now)
+	if cr == nil {
+		if auth == schema.AuthMissing {
+			return e.degradeNoCreds(now, cachedSnap, storedAt, haveCache)
 		}
+		return e.degradeAuthExpired(now, cachedSnap, storedAt, haveCache)
 	}
 
-	snap, ferr := e.fetcher.Fetch(ctx, cr.AccessToken)
+	snap, ferr := e.fetchWithToken(ctx, cr, now)
 	if ferr == nil {
 		merged := usage.Reconcile(cachedSnap, snap, now)
 		e.storeCache(merged)
@@ -107,14 +104,6 @@ func (e *Engine) Resolve(ctx context.Context) *schema.State {
 	}
 
 	if errors.Is(ferr, usage.ErrAuth) {
-		if cr2, err := e.creds.Resolve(); err == nil && cr2 != nil &&
-			cr2.AccessToken != "" && cr2.AccessToken != cr.AccessToken && !cr2.Expired(now) {
-			if snap2, ferr2 := e.fetcher.Fetch(ctx, cr2.AccessToken); ferr2 == nil {
-				merged := usage.Reconcile(cachedSnap, snap2, now)
-				e.storeCache(merged)
-				return snapshotState(merged, schema.SourceOAuth, false, 0, schema.AuthOK)
-			}
-		}
 		return e.degradeAuthExpired(now, cachedSnap, storedAt, haveCache)
 	}
 
@@ -124,23 +113,92 @@ func (e *Engine) Resolve(ctx context.Context) *schema.State {
 	return e.degradeNoData(now, schema.AuthOK, "usage fetch failed and no cache is available")
 }
 
-// ResolveStdin serves a snapshot piped in by Claude Code's statusline; it never
-// calls the API — windows stdin lacks are filled from the disk cache (only I/O).
+// resolveToken resolves usable credentials, re-reading once when the first read
+// is expired. Returns (nil, AuthMissing) with no token and (nil, AuthExpired)
+// when an expired token can't be replaced by a re-read.
+func (e *Engine) resolveToken(now time.Time) (*creds.Credentials, schema.AuthStatus) {
+	cr, err := e.creds.Resolve()
+	if err != nil || cr == nil || cr.AccessToken == "" {
+		return nil, schema.AuthMissing
+	}
+	if cr.Expired(now) {
+		if cr2, err := e.creds.Resolve(); err == nil && cr2 != nil && !cr2.Expired(now) {
+			return cr2, schema.AuthOK
+		}
+		return nil, schema.AuthExpired
+	}
+	return cr, schema.AuthOK
+}
+
+// fetchWithToken fetches a snapshot, retrying once with a fresh token on a 401
+// if Claude Code has rotated it meanwhile. It returns the original error when
+// the retry is not applicable or also fails.
+func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now time.Time) (*usage.Snapshot, error) {
+	snap, err := e.fetcher.Fetch(ctx, cr.AccessToken)
+	if err == nil || !errors.Is(err, usage.ErrAuth) {
+		return snap, err
+	}
+	if cr2, err := e.creds.Resolve(); err == nil && cr2 != nil &&
+		cr2.AccessToken != "" && cr2.AccessToken != cr.AccessToken && !cr2.Expired(now) {
+		if snap2, err := e.fetcher.Fetch(ctx, cr2.AccessToken); err == nil {
+			return snap2, nil
+		}
+	}
+	return snap, err
+}
+
+// ResolveStdin serves a snapshot piped in by Claude Code's statusline, overlaid
+// on the disk cache. When stdin is incomplete and the cache is stale it does one
+// bounded refresh (≤1/TTL, reusing resolveToken/fetchWithToken + Reconcile +
+// storeCache) to heal the gaps, then re-overlays; on failure it serves the
+// cache-backed merge marked stale. No suspect guard runs here — the statusline
+// mirrors Claude Code's own values; the guard and its marker live on the ladder.
 func (e *Engine) ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schema.State {
 	if stdin == nil {
 		return e.Resolve(ctx)
 	}
 	now := e.clock.Now()
 	cachedSnap, storedAt, haveCache := e.loadCache()
-	merged, usedCache := usage.Overlay(stdin, cachedSnap)
-	var stale bool
-	var age time.Duration
-	if usedCache && haveCache {
-		if d := now.Sub(storedAt); d >= e.ttl {
-			stale, age = true, d
+	cacheStale := !haveCache || now.Sub(storedAt) >= e.ttl
+	if cacheStale && !stdinComplete(stdin) {
+		if fresh := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
+			cachedSnap, haveCache = fresh, true
+			cacheStale = false
 		}
 	}
+	merged, usedCache := usage.Overlay(stdin, cachedSnap)
+	stale := usedCache && cacheStale
+	var age time.Duration
+	if stale {
+		age = now.Sub(storedAt)
+	}
 	return snapshotState(merged, schema.SourceStdin, stale, age, schema.AuthOK)
+}
+
+// refreshSnapshot performs a best-effort fresh fetch, reconciles it against the
+// cached snapshot, stores the result, and returns it. Returns nil on any
+// failure (missing ports, no usable credentials, fetch error).
+func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap *usage.Snapshot) *usage.Snapshot {
+	if e.creds == nil || e.fetcher == nil {
+		return nil
+	}
+	cr, _ := e.resolveToken(now)
+	if cr == nil {
+		return nil
+	}
+	rctx, cancel := context.WithTimeout(ctx, stdinRefreshTimeout)
+	defer cancel()
+	snap, err := e.fetchWithToken(rctx, cr, now)
+	if err != nil {
+		return nil
+	}
+	merged := usage.Reconcile(cachedSnap, snap, now)
+	e.storeCache(merged)
+	return merged
+}
+
+func stdinComplete(s *usage.Snapshot) bool {
+	return s != nil && s.FiveHour != nil && s.SevenDay != nil && len(s.ScopedLimits) > 0
 }
 
 func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *usage.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
