@@ -83,18 +83,26 @@ func freshnessFooter(st *schema.State) string {
 		return "source: live\n"
 	case schema.SourceCache:
 		if st.Stale {
-			age := ""
-			if st.StaleAge != nil {
-				age = " (" + humanizeDuration(time.Duration(*st.StaleAge)) + " old)"
-			}
-			return "source: cache · stale" + age + "\n"
+			return "source: cache · stale" + staleSuffix(st) + "\n"
 		}
 		return "source: cache\n"
+	case schema.SourceStdin:
+		if st.Stale {
+			return "source: claude code · stale" + staleSuffix(st) + "\n"
+		}
+		return "source: claude code\n"
 	case schema.SourceTranscript:
 		return "source: transcript fallback\n"
 	default:
 		return ""
 	}
+}
+
+func staleSuffix(st *schema.State) string {
+	if st.StaleAge == nil {
+		return ""
+	}
+	return " (" + humanizeDuration(time.Duration(*st.StaleAge)) + " old)"
 }
 
 // humanizeDuration formats a duration like "4h12m", "3d5h", "45s"; non-positive

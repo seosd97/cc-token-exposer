@@ -215,41 +215,36 @@ func TestIsTerminal(t *testing.T) {
 	}
 }
 
-func TestStateFromRateLimits(t *testing.T) {
+func TestSnapshotFromRateLimits(t *testing.T) {
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 
 	t.Run("absent", func(t *testing.T) {
-		if _, ok := stateFromRateLimits(nil, now); ok {
-			t.Error("nil rate_limits should not yield a state")
+		if _, ok := snapshotFromRateLimits(nil, now); ok {
+			t.Error("nil rate_limits should not yield a snapshot")
 		}
 	})
 
 	t.Run("unrelated shape falls through", func(t *testing.T) {
-		if _, ok := stateFromRateLimits([]byte(`{"something_else":1}`), now); ok {
-			t.Error("unknown shape should yield no state")
+		if _, ok := snapshotFromRateLimits([]byte(`{"something_else":1}`), now); ok {
+			t.Error("unknown shape should yield no snapshot")
 		}
 	})
 
 	t.Run("parses windows with float utilization", func(t *testing.T) {
 		raw := []byte(`{"five_hour":{"utilization":23.0,"resets_at":"2026-06-12T16:00:00Z"},"seven_day":{"utilization":40.6,"resets_at":"2026-06-18T00:00:00Z"}}`)
-		st, ok := stateFromRateLimits(raw, now)
+		snap, ok := snapshotFromRateLimits(raw, now)
 		if !ok {
-			t.Fatal("expected a state")
-		}
-		if st.Source != schema.SourceOAuth || st.Auth != schema.AuthOK || st.Type != schema.TypeSnapshot {
-			t.Errorf("unexpected state envelope: %+v", st)
+			t.Fatal("expected a snapshot")
 		}
 		// The wire type is float64: the raw value is preserved, not rounded.
-		if st.Snapshot.FiveHour == nil || st.Snapshot.FiveHour.Utilization != 23 {
-			t.Errorf("five_hour = %+v, want 23", st.Snapshot.FiveHour)
+		if snap.FiveHour == nil || snap.FiveHour.Utilization != 23 {
+			t.Errorf("five_hour = %+v, want 23", snap.FiveHour)
 		}
-		if st.Snapshot.SevenDay == nil || st.Snapshot.SevenDay.Utilization != 40.6 {
-			t.Errorf("seven_day = %+v, want 40.6 preserved", st.Snapshot.SevenDay)
+		if snap.SevenDay == nil || snap.SevenDay.Utilization != 40.6 {
+			t.Errorf("seven_day = %+v, want 40.6 preserved", snap.SevenDay)
 		}
-		// Rounding happens only at display time; each window shows gauge, %, and reset inline.
-		line := formatStatusline(st, now, false)
-		if !strings.Contains(line, "◷ 5h ▮▯▯▯▯ 23%") || !strings.Contains(line, "◷ 7d ▮▮▯▯▯ 41%") {
-			t.Errorf("formatted line = %q", line)
+		if !snap.FetchedAt.Equal(now) {
+			t.Errorf("fetched_at = %v, want %v", snap.FetchedAt, now)
 		}
 	})
 
@@ -258,31 +253,75 @@ func TestStateFromRateLimits(t *testing.T) {
 		// resets_at as an epoch (seconds here).
 		epoch := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC).Unix()
 		raw := []byte(`{"five_hour":{"used_percentage":33,"resets_at":` + strconv.FormatInt(epoch, 10) + `}}`)
-		st, ok := stateFromRateLimits(raw, now)
+		snap, ok := snapshotFromRateLimits(raw, now)
 		if !ok {
-			t.Fatal("expected a state from used_percentage")
+			t.Fatal("expected a snapshot from used_percentage")
 		}
-		if st.Snapshot.FiveHour == nil || st.Snapshot.FiveHour.Utilization != 33 {
-			t.Errorf("five_hour = %+v, want 33", st.Snapshot.FiveHour)
+		if snap.FiveHour == nil || snap.FiveHour.Utilization != 33 {
+			t.Errorf("five_hour = %+v, want 33", snap.FiveHour)
 		}
-		if want := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC); !st.Snapshot.FiveHour.ResetsAt.Equal(want) {
-			t.Errorf("resets_at = %v, want %v (epoch decoded)", st.Snapshot.FiveHour.ResetsAt, want)
+		if want := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC); !snap.FiveHour.ResetsAt.Equal(want) {
+			t.Errorf("resets_at = %v, want %v (epoch decoded)", snap.FiveHour.ResetsAt, want)
 		}
 	})
 
 	t.Run("used_percentage takes priority over utilization", func(t *testing.T) {
 		raw := []byte(`{"five_hour":{"used_percentage":70,"utilization":10}}`)
-		st, ok := stateFromRateLimits(raw, now)
-		if !ok || st.Snapshot.FiveHour.Utilization != 70 {
-			t.Errorf("got %+v, want used_percentage 70 to win", st.Snapshot)
+		snap, ok := snapshotFromRateLimits(raw, now)
+		if !ok || snap.FiveHour.Utilization != 70 {
+			t.Errorf("got %+v, want used_percentage 70 to win", snap)
 		}
 	})
 
 	t.Run("window without a percentage is ignored", func(t *testing.T) {
 		// Only resets_at, no used_percentage/utilization -> not a usable window.
 		raw := []byte(`{"five_hour":{"resets_at":"2026-06-12T16:00:00Z"}}`)
-		if _, ok := stateFromRateLimits(raw, now); ok {
-			t.Error("window without a percentage should not yield a state")
+		if _, ok := snapshotFromRateLimits(raw, now); ok {
+			t.Error("window without a percentage should not yield a snapshot")
+		}
+	})
+
+	t.Run("model_scoped keyed by display_name", func(t *testing.T) {
+		raw := []byte(`{"model_scoped":[` +
+			`{"display_name":"Fable","utilization":55.0,"resets_at":"2026-06-18T00:00:00Z"},` +
+			`{"display_name":"Opus","utilization":12.5,"resets_at":"2026-06-18T00:00:00Z"}]}`)
+		snap, ok := snapshotFromRateLimits(raw, now)
+		if !ok {
+			t.Fatal("expected a snapshot from model_scoped")
+		}
+		fable := snap.ScopedLimits["Fable"]
+		if fable == nil || fable.Utilization != 55 {
+			t.Errorf("Fable = %+v, want 55", fable)
+		}
+		if want := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC); !fable.ResetsAt.Equal(want) {
+			t.Errorf("Fable resets_at = %v, want %v", fable.ResetsAt, want)
+		}
+		if opus := snap.ScopedLimits["Opus"]; opus == nil || opus.Utilization != 12.5 {
+			t.Errorf("Opus = %+v, want 12.5", opus)
+		}
+	})
+
+	t.Run("model_scoped skips entries without a usable value", func(t *testing.T) {
+		raw := []byte(`{"model_scoped":[` +
+			`{"display_name":"Fable","utilization":null,"resets_at":"2026-06-18T00:00:00Z"},` +
+			`{"display_name":"","utilization":5,"resets_at":null}]}`)
+		if _, ok := snapshotFromRateLimits(raw, now); ok {
+			t.Error("entries with null utilization or empty name should not yield a snapshot")
+		}
+	})
+
+	t.Run("seven_day_opus backfills only when model_scoped lacks Opus", func(t *testing.T) {
+		raw := []byte(`{"seven_day_opus":{"used_percentage":30,"resets_at":"2026-06-18T00:00:00Z"}}`)
+		snap, ok := snapshotFromRateLimits(raw, now)
+		if !ok || snap.ScopedLimits["Opus"] == nil || snap.ScopedLimits["Opus"].Utilization != 30 {
+			t.Fatalf("seven_day_opus should backfill ScopedLimits[Opus]: %+v", snap)
+		}
+
+		raw = []byte(`{"seven_day_opus":{"used_percentage":30},` +
+			`"model_scoped":[{"display_name":"Opus","utilization":7,"resets_at":null}]}`)
+		snap, ok = snapshotFromRateLimits(raw, now)
+		if !ok || snap.ScopedLimits["Opus"].Utilization != 7 {
+			t.Fatalf("model_scoped Opus should win over seven_day_opus: %+v", snap)
 		}
 	})
 }

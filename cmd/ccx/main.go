@@ -24,6 +24,7 @@ var errSilentExit = errors.New("")
 
 type resolver interface {
 	Resolve(ctx context.Context) *schema.State
+	ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schema.State
 }
 
 func versionString() string {

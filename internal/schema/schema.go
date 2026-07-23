@@ -17,6 +17,7 @@ const (
 	SourceOAuth      = "oauth"
 	SourceCache      = "cache"
 	SourceTranscript = "transcript"
+	SourceStdin      = "stdin"
 )
 
 type AuthStatus string
