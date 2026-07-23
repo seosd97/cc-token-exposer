@@ -14,9 +14,19 @@ func Reconcile(prev, next *Snapshot, now time.Time) *Snapshot {
 	out := *next
 	out.FiveHour = reconcileWindow(prev.FiveHour, next.FiveHour, now)
 	out.SevenDay = reconcileWindow(prev.SevenDay, next.SevenDay, now)
-	out.SevenDayOpus = reconcileWindow(prev.SevenDayOpus, next.SevenDayOpus, now)
-	out.SevenDayFable = reconcileWindow(prev.SevenDayFable, next.SevenDayFable, now)
+	out.ScopedLimits = reconcileScoped(prev.ScopedLimits, next.ScopedLimits, now)
 	return &out
+}
+
+func reconcileScoped(prev, next map[string]*Window, now time.Time) map[string]*Window {
+	if len(next) == 0 {
+		return nil
+	}
+	out := make(map[string]*Window, len(next))
+	for k, nw := range next {
+		out[k] = reconcileWindow(prev[k], nw, now)
+	}
+	return out
 }
 
 func reconcileWindow(prev, next *Window, now time.Time) *Window {

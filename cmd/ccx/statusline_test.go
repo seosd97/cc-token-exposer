@@ -57,22 +57,38 @@ func TestFormatStatusline(t *testing.T) {
 				Snapshot: &schema.Snapshot{
 					FiveHour:     win(10, reset5h),
 					SevenDay:     win(20, reset7d),
-					SevenDayOpus: win(5, reset7d),
+					ScopedLimits: map[string]*schema.Window{"Opus": win(5, reset7d)},
 				},
 			},
-			want: "◷ 5h ▮▯▯▯▯ 10% ↻ 4h12m · ◷ 7d ▮▯▯▯▯ 20% ↻ 3d0h · ✦ opus ▯▯▯▯▯ 5% ↻ 3d0h",
+			want: "◷ 5h ▮▯▯▯▯ 10% ↻ 4h12m · ◷ 7d ▮▯▯▯▯ 20% ↻ 3d0h · ✧ opus ▯▯▯▯▯ 5% ↻ 3d0h",
 		},
 		{
 			name: "includes fable window",
 			st: &schema.State{
 				Auth: schema.AuthOK,
 				Snapshot: &schema.Snapshot{
-					FiveHour:      win(10, reset5h),
-					SevenDay:      win(20, reset7d),
-					SevenDayFable: win(94, reset7d),
+					FiveHour:     win(10, reset5h),
+					SevenDay:     win(20, reset7d),
+					ScopedLimits: map[string]*schema.Window{"Fable": win(94, reset7d)},
 				},
 			},
 			want: "◷ 5h ▮▯▯▯▯ 10% ↻ 4h12m · ◷ 7d ▮▯▯▯▯ 20% ↻ 3d0h · ✧ fable ▮▮▮▮▮ 94% ↻ 3d0h",
+		},
+		{
+			name: "multiple scoped models sorted alphabetically",
+			st: &schema.State{
+				Auth: schema.AuthOK,
+				Snapshot: &schema.Snapshot{
+					FiveHour: win(10, reset5h),
+					SevenDay: win(20, reset7d),
+					ScopedLimits: map[string]*schema.Window{
+						"Opus":   win(30, reset7d),
+						"Fable":  win(50, reset7d),
+						"Sonnet": win(70, reset7d),
+					},
+				},
+			},
+			want: "◷ 5h ▮▯▯▯▯ 10% ↻ 4h12m · ◷ 7d ▮▯▯▯▯ 20% ↻ 3d0h · ✧ fable ▮▮▮▯▯ 50% ↻ 3d0h · ✧ opus ▮▮▯▯▯ 30% ↻ 3d0h · ✧ sonnet ▮▮▮▮▯ 70% ↻ 3d0h",
 		},
 		{
 			name: "stale prefixes approx sign",
