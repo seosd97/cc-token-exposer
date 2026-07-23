@@ -9,14 +9,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seosd97/cc-token-exposer/internal/engine"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
+	"github.com/seosd97/cc-token-exposer/internal/usage"
 )
 
 // fakeResolver returns a canned State, exercising the full command path
 // (flags, rendering, exit codes) without any real IO.
-type fakeResolver struct{ st *schema.State }
+type fakeResolver struct {
+	st    *schema.State
+	stdin *usage.Snapshot
+}
 
 func (f *fakeResolver) Resolve(context.Context) *schema.State { return f.st }
+
+func (f *fakeResolver) ResolveStdin(_ context.Context, stdin *usage.Snapshot) *schema.State {
+	f.stdin = stdin
+	return f.st
+}
 
 func snapshotState(fiveHour, sevenDay float64, resetsAt time.Time) *schema.State {
 	return &schema.State{
@@ -117,10 +127,12 @@ func TestStatuslineUsesInjectedResolver(t *testing.T) {
 	}
 }
 
-func TestStatuslinePrefersStdinRateLimits(t *testing.T) {
-	// When stdin carries rate_limits, the resolver must NOT be consulted.
+func TestStatuslinePipesStdinSnapshotToResolver(t *testing.T) {
+	// When stdin carries rate_limits, the parsed snapshot must reach the
+	// resolver's stdin path, not the fetch ladder.
 	t.Setenv("NO_COLOR", "1")
-	cmd := newStatuslineCmd(&fakeResolver{st: authErrorState()})
+	res := &fakeResolver{st: snapshotState(18, 0, time.Now().UTC().Add(2*time.Hour))}
+	cmd := newStatuslineCmd(res)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetIn(bytes.NewBufferString(
@@ -130,9 +142,50 @@ func TestStatuslinePrefersStdinRateLimits(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
+	if res.stdin == nil || res.stdin.FiveHour == nil || res.stdin.FiveHour.Utilization != 18.2 {
+		t.Fatalf("resolver stdin path not fed from rate_limits: %+v", res.stdin)
+	}
 	line := strings.TrimSpace(out.String())
 	if !strings.Contains(line, "5h ▮▯▯▯▯ 18%") {
-		t.Fatalf("rate_limits path not taken (resolver would say ⚠ login): %q", line)
+		t.Fatalf("line missing stdin window: %q", line)
+	}
+}
+
+func TestStatuslineNoRateLimitsYieldsNilStdin(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	res := &fakeResolver{st: snapshotState(72, 41, time.Now().UTC().Add(4*time.Hour))}
+	cmd := newStatuslineCmd(res)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetIn(bytes.NewBufferString("{}"))
+	cmd.SetArgs(nil)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.stdin != nil {
+		t.Fatalf("empty stdin should yield nil snapshot, got %+v", res.stdin)
+	}
+}
+
+func TestStatuslineRendersScopedModelsFromStdin(t *testing.T) {
+	// Regression: model_scoped in stdin must survive to the rendered line
+	// through the real engine (previously dropped by the stdin shortcut).
+	t.Setenv("NO_COLOR", "1")
+	cmd := newStatuslineCmd(engine.New(engine.Options{}))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetIn(bytes.NewBufferString(
+		`{"rate_limits":{"five_hour":{"used_percentage":23,"resets_at":"2099-01-01T00:00:00Z"},` +
+			`"model_scoped":[{"display_name":"Fable","utilization":55.0,"resets_at":"2099-01-01T00:00:00Z"}]}}`))
+	cmd.SetArgs(nil)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	line := strings.TrimSpace(out.String())
+	if !strings.Contains(line, "5h ▮▯▯▯▯ 23%") || !strings.Contains(line, "✧ fable ▮▮▮▯▯ 55%") {
+		t.Fatalf("scoped model from stdin not rendered: %q", line)
 	}
 }
 

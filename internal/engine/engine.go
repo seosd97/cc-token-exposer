@@ -124,6 +124,25 @@ func (e *Engine) Resolve(ctx context.Context) *schema.State {
 	return e.degradeNoData(now, schema.AuthOK, "usage fetch failed and no cache is available")
 }
 
+// ResolveStdin serves a snapshot piped in by Claude Code's statusline; it never
+// calls the API — windows stdin lacks are filled from the disk cache (only I/O).
+func (e *Engine) ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schema.State {
+	if stdin == nil {
+		return e.Resolve(ctx)
+	}
+	now := e.clock.Now()
+	cachedSnap, storedAt, haveCache := e.loadCache()
+	merged, usedCache := usage.Overlay(stdin, cachedSnap)
+	var stale bool
+	var age time.Duration
+	if usedCache && haveCache {
+		if d := now.Sub(storedAt); d >= e.ttl {
+			stale, age = true, d
+		}
+	}
+	return snapshotState(merged, schema.SourceStdin, stale, age, schema.AuthOK)
+}
+
 func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *usage.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
 	if haveCache {
 		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthMissing)

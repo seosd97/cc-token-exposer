@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/seosd97/cc-token-exposer/internal/schema"
+	"github.com/seosd97/cc-token-exposer/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -33,8 +34,8 @@ Code calls it every few seconds, so within the cache TTL it never touches the
 usage API.
 
 If the statusline stdin session JSON carries a "rate_limits" field (intermittent
-across Claude Code versions, #40094), it is used opportunistically and no cache
-or API access happens at all.
+across Claude Code versions, #40094), it is used directly; windows it lacks are
+filled from the disk cache, and no usage API call ever happens on this path.
 
 Install: add to ~/.claude/settings.json
 
@@ -51,12 +52,12 @@ func newStatuslineCmd(res resolver) *cobra.Command {
 			out := cmd.OutOrStdout()
 			colored := os.Getenv("NO_COLOR") == ""
 
+			var stdinSnap *usage.Snapshot
 			stdin := cmd.InOrStdin()
 			if !isTerminal(stdin) {
 				if in, err := readStatuslineInput(stdin); err == nil {
-					if st, ok := stateFromRateLimits(in.RateLimits, now); ok {
-						fmt.Fprintln(out, formatStatusline(st, now, colored))
-						return nil
+					if snap, ok := snapshotFromRateLimits(in.RateLimits, now); ok {
+						stdinSnap = snap
 					}
 				}
 			}
@@ -64,7 +65,7 @@ func newStatuslineCmd(res resolver) *cobra.Command {
 			ctx, cancel := context.WithTimeout(cmd.Context(), statuslineTimeout)
 			defer cancel()
 
-			fmt.Fprintln(out, formatStatusline(res.Resolve(ctx), now, colored))
+			fmt.Fprintln(out, formatStatusline(res.ResolveStdin(ctx, stdinSnap), now, colored))
 			return nil
 		},
 	}
@@ -194,11 +195,11 @@ func (w *rlWindow) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (w *rlWindow) toSchema() *schema.Window {
+func (w *rlWindow) toUsage() *usage.Window {
 	if w == nil || !w.hasUsed {
 		return nil
 	}
-	return &schema.Window{
+	return &usage.Window{
 		Utilization: w.used,
 		ResetsAt:    w.resetsAt,
 	}
@@ -227,42 +228,66 @@ func parseTolerantTime(raw json.RawMessage) time.Time {
 	return time.Time{}
 }
 
-func stateFromRateLimits(raw json.RawMessage, now time.Time) (*schema.State, bool) {
+type rlScoped struct {
+	DisplayName string          `json:"display_name"`
+	Utilization *float64        `json:"utilization"`
+	ResetsAt    json.RawMessage `json:"resets_at"`
+}
+
+// snapshotFromRateLimits converts the stdin rate_limits object into a usage
+// snapshot; ok is false when it carries no usable window. model_scoped entries
+// keyed by display_name are the canonical scoped limits; seven_day_opus only
+// backfills Opus when model_scoped lacks it.
+func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*usage.Snapshot, bool) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, false
 	}
 	var obj struct {
-		FiveHour     *rlWindow `json:"five_hour"`
-		SevenDay     *rlWindow `json:"seven_day"`
-		SevenDayOpus *rlWindow `json:"seven_day_opus"`
+		FiveHour     *rlWindow  `json:"five_hour"`
+		SevenDay     *rlWindow  `json:"seven_day"`
+		SevenDayOpus *rlWindow  `json:"seven_day_opus"`
+		ModelScoped  []rlScoped `json:"model_scoped"`
 	}
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, false
 	}
 
-	snap := &schema.Snapshot{FetchedAt: now}
+	snap := &usage.Snapshot{FetchedAt: now}
 	n := 0
-	if w := obj.FiveHour.toSchema(); w != nil {
+	if w := obj.FiveHour.toUsage(); w != nil {
 		snap.FiveHour = w
 		n++
 	}
-	if w := obj.SevenDay.toSchema(); w != nil {
+	if w := obj.SevenDay.toUsage(); w != nil {
 		snap.SevenDay = w
 		n++
 	}
-	if w := obj.SevenDayOpus.toSchema(); w != nil {
-		snap.SevenDayOpus = w
+	var scoped map[string]*usage.Window
+	for _, ms := range obj.ModelScoped {
+		if ms.DisplayName == "" || ms.Utilization == nil {
+			continue
+		}
+		if scoped == nil {
+			scoped = make(map[string]*usage.Window, len(obj.ModelScoped))
+		}
+		scoped[ms.DisplayName] = &usage.Window{
+			Utilization: *ms.Utilization,
+			ResetsAt:    parseTolerantTime(ms.ResetsAt),
+		}
 		n++
 	}
+	if w := obj.SevenDayOpus.toUsage(); w != nil {
+		if _, ok := scoped["Opus"]; !ok {
+			if scoped == nil {
+				scoped = make(map[string]*usage.Window, 1)
+			}
+			scoped["Opus"] = w
+			n++
+		}
+	}
+	snap.ScopedLimits = scoped
 	if n == 0 {
 		return nil, false
 	}
-
-	return &schema.State{
-		SchemaVersion: schema.Version,
-		Type:          schema.TypeSnapshot,
-		Source:        schema.SourceOAuth,
-		Auth:          schema.AuthOK,
-		Snapshot:      snap,
-	}, true
+	return snap, true
 }

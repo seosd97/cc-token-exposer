@@ -93,6 +93,8 @@ func snapWith(util float64, resetsAt time.Time) *usage.Snapshot {
 	}
 }
 
+func ptr(v float64) *float64 { return &v }
+
 func mustMarshal(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)
@@ -354,6 +356,148 @@ func TestTranscriptFallbackWhenNoCacheNoCreds(t *testing.T) {
 	}
 	if st.Auth != schema.AuthMissing {
 		t.Fatalf("auth = %s, want missing", st.Auth)
+	}
+}
+
+func resolveStdin(t *testing.T, o engine.Options, stdin *usage.Snapshot) *schema.State {
+	t.Helper()
+	if o.Clock == nil {
+		o.Clock = &fakeClock{t: baseTime}
+	}
+	st := engine.New(o).ResolveStdin(context.Background(), stdin)
+	if st == nil {
+		t.Fatalf("ResolveStdin returned nil state")
+	}
+	return st
+}
+
+func stdinSnap(util float64, resetsAt time.Time) *usage.Snapshot {
+	return &usage.Snapshot{
+		FetchedAt: baseTime,
+		FiveHour:  &usage.Window{Utilization: util, ResetsAt: resetsAt},
+	}
+}
+
+func TestStdinNilFallsBackToResolve(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cache := &fakeCache{
+		payload:  mustMarshal(t, snapWith(23, baseTime.Add(time.Hour))),
+		storedAt: baseTime.Add(-30 * time.Second),
+		has:      true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+		t.Fatalf("fetch must not be called on fresh cache")
+		return nil, nil
+	}}
+
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, nil)
+	if st.Source != schema.SourceCache || st.Snapshot.FiveHour.Utilization != 23 {
+		t.Fatalf("nil stdin should delegate to Resolve: source=%s snap=%+v", st.Source, st.Snapshot)
+	}
+}
+
+func TestStdinSnapshotServedWithoutFetchOrCacheStore(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+		t.Fatalf("fetch must never run on the stdin path")
+		return nil, nil
+	}}
+	cache := &fakeCache{}
+
+	stdin := stdinSnap(18, baseTime.Add(time.Hour))
+	stdin.ScopedLimits = map[string]*usage.Window{
+		"Fable": {Utilization: 55, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
+	}
+	st := resolveStdin(t, engine.Options{Clock: clk, Fetcher: fetch, Cache: cache}, stdin)
+
+	if st.Source != schema.SourceStdin || st.Stale || st.Auth != schema.AuthOK {
+		t.Fatalf("got source=%s stale=%v auth=%s, want stdin/false/ok", st.Source, st.Stale, st.Auth)
+	}
+	if len(fetch.calls) != 0 || cache.stores != 0 {
+		t.Fatalf("stdin path did I/O: fetch=%d stores=%d", len(fetch.calls), cache.stores)
+	}
+	if st.Snapshot.ScopedLimits["Fable"] == nil || st.Snapshot.ScopedLimits["Fable"].Utilization != 55 {
+		t.Fatalf("scoped = %+v, want Fable 55", st.Snapshot.ScopedLimits)
+	}
+	if st.Snapshot.SevenDayFable == nil {
+		t.Fatal("SevenDayFable alias should be populated from ScopedLimits")
+	}
+}
+
+func TestStdinGapsFilledFromFreshCacheNotStale(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cached := snapWith(99, baseTime.Add(time.Hour))
+	cached.ScopedLimits = map[string]*usage.Window{
+		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
+	}
+	cache := &fakeCache{
+		payload:  mustMarshal(t, cached),
+		storedAt: baseTime.Add(-30 * time.Second), // within TTL
+		has:      true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+		t.Fatalf("fetch must never run on the stdin path")
+		return nil, nil
+	}}
+
+	st := resolveStdin(t, engine.Options{Clock: clk, Fetcher: fetch, Cache: cache}, stdinSnap(18, baseTime.Add(time.Hour)))
+
+	if st.Snapshot.FiveHour.Utilization != 18 {
+		t.Fatalf("five_hour = %v, want stdin 18", st.Snapshot.FiveHour.Utilization)
+	}
+	if st.Snapshot.ScopedLimits["Fable"] == nil || st.Snapshot.ScopedLimits["Fable"].Utilization != 40 {
+		t.Fatalf("scoped = %+v, want Fable 40 from cache", st.Snapshot.ScopedLimits)
+	}
+	if st.Stale {
+		t.Fatal("cache within TTL should not mark the state stale")
+	}
+}
+
+func TestStdinGapsFilledFromOldCacheIsStale(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cached := snapWith(99, baseTime.Add(time.Hour))
+	cached.ScopedLimits = map[string]*usage.Window{
+		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
+	}
+	cache := &fakeCache{
+		payload:  mustMarshal(t, cached),
+		storedAt: baseTime.Add(-10 * time.Minute), // older than TTL
+		has:      true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+		t.Fatalf("fetch must never run on the stdin path")
+		return nil, nil
+	}}
+
+	st := resolveStdin(t, engine.Options{Clock: clk, Fetcher: fetch, Cache: cache}, stdinSnap(18, baseTime.Add(time.Hour)))
+
+	if !st.Stale || st.StaleAge == nil || time.Duration(*st.StaleAge) != 10*time.Minute {
+		t.Fatalf("got stale=%v age=%v, want true/10m", st.Stale, st.StaleAge)
+	}
+	if st.Snapshot.ScopedLimits["Fable"] == nil {
+		t.Fatal("scoped Fable should survive via cache gap-fill")
+	}
+}
+
+func TestStdinCompleteSnapshotIgnoresCache(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cached := snapWith(99, baseTime.Add(time.Hour))
+	cached.ExtraUsage = &usage.ExtraUsage{Utilization: ptr(5.0)}
+	cache := &fakeCache{
+		payload:  mustMarshal(t, cached),
+		storedAt: baseTime.Add(-10 * time.Minute),
+		has:      true,
+	}
+
+	stdin := stdinSnap(18, baseTime.Add(time.Hour))
+	stdin.SevenDay = &usage.Window{Utilization: 41, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
+	st := resolveStdin(t, engine.Options{Clock: clk, Cache: cache}, stdin)
+
+	if st.Stale {
+		t.Fatal("no cache contribution means not stale")
+	}
+	if st.Snapshot.FiveHour.Utilization != 18 || st.Snapshot.SevenDay.Utilization != 41 {
+		t.Fatalf("snap = %+v, want stdin values", st.Snapshot)
 	}
 }
 

@@ -44,15 +44,17 @@ threshold notifications (`internal/notify`), history logging
 cmd/ccx/main.go      composition root: builds the ONE production engine and
                      injects it into commands as a `resolver` interface
 cmd/ccx/now.go       rendering + exit-code policy
-cmd/ccx/statusline.go  statusline formatting + opportunistic stdin rate_limits
+cmd/ccx/statusline.go  statusline formatting + stdin rate_limits parsing
+                     (rate_limits -> usage.Snapshot -> engine.ResolveStdin)
 cmd/ccx/update.go    self-update command (thin) over internal/selfupdate
 internal/
   selfupdate/  GitHub-release self-update: Latest (releases/latest) ->
                FetchAsset -> VerifyChecksum (checksums.txt) -> ExtractBinary
                (tar.gz) -> Apply (atomic rename over os.Executable). Stdlib
                only; injectable http client + apiBase + platform for tests.
-  engine/      THE BRAIN. Resolve(ctx) -> *schema.State, runs the degrade
-               ladder. Depends only on 5 consumer-side interfaces it defines:
+  engine/      THE BRAIN. Resolve(ctx) and ResolveStdin(ctx, snap) ->
+               *schema.State, runs the degrade ladder. Depends only on 5
+               consumer-side interfaces it defines:
                CredResolver / Fetcher / Cache / TranscriptProbe / Clock.
   schema/      The wire contract (State, schema_version=1). Leaf package,
                imports nothing internal. The PUBLIC CONTRACT is the JSON
@@ -60,9 +62,10 @@ internal/
                external import by design). ScopedLimits (map[string]*Window)
                is additive over schema_version=1; seven_day_opus/fable remain
                as backward-compat aliases.
-  usage/       oauth/usage HTTP client + Reconcile consistency guard.
-               decode populates Snapshot.ScopedLimits dynamically from all
-               weekly_scoped entries in limits[]; no model name is hardcoded.
+  usage/       oauth/usage HTTP client + Reconcile consistency guard +
+               Overlay gap-fill merge. decode populates Snapshot.ScopedLimits
+               dynamically from all weekly_scoped entries in limits[]; no
+               model name is hardcoded.
   creds/       credential acquisition: file > macOS keychain shell-out.
   cache/       flock-protected, atomic-write disk cache of opaque JSON.
   transcript/  last-resort fallback: parses limit-hit messages from
@@ -79,12 +82,21 @@ carrying the best known truth plus its freshness):
    otherwise `auth: "expired"` (still with stale data if available).
 5. No cache at all → transcript limit-hit probe → else error State.
 
+ResolveStdin (statusline only) bypasses the ladder: the parsed stdin
+snapshot is overlaid on the cache (`usage.Overlay` — per window, stdin wins,
+gaps fill from cache, ExtraUsage always from the fresh side) and served with
+`source: "stdin"`. It NEVER calls the API and never writes the cache; the
+disk-cache read is its only I/O. Cache-sourced windows from a cache older
+than the TTL mark the state stale.
+
 ## Invariants — do not break these
 
 1. **Cache-first.** Claude Code invokes the statusline command every few
    seconds. Within the cache TTL ccx must NEVER touch the API; the disk cache
    (+ flock) caps request volume at ~1 per TTL across ALL invocations.
    Breaking this gets the user rate-limited (the endpoint 429s aggressively).
+   The stdin rate_limits path is stricter still: it never calls the API at
+   all — a disk-cache read to fill windows stdin lacks is its only I/O.
 2. **Token hygiene.** The OAuth token is read-only and in-memory only. It must
    never appear in logs, error messages, the cache file, test fixtures, or
    `String()` output (creds redacts). The cache stores only
@@ -105,7 +117,8 @@ carrying the best known truth plus its freshness):
    bump the version. `utilization` is float64 on the wire (the real API sends
    fractionals); round only at display time. `scoped_limits`
    (map[string]*Window) was added additively; `seven_day_opus` /
-   `seven_day_fable` remain as aliases for backward compat.
+   `seven_day_fable` remain as aliases for backward compat. `source` gained
+   the additive value `"stdin"` (statusline rate_limits path).
 7. **Transcript files are read-only.** Never write under `~/.claude/`.
 
 ## Data source notes
@@ -136,9 +149,17 @@ carrying the best known truth plus its freshness):
   `suspect: true` when utilization falls ≥30 points within an unchanged
   reset cycle.
 - statusline stdin: Claude Code pipes session JSON. A `rate_limits` field
-  appears intermittently across versions (#40094); when present it is used
-  directly (no cache/API I/O), parsed tolerantly (`used_percentage` or
-  `utilization`; resets_at as ISO string or epoch). Never depend on it.
+  appears intermittently across versions (#40094); when present it is parsed
+  tolerantly (`used_percentage` or `utilization`; resets_at as ISO string or
+  epoch) into a usage.Snapshot and fed to `engine.ResolveStdin`. Never depend
+  on it. Confirmed shape (CC 2.1.217): `five_hour` / `seven_day` /
+  `seven_day_oauth_apps` / `seven_day_opus` / `seven_day_sonnet` windows,
+  `model_scoped: [{display_name, utilization|null, resets_at ISO|null}]`
+  (projected by CC from the server limits[] overage-included-models
+  allowlist, present only when non-empty), and `extra_usage`. The parser maps
+  model_scoped by display_name into ScopedLimits (seven_day_opus only
+  backfills Opus); sonnet/oauth_apps/extra_usage are ignored, consistent
+  with the API path.
 - Local limit-hit signal: when a limit is hit, Claude Code writes a synthetic
   transcript message (`isApiErrorMessage: true`, text like
   "You've hit your session limit · resets 4:50pm (Asia/Seoul)"). The
