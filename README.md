@@ -51,8 +51,9 @@ JSON output for scripts:
 
 ```
 $ ccx now --json
-{"schema_version":1,"type":"snapshot","source":"oauth","auth":"ok",
- "snapshot":{"fetched_at":"…","five_hour":{"utilization":47,"resets_at":"…"},"seven_day":{"utilization":23,"resets_at":"…"}}}
+{"schema_version":1,"type":"snapshot","source":"oauth","stale":false,"auth":"ok",
+ "snapshot":{"fetched_at":"…","five_hour":{"utilization":47,"resets_at":"…"},"seven_day":{"utilization":23,"resets_at":"…"},
+  "scoped_limits":{"Fable":{"utilization":94,"resets_at":"…"},"Opus":{"utilization":12,"resets_at":"…"}}}}
 ```
 
 ### `ccx statusline`
