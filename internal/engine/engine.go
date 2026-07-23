@@ -162,7 +162,7 @@ func (e *Engine) ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schem
 	cacheStale := !haveCache || now.Sub(storedAt) >= e.ttl
 	if cacheStale && !stdinComplete(stdin) {
 		if fresh := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
-			cachedSnap, haveCache = fresh, true
+			cachedSnap = fresh
 			cacheStale = false
 		}
 	}
