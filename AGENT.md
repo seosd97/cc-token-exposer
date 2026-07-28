@@ -68,6 +68,8 @@ internal/
                model name is hardcoded.
   creds/       credential acquisition: file > macOS keychain shell-out.
   cache/       flock-protected, atomic-write disk cache of opaque JSON.
+               Store records {fetched_at, payload}; Touch(attempted_at)
+               stamps a refresh attempt without touching payload/fetched_at.
   transcript/  last-resort fallback: parses limit-hit messages from
                ~/.claude/projects/**/*.jsonl (read-only, best-effort).
 ```
@@ -82,12 +84,20 @@ carrying the best known truth plus its freshness):
    otherwise `auth: "expired"` (still with stale data if available).
 5. No cache at all → transcript limit-hit probe → else error State.
 
-ResolveStdin (statusline only) bypasses the ladder: the parsed stdin
-snapshot is overlaid on the cache (`usage.Overlay` — per window, stdin wins,
-gaps fill from cache, ExtraUsage always from the fresh side) and served with
-`source: "stdin"`. It NEVER calls the API and never writes the cache; the
-disk-cache read is its only I/O. Cache-sourced windows from a cache older
-than the TTL mark the state stale.
+ResolveStdin (statusline only) overlays the parsed stdin snapshot on the cache
+(`usage.Overlay` — per window, stdin wins, gaps fill from cache, ExtraUsage
+always from the fresh side) and serves it with `source: "stdin"`. When stdin is
+incomplete and no refresh has run within the TTL it does one bounded refresh
+(reusing `resolveToken`/`fetchWithToken` + `Reconcile` + `storeCache`) to heal
+the gaps, then re-overlays. The refresh gate keys off the *later* of the cache's
+`fetched_at` and `attempted_at`, NOT off data staleness alone: on refresh failure
+`Cache.Touch(now)` records the attempt (payload/`fetched_at` untouched), so a
+persistently failing endpoint still yields ≤1 attempt per TTL instead of a fetch
+on every statusline tick. The served state's `stale` marker keys off data age
+(`fetched_at`), so a failed refresh still shows `≈` honestly while the attempt is
+throttled. No suspect guard runs here — the statusline mirrors Claude Code's own
+displayed values; the ≥30pt-drop guard (`Reconcile`) and its `(suspect)` marker
+live on the ladder (`now`), where the marker is actually visible.
 
 ## Invariants — do not break these
 
@@ -95,12 +105,21 @@ than the TTL mark the state stale.
    seconds. Within the cache TTL ccx must NEVER touch the API; the disk cache
    (+ flock) caps request volume at ~1 per TTL across ALL invocations.
    Breaking this gets the user rate-limited (the endpoint 429s aggressively).
-   The stdin rate_limits path is stricter still: it never calls the API at
-   all — a disk-cache read to fill windows stdin lacks is its only I/O.
+   The stdin rate_limits path keeps that cap: it does at most one bounded
+   refresh per TTL, gated on the *later* of the cache's `fetched_at` and
+   `attempted_at`. A failed refresh records its attempt (`Cache.Touch`) so a
+   failing/429ing endpoint does NOT re-fetch on every statusline tick; a
+   complete stdin snapshot means zero calls. Both paths share the flock'd cache,
+   so the per-machine bound holds. Caveat: the check→fetch→store sequence is not
+   locked end-to-end, so several concurrent sessions crossing the TTL boundary
+   at once can each fetch before the first store lands (bounded by session
+   count, self-healing on the next store); the flock serializes writes, not
+   fetch de-duplication.
 2. **Token hygiene.** The OAuth token is read-only and in-memory only. It must
    never appear in logs, error messages, the cache file, test fixtures, or
    `String()` output (creds redacts). The cache stores only
-   `{fetched_at, payload}` where payload is a token-free usage snapshot.
+   `{fetched_at, attempted_at?, payload}` where payload is a token-free usage
+   snapshot and `attempted_at` is an optional refresh-attempt timestamp.
 3. **No self refresh.** Never run an OAuth refresh grant. Refresh tokens may
    rotate; consuming one can invalidate Claude Code's stored refresh token and
    break the user's login. On expiry: re-read `~/.claude/.credentials.json`
@@ -238,3 +257,23 @@ go vet ./... && gofmt -l .
 - `utilization` int → float64 after a live API test caught fractional values
   (also needed for future burn-rate math).
 - Engine returns State-only (no error): every failure is a degraded State.
+- stdin path cache freshness: when Claude Code reliably pipes rate_limits the
+  ladder rarely runs. ResolveStdin does a bounded refresh (≤1/TTL) only when
+  stdin is incomplete, so the overall API cap holds and older-CC /
+  allowlist-filtered deployments self-heal instead of showing perpetually-stale
+  ≈ windows.
+- stdin refresh throttle keys off attempts, not data age: the refresh gate must
+  use the last *attempt* time, not just cache staleness. Keying off staleness
+  alone means a failed refresh (429 / network down) leaves the cache stale, so
+  every statusline tick — auto-fired every few seconds — re-fetches, amplifying
+  the exact 429 the tool exists to avoid. So a failed refresh writes an
+  `attempted_at` stamp (`Cache.Touch`) that throttles the next attempt for a
+  TTL, while the `stale`/≈ marker stays keyed to data age (`fetched_at`) so the
+  UI is still honest. `now`/Resolve deliberately ignores `attempted_at` (manual
+  one-shot; a single fetch is fine) and Touch never moves `fetched_at`, so the
+  ladder path is unaffected.
+- stdin path suspect guard: intentionally absent. The statusline mirrors
+  Claude Code's own displayed values; the ≥30pt-drop guard (`Reconcile`)
+  applies only to fetched/ladder data and renders its `(suspect)` marker in
+  `now`, where the marker is visible. Guarding on the statusline would make
+  ccx diverge from CC's UI while hiding the reason.

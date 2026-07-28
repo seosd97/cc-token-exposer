@@ -46,6 +46,49 @@ func TestLoadMiss(t *testing.T) {
 	}
 }
 
+func TestTouchRecordsAttemptPreservingData(t *testing.T) {
+	c := tempCache(t)
+	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
+	if err := c.Store(payload, fetchedAt); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	attemptedAt := fetchedAt.Add(10 * time.Minute)
+	if err := c.Touch(attemptedAt); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+
+	e, err := c.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !e.FetchedAt.Equal(fetchedAt) {
+		t.Errorf("Touch changed FetchedAt = %v, want %v preserved", e.FetchedAt, fetchedAt)
+	}
+	if !jsonEqual(t, e.Payload, payload) {
+		t.Errorf("Touch changed payload = %s, want %s preserved", e.Payload, payload)
+	}
+	if e.AttemptedAt == nil || !e.AttemptedAt.Equal(attemptedAt) {
+		t.Errorf("AttemptedAt = %v, want %v", e.AttemptedAt, attemptedAt)
+	}
+}
+
+func TestTouchWithoutEntryRecordsAttempt(t *testing.T) {
+	c := tempCache(t)
+	attemptedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	if err := c.Touch(attemptedAt); err != nil {
+		t.Fatalf("Touch on empty cache: %v", err)
+	}
+	e, err := c.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if e.AttemptedAt == nil || !e.AttemptedAt.Equal(attemptedAt) {
+		t.Errorf("AttemptedAt = %v, want %v", e.AttemptedAt, attemptedAt)
+	}
+}
+
 func TestFreshTTL(t *testing.T) {
 	c := tempCache(t, WithTTL(120*time.Second))
 	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
