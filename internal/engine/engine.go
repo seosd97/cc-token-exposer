@@ -33,8 +33,9 @@ type Fetcher interface {
 }
 
 type Cache interface {
-	Load() (payload []byte, storedAt time.Time, err error)
+	Load() (payload []byte, storedAt time.Time, attemptedAt time.Time, err error)
 	Store(payload []byte, storedAt time.Time) error
+	Touch(attemptedAt time.Time) error
 }
 
 type TranscriptProbe interface {
@@ -80,7 +81,7 @@ func New(o Options) *Engine {
 
 func (e *Engine) Resolve(ctx context.Context) *schema.State {
 	now := e.clock.Now()
-	cachedSnap, storedAt, haveCache := e.loadCache()
+	cachedSnap, storedAt, _, haveCache := e.loadCache()
 
 	if haveCache {
 		if age := now.Sub(storedAt); age >= 0 && age < e.ttl {
@@ -148,31 +149,43 @@ func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now 
 }
 
 // ResolveStdin serves a snapshot piped in by Claude Code's statusline, overlaid
-// on the disk cache. When stdin is incomplete and the cache is stale it does one
-// bounded refresh (≤1/TTL, reusing resolveToken/fetchWithToken + Reconcile +
-// storeCache) to heal the gaps, then re-overlays; on failure it serves the
-// cache-backed merge marked stale. No suspect guard runs here — the statusline
-// mirrors Claude Code's own values; the guard and its marker live on the ladder.
+// on the disk cache. When stdin is incomplete and no refresh has run within the
+// TTL it does one bounded refresh (reusing resolveToken/fetchWithToken +
+// Reconcile + storeCache) to heal the gaps, then re-overlays; a failed refresh
+// records its attempt via Cache.Touch so the ≤1/TTL budget holds even under a
+// failing endpoint, and the cache-backed merge is served marked stale. No
+// suspect guard runs here — the statusline mirrors Claude Code's own values;
+// the guard and its marker live on the ladder.
 func (e *Engine) ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schema.State {
 	if stdin == nil {
 		return e.Resolve(ctx)
 	}
 	now := e.clock.Now()
-	cachedSnap, storedAt, haveCache := e.loadCache()
-	cacheStale := !haveCache || now.Sub(storedAt) >= e.ttl
-	if cacheStale && !stdinComplete(stdin) {
+	cachedSnap, storedAt, attemptedAt, haveCache := e.loadCache()
+	dataStale := !haveCache || now.Sub(storedAt) >= e.ttl
+	lastAttempt := storedAt
+	if attemptedAt.After(lastAttempt) {
+		lastAttempt = attemptedAt
+	}
+	if e.refreshDue(now, lastAttempt) && !stdinComplete(stdin) {
 		if fresh := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
 			cachedSnap = fresh
-			cacheStale = false
+			dataStale = false
+		} else if e.cache != nil {
+			_ = e.cache.Touch(now)
 		}
 	}
 	merged, usedCache := usage.Overlay(stdin, cachedSnap)
-	stale := usedCache && cacheStale
+	stale := usedCache && dataStale
 	var age time.Duration
 	if stale {
 		age = now.Sub(storedAt)
 	}
 	return snapshotState(merged, schema.SourceStdin, stale, age, schema.AuthOK)
+}
+
+func (e *Engine) refreshDue(now, lastAttempt time.Time) bool {
+	return lastAttempt.IsZero() || now.Sub(lastAttempt) >= e.ttl
 }
 
 // refreshSnapshot performs a best-effort fresh fetch, reconciles it against the
@@ -239,19 +252,22 @@ func (e *Engine) probeTranscript(now time.Time) *schema.LimitHit {
 	return lh
 }
 
-func (e *Engine) loadCache() (*usage.Snapshot, time.Time, bool) {
+func (e *Engine) loadCache() (*usage.Snapshot, time.Time, time.Time, bool) {
 	if e.cache == nil {
-		return nil, time.Time{}, false
+		return nil, time.Time{}, time.Time{}, false
 	}
-	payload, storedAt, err := e.cache.Load()
+	payload, storedAt, attemptedAt, err := e.cache.Load()
 	if err != nil || len(payload) == 0 {
-		return nil, time.Time{}, false
+		return nil, time.Time{}, attemptedAt, false
 	}
 	var snap usage.Snapshot
 	if err := json.Unmarshal(payload, &snap); err != nil {
-		return nil, time.Time{}, false
+		return nil, time.Time{}, attemptedAt, false
 	}
-	return &snap, storedAt, true
+	if snap.FiveHour == nil && snap.SevenDay == nil && len(snap.ScopedLimits) == 0 {
+		return nil, storedAt, attemptedAt, false
+	}
+	return &snap, storedAt, attemptedAt, true
 }
 
 func (e *Engine) storeCache(snap *usage.Snapshot) {

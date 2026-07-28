@@ -18,8 +18,9 @@ const DefaultTTL = 120 * time.Second
 var ErrMiss = errors.New("cache: no entry")
 
 type Entry struct {
-	FetchedAt time.Time       `json:"fetched_at"`
-	Payload   json.RawMessage `json:"payload"`
+	FetchedAt   time.Time       `json:"fetched_at"`
+	AttemptedAt *time.Time      `json:"attempted_at,omitempty"`
+	Payload     json.RawMessage `json:"payload"`
 }
 
 func (e *Entry) Age(now time.Time) time.Duration { return now.Sub(e.FetchedAt) }
@@ -73,18 +74,91 @@ func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time) error {
 	if !json.Valid(payload) {
 		return errors.New("cache: payload is not valid JSON")
 	}
-	dir := filepath.Dir(c.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("cache: create dir: %w", err)
+	return c.withWriteLock(func() error {
+		return c.writeEntry(Entry{FetchedAt: fetchedAt, Payload: payload})
+	})
+}
+
+// Touch records a refresh attempt at now without altering the cached payload or
+// its fetched-at timestamp, so a failed refresh still counts against the
+// once-per-TTL budget. With no existing entry it records a payload-less attempt.
+func (c *Cache) Touch(attemptedAt time.Time) error {
+	return c.withWriteLock(func() error {
+		e, err := c.readEntry()
+		if err != nil {
+			if !errors.Is(err, ErrMiss) {
+				return err
+			}
+			e = &Entry{Payload: json.RawMessage("null")}
+		}
+		at := attemptedAt
+		e.AttemptedAt = &at
+		return c.writeEntry(*e)
+	})
+}
+
+func (c *Cache) Load() (*Entry, error) {
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
+		return nil, fmt.Errorf("cache: create dir: %w", err)
 	}
 
+	lock := flock.New(c.lockPath())
+	if err := lock.RLock(); err != nil {
+		return nil, fmt.Errorf("cache: acquire read lock: %w", err)
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	return c.readEntry()
+}
+
+func (c *Cache) Fresh(e *Entry, now time.Time) bool {
+	if e == nil {
+		return false
+	}
+	return e.Age(now) < c.ttl
+}
+
+func (c *Cache) withWriteLock(fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
+		return fmt.Errorf("cache: create dir: %w", err)
+	}
 	lock := flock.New(c.lockPath())
 	if err := lock.Lock(); err != nil {
 		return fmt.Errorf("cache: acquire write lock: %w", err)
 	}
 	defer func() { _ = lock.Unlock() }()
+	return fn()
+}
 
-	data, err := json.Marshal(Entry{FetchedAt: fetchedAt, Payload: payload})
+// readEntry reads and decodes the on-disk entry without locking; callers must
+// already hold the appropriate flock.
+func (c *Cache) readEntry() (*Entry, error) {
+	f, err := os.Open(c.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrMiss
+		}
+		return nil, fmt.Errorf("cache: open: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("cache: read: %w", err)
+	}
+
+	var e Entry
+	if err := json.Unmarshal(data, &e); err != nil {
+		return nil, fmt.Errorf("cache: decode entry: %w", err)
+	}
+	return &e, nil
+}
+
+// writeEntry atomically replaces the cache file with e; callers must already
+// hold the write flock and have ensured the parent directory exists.
+func (c *Cache) writeEntry(e Entry) error {
+	dir := filepath.Dir(c.path)
+	data, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("cache: marshal entry: %w", err)
 	}
@@ -107,43 +181,4 @@ func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time) error {
 		return fmt.Errorf("cache: rename temp: %w", err)
 	}
 	return nil
-}
-
-func (c *Cache) Load() (*Entry, error) {
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
-		return nil, fmt.Errorf("cache: create dir: %w", err)
-	}
-
-	lock := flock.New(c.lockPath())
-	if err := lock.RLock(); err != nil {
-		return nil, fmt.Errorf("cache: acquire read lock: %w", err)
-	}
-	defer func() { _ = lock.Unlock() }()
-
-	f, err := os.Open(c.path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, ErrMiss
-		}
-		return nil, fmt.Errorf("cache: open: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, fmt.Errorf("cache: read: %w", err)
-	}
-
-	var e Entry
-	if err := json.Unmarshal(data, &e); err != nil {
-		return nil, fmt.Errorf("cache: decode entry: %w", err)
-	}
-	return &e, nil
-}
-
-func (c *Cache) Fresh(e *Entry, now time.Time) bool {
-	if e == nil {
-		return false
-	}
-	return e.Age(now) < c.ttl
 }
