@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -173,6 +175,28 @@ func VerifyChecksum(data []byte, name string, checksums []byte) error {
 	sum := sha256.Sum256(data)
 	if got := hex.EncodeToString(sum[:]); got != want {
 		return fmt.Errorf("selfupdate: checksum mismatch for %s: got %s, want %s", name, got, want)
+	}
+	return nil
+}
+
+// VerifySignedChecksums confirms checksums carries a valid ed25519 signature
+// by the release public key: the .sig file holds base64(ed25519.Signature) of
+// the checksums bytes. This anchors trust beyond transit integrity — checksums
+// and archives come from the same release, so signature verification is what
+// stops a tampered release from installing arbitrary code.
+func VerifySignedChecksums(checksums, sig []byte, pub ed25519.PublicKey) error {
+	if len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("selfupdate: invalid public key length %d", len(pub))
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sig)))
+	if err != nil {
+		return fmt.Errorf("selfupdate: decode signature: %w", err)
+	}
+	if len(raw) != ed25519.SignatureSize {
+		return fmt.Errorf("selfupdate: signature has length %d, want %d", len(raw), ed25519.SignatureSize)
+	}
+	if !ed25519.Verify(pub, checksums, raw) {
+		return errors.New("selfupdate: checksums signature invalid")
 	}
 	return nil
 }

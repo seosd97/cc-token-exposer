@@ -1,9 +1,11 @@
 package usage
 
+import "github.com/seosd97/cc-token-exposer/internal/schema"
+
 // Overlay layers fresh over base per window: anything fresh provides wins,
 // anything it lacks falls back to base. ExtraUsage always comes from fresh
 // (Reconcile does the same). Reports whether base contributed.
-func Overlay(fresh, base *Snapshot) (*Snapshot, bool) {
+func Overlay(fresh, base *schema.Snapshot) (*schema.Snapshot, bool) {
 	if fresh == nil {
 		return base, base != nil
 	}
@@ -21,7 +23,7 @@ func Overlay(fresh, base *Snapshot) (*Snapshot, bool) {
 		used = true
 	}
 	if scopedMissing(out.ScopedLimits, base.ScopedLimits) {
-		m := make(map[string]*Window, len(out.ScopedLimits)+len(base.ScopedLimits))
+		m := make(map[string]*schema.Window, len(out.ScopedLimits)+len(base.ScopedLimits))
 		for name, w := range out.ScopedLimits {
 			m[name] = w
 		}
@@ -39,7 +41,7 @@ func Overlay(fresh, base *Snapshot) (*Snapshot, bool) {
 	return &out, used
 }
 
-func scopedMissing(fresh, base map[string]*Window) bool {
+func scopedMissing(fresh, base map[string]*schema.Window) bool {
 	for name, w := range base {
 		if w == nil {
 			continue

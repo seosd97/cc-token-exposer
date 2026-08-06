@@ -3,6 +3,8 @@ package usage
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
 // TestWindowUnmarshalNumberForms verifies utilization decodes from both int and
@@ -20,7 +22,7 @@ func TestWindowUnmarshalNumberForms(t *testing.T) {
 		{`{"utilization": 100}`, 100},
 	}
 	for _, tc := range cases {
-		var w Window
+		var w schema.Window
 		if err := json.Unmarshal([]byte(tc.in), &w); err != nil {
 			t.Errorf("Unmarshal(%s): %v", tc.in, err)
 			continue
@@ -37,7 +39,7 @@ func TestSnapshotDecodeFloatUtilization(t *testing.T) {
 		"seven_day":      {"utilization": 7.5,  "resets_at": "2026-06-18T00:00:00Z"},
 		"extra_usage":    {"utilization": 12.0}
 	}`
-	var snap Snapshot
+	var snap schema.Snapshot
 	if err := json.Unmarshal([]byte(body), &snap); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
@@ -53,12 +55,12 @@ func TestSnapshotDecodeFloatUtilization(t *testing.T) {
 }
 
 func TestWindowRoundTrip(t *testing.T) {
-	w := Window{Utilization: 42.5, Suspect: true}
+	w := schema.Window{Utilization: 42.5, Suspect: true}
 	b, err := json.Marshal(w)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	var got Window
+	var got schema.Window
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}

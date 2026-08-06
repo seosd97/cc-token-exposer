@@ -22,6 +22,8 @@ type LimitHit struct {
 
 const maxLineBytes = 8 << 20
 
+const tailChunkBytes = 512 << 10
+
 var resetRe = regexp.MustCompile(`(?i)resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?`)
 
 var limitRe = regexp.MustCompile(`(?i)\bsession limit\b`)
@@ -103,17 +105,50 @@ func ScanFile(path string, now time.Time, loc *time.Location) (*LimitHit, error)
 		return nil, fmt.Errorf("transcript: open: %w", err)
 	}
 	defer func() { _ = f.Close() }()
+	if info, ierr := f.Stat(); ierr == nil && info.Size() > tailChunkBytes {
+		if hit, herr := scanTail(f, info.Size(), now, loc); herr != nil || hit != nil {
+			return hit, herr
+		}
+		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
+			return nil, serr
+		}
+	}
 	return ScanReader(f, now, loc)
 }
 
-func ScanLatest(paths []string, now time.Time, loc *time.Location) (*LimitHit, error) {
+// scanTail reads the last tailChunkBytes of a file and scans only that region,
+// skipping the partial leading line. A limit-hit message is appended near the
+// end of a transcript, so this covers the common case without reading the whole
+// file; ScanFile falls back to a full scan when the tail finds nothing.
+func scanTail(f *os.File, size int64, now time.Time, loc *time.Location) (*LimitHit, error) {
+	off := size - tailChunkBytes
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, tailChunkBytes)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	data := buf[:n]
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		data = data[i+1:]
+	}
+	return ScanReader(bytes.NewReader(data), now, loc)
+}
+
+// ScanLatest scans files (newest first) and returns the limit hit with the
+// newest DetectedAt. It stops as soon as a file can no longer contain a newer
+// hit: a hit's timestamp never exceeds the mtime of the file holding it, so a
+// file whose mtime is no later than the newest hit found so far can be skipped.
+func ScanLatest(files []TranscriptFile, now time.Time, loc *time.Location) (*LimitHit, error) {
 	var latest *LimitHit
-	for _, p := range paths {
-		hit, err := ScanFile(p, now, loc)
-		if err != nil {
-			continue
+	for _, f := range files {
+		if latest != nil && !f.ModTime.After(latest.DetectedAt) {
+			break
 		}
-		if hit == nil {
+		hit, err := ScanFile(f.Path, now, loc)
+		if err != nil || hit == nil {
 			continue
 		}
 		if latest == nil || hit.DetectedAt.After(latest.DetectedAt) {

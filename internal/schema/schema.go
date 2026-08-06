@@ -2,6 +2,7 @@
 package schema
 
 import (
+	"encoding/json"
 	"strconv"
 	"time"
 )
@@ -39,6 +40,18 @@ type ExtraUsage struct {
 }
 
 type Snapshot struct {
+	FetchedAt    time.Time          `json:"fetched_at"`
+	FiveHour     *Window            `json:"five_hour,omitempty"`
+	SevenDay     *Window            `json:"seven_day,omitempty"`
+	ScopedLimits map[string]*Window `json:"scoped_limits,omitempty"`
+	ExtraUsage   *ExtraUsage        `json:"extra_usage,omitempty"`
+}
+
+// snapshotWire mirrors Snapshot with the legacy per-model alias fields. The
+// aliases are a wire-compat concern, not internal state: MarshalJSON emits
+// seven_day_opus / seven_day_fable from ScopedLimits so legacy --json consumers
+// keep working while new models appear only under scoped_limits.
+type snapshotWire struct {
 	FetchedAt     time.Time          `json:"fetched_at"`
 	FiveHour      *Window            `json:"five_hour,omitempty"`
 	SevenDay      *Window            `json:"seven_day,omitempty"`
@@ -46,6 +59,23 @@ type Snapshot struct {
 	SevenDayFable *Window            `json:"seven_day_fable,omitempty"`
 	ScopedLimits  map[string]*Window `json:"scoped_limits,omitempty"`
 	ExtraUsage    *ExtraUsage        `json:"extra_usage,omitempty"`
+}
+
+func (s *Snapshot) MarshalJSON() ([]byte, error) {
+	w := snapshotWire{
+		FetchedAt:    s.FetchedAt,
+		FiveHour:     s.FiveHour,
+		SevenDay:     s.SevenDay,
+		ScopedLimits: s.ScopedLimits,
+		ExtraUsage:   s.ExtraUsage,
+	}
+	if v, ok := s.ScopedLimits["Opus"]; ok {
+		w.SevenDayOpus = v
+	}
+	if v, ok := s.ScopedLimits["Fable"]; ok {
+		w.SevenDayFable = v
+	}
+	return json.Marshal(w)
 }
 
 type LimitHit struct {

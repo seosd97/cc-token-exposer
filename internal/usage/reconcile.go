@@ -1,10 +1,14 @@
 package usage
 
-import "time"
+import (
+	"time"
+
+	"github.com/seosd97/cc-token-exposer/internal/schema"
+)
 
 const SuspectDropThreshold = 30
 
-func Reconcile(prev, next *Snapshot, now time.Time) *Snapshot {
+func Reconcile(prev, next *schema.Snapshot, now time.Time) *schema.Snapshot {
 	if next == nil {
 		return nil
 	}
@@ -18,18 +22,18 @@ func Reconcile(prev, next *Snapshot, now time.Time) *Snapshot {
 	return &out
 }
 
-func reconcileScoped(prev, next map[string]*Window, now time.Time) map[string]*Window {
+func reconcileScoped(prev, next map[string]*schema.Window, now time.Time) map[string]*schema.Window {
 	if len(next) == 0 {
 		return nil
 	}
-	out := make(map[string]*Window, len(next))
+	out := make(map[string]*schema.Window, len(next))
 	for k, nw := range next {
 		out[k] = reconcileWindow(prev[k], nw, now)
 	}
 	return out
 }
 
-func reconcileWindow(prev, next *Window, now time.Time) *Window {
+func reconcileWindow(prev, next *schema.Window, now time.Time) *schema.Window {
 	if prev == nil || next == nil {
 		return next
 	}

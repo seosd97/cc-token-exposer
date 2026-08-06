@@ -11,7 +11,7 @@ const limitMessage = "session limit reached"
 const defaultMaxFiles = 64
 
 type Probe struct {
-	resolve  func() ([]string, error)
+	dir      func() (string, error)
 	loc      *time.Location
 	maxFiles int
 }
@@ -37,19 +37,15 @@ func WithMaxFiles(n int) ProbeOption {
 func WithProjectsDir(dir string) ProbeOption {
 	return func(p *Probe) {
 		if dir != "" {
-			p.resolve = func() ([]string, error) { return FindTranscripts(dir) }
+			p.dir = func() (string, error) { return dir, nil }
 		}
 	}
 }
 
 func NewProbe(opts ...ProbeOption) *Probe {
 	p := &Probe{
-		resolve: func() ([]string, error) {
-			dir, err := DefaultProjectsDir()
-			if err != nil {
-				return nil, err
-			}
-			return FindTranscripts(dir)
+		dir: func() (string, error) {
+			return DefaultProjectsDir()
 		},
 		loc:      time.Local,
 		maxFiles: defaultMaxFiles,
@@ -61,16 +57,20 @@ func NewProbe(opts ...ProbeOption) *Probe {
 }
 
 func (p *Probe) Probe(now time.Time) (*schema.LimitHit, error) {
-	paths, err := p.resolve()
-	if err != nil || len(paths) == 0 {
+	dir, err := p.dir()
+	if err != nil || dir == "" {
 		return nil, nil
 	}
-	if p.maxFiles > 0 && len(paths) > p.maxFiles {
-		paths = paths[:p.maxFiles]
+	files, err := FindTranscripts(dir, p.maxFiles)
+	if err != nil || len(files) == 0 {
+		return nil, nil
 	}
 
-	hit, err := ScanLatest(paths, now, p.loc)
+	hit, err := ScanLatest(files, now, p.loc)
 	if err != nil || hit == nil {
+		return nil, nil
+	}
+	if hit.HasReset && !hit.ResetsAt.After(now) {
 		return nil, nil
 	}
 

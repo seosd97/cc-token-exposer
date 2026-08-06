@@ -67,10 +67,17 @@ func newUpdateCmd(up *selfupdate.Client) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			sig, err := up.FetchAsset(ctx, rel, selfupdate.ChecksumsAsset+".sig")
+			if err != nil {
+				return err
+			}
+			if err := selfupdate.VerifySignedChecksums(sums, sig, signerPublicKey()); err != nil {
+				return err
+			}
 			if err := selfupdate.VerifyChecksum(targz, asset, sums); err != nil {
 				return err
 			}
-			fmt.Fprintln(out, "verifying checksum ... ok")
+			fmt.Fprintln(out, "verifying checksum + signature ... ok")
 
 			bin, err := selfupdate.ExtractBinary(targz)
 			if err != nil {

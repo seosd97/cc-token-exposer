@@ -16,9 +16,10 @@ import (
 var ErrMiss = errors.New("cache: no entry")
 
 type Entry struct {
-	FetchedAt   time.Time       `json:"fetched_at"`
-	AttemptedAt *time.Time      `json:"attempted_at,omitempty"`
-	Payload     json.RawMessage `json:"payload"`
+	FetchedAt    time.Time       `json:"fetched_at"`
+	AttemptedAt  *time.Time      `json:"attempted_at,omitempty"`
+	ScopedProbed bool            `json:"scoped_probed,omitempty"`
+	Payload      json.RawMessage `json:"payload"`
 }
 
 type Cache struct {
@@ -49,35 +50,55 @@ func (c *Cache) Path() string { return c.path }
 
 func (c *Cache) lockPath() string { return c.path + ".lock" }
 
-func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time) error {
+func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time, scopedProbed bool) error {
 	if !json.Valid(payload) {
 		return errors.New("cache: payload is not valid JSON")
 	}
 	return c.withWriteLock(func() error {
-		return c.writeEntry(Entry{FetchedAt: fetchedAt, Payload: payload})
+		return c.writeEntry(Entry{FetchedAt: fetchedAt, ScopedProbed: scopedProbed, Payload: payload})
 	})
 }
 
-// Touch records a refresh attempt without altering the cached payload or its
-// fetched-at timestamp; with no existing entry it records a payload-less attempt.
-func (c *Cache) Touch(attemptedAt time.Time) error {
-	return c.withWriteLock(func() error {
+// ClaimRefresh atomically claims a refresh slot: it records an attempt at now
+// only when the last attempt (the later of fetched_at and attempted_at) is
+// absent or older than backoff, reporting whether a slot was claimed. The
+// check-and-set runs under the write flock, so concurrent claimants across
+// processes are deduplicated.
+func (c *Cache) ClaimRefresh(now time.Time, backoff time.Duration) (bool, error) {
+	var claimed bool
+	err := c.withWriteLock(func() error {
 		e, err := c.readEntry()
 		if err != nil {
 			if !errors.Is(err, ErrMiss) {
 				return err
 			}
-			e = &Entry{Payload: json.RawMessage("null")}
+			claimed = true
+			at := now
+			return c.writeEntry(Entry{AttemptedAt: &at, Payload: json.RawMessage("null")})
 		}
-		at := attemptedAt
+		last := e.FetchedAt
+		if e.AttemptedAt != nil && e.AttemptedAt.After(last) {
+			last = *e.AttemptedAt
+		}
+		if !last.IsZero() && now.Sub(last) < backoff {
+			return nil
+		}
+		claimed = true
+		at := now
 		e.AttemptedAt = &at
 		return c.writeEntry(*e)
 	})
+	return claimed, err
 }
 
 func (c *Cache) Load() (*Entry, error) {
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
-		return nil, fmt.Errorf("cache: create dir: %w", err)
+	// A stat pre-check lets the cold-start hot path (no cache file at all)
+	// skip the flock entirely and return a miss fast.
+	if _, err := os.Stat(c.path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrMiss
+		}
+		return nil, fmt.Errorf("cache: stat: %w", err)
 	}
 
 	lock := flock.New(c.lockPath())

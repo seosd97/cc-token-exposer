@@ -3,16 +3,18 @@ package usage
 import (
 	"testing"
 	"time"
+
+	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
 var mergeBase = time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 
-func owin(util float64) *Window {
-	return &Window{Utilization: util, ResetsAt: mergeBase.Add(time.Hour)}
+func owin(util float64) *schema.Window {
+	return &schema.Window{Utilization: util, ResetsAt: mergeBase.Add(time.Hour)}
 }
 
 func TestOverlayNilFreshReturnsBase(t *testing.T) {
-	base := &Snapshot{FiveHour: owin(10)}
+	base := &schema.Snapshot{FiveHour: owin(10)}
 	got, used := Overlay(nil, base)
 	if got != base || !used {
 		t.Fatalf("got %v used=%v, want base/true", got, used)
@@ -23,16 +25,16 @@ func TestOverlayNilFreshReturnsBase(t *testing.T) {
 }
 
 func TestOverlayFreshCompleteIgnoresBase(t *testing.T) {
-	fresh := &Snapshot{
+	fresh := &schema.Snapshot{
 		FiveHour:     owin(20),
 		SevenDay:     owin(30),
-		ScopedLimits: map[string]*Window{"Fable": owin(40), "Opus": owin(50)},
-		ExtraUsage:   &ExtraUsage{Utilization: ptr(5.0)},
+		ScopedLimits: map[string]*schema.Window{"Fable": owin(40), "Opus": owin(50)},
+		ExtraUsage:   &schema.ExtraUsage{Utilization: ptr(5.0)},
 	}
-	base := &Snapshot{
+	base := &schema.Snapshot{
 		FiveHour:     owin(99),
 		SevenDay:     owin(99),
-		ScopedLimits: map[string]*Window{"Fable": owin(99)},
+		ScopedLimits: map[string]*schema.Window{"Fable": owin(99)},
 	}
 	got, used := Overlay(fresh, base)
 	if used {
@@ -45,12 +47,12 @@ func TestOverlayFreshCompleteIgnoresBase(t *testing.T) {
 }
 
 func TestOverlayFillsGapsFromBase(t *testing.T) {
-	fresh := &Snapshot{FiveHour: owin(20)}
-	base := &Snapshot{
+	fresh := &schema.Snapshot{FiveHour: owin(20)}
+	base := &schema.Snapshot{
 		FiveHour:     owin(99),
 		SevenDay:     owin(30),
-		ScopedLimits: map[string]*Window{"Fable": owin(40), "Opus": owin(50)},
-		ExtraUsage:   &ExtraUsage{Utilization: ptr(5.0)},
+		ScopedLimits: map[string]*schema.Window{"Fable": owin(40), "Opus": owin(50)},
+		ExtraUsage:   &schema.ExtraUsage{Utilization: ptr(5.0)},
 	}
 	got, used := Overlay(fresh, base)
 	if !used {
@@ -71,8 +73,8 @@ func TestOverlayFillsGapsFromBase(t *testing.T) {
 }
 
 func TestOverlayScopedUnionFreshWinsPerName(t *testing.T) {
-	fresh := &Snapshot{ScopedLimits: map[string]*Window{"Fable": owin(11)}}
-	base := &Snapshot{ScopedLimits: map[string]*Window{"Fable": owin(99), "Opus": owin(50)}}
+	fresh := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": owin(11)}}
+	base := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": owin(99), "Opus": owin(50)}}
 	got, used := Overlay(fresh, base)
 	if !used {
 		t.Fatal("base Opus should contribute")
@@ -89,8 +91,8 @@ func TestOverlayScopedUnionFreshWinsPerName(t *testing.T) {
 }
 
 func TestOverlaySkipsNilBaseWindows(t *testing.T) {
-	fresh := &Snapshot{FiveHour: owin(20)}
-	base := &Snapshot{ScopedLimits: map[string]*Window{"Fable": nil}}
+	fresh := &schema.Snapshot{FiveHour: owin(20)}
+	base := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": nil}}
 	got, used := Overlay(fresh, base)
 	if used {
 		t.Error("nil base windows should not count as contributing")

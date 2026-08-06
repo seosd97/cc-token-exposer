@@ -29,13 +29,28 @@ type CredResolver interface {
 }
 
 type Fetcher interface {
-	Fetch(ctx context.Context, token string) (*usage.Snapshot, error)
+	Fetch(ctx context.Context, token string) (*usage.FetchedSnapshot, error)
+}
+
+type CacheEntry struct {
+	Payload      []byte
+	StoredAt     time.Time
+	AttemptedAt  time.Time
+	ScopedProbed bool
 }
 
 type Cache interface {
-	Load() (payload []byte, storedAt time.Time, attemptedAt time.Time, err error)
-	Store(payload []byte, storedAt time.Time) error
-	Touch(attemptedAt time.Time) error
+	Load() (*CacheEntry, error)
+	Store(e CacheEntry) error
+	ClaimRefresh(now time.Time, backoff time.Duration) (bool, error)
+}
+
+// Refresher starts a detached background refresh of the shared disk cache. The
+// statusline path never blocks on the network: it claims a slot, spawns the
+// refresher, and serves immediately; the refresher updates the cache for
+// subsequent ticks.
+type Refresher interface {
+	Spawn(ctx context.Context) error
 }
 
 type TranscriptProbe interface {
@@ -47,6 +62,7 @@ type Options struct {
 	Fetcher    Fetcher
 	Cache      Cache
 	Transcript TranscriptProbe
+	Refresher  Refresher
 	Clock      Clock
 	TTL        time.Duration
 }
@@ -56,6 +72,7 @@ type Engine struct {
 	fetcher    Fetcher
 	cache      Cache
 	transcript TranscriptProbe
+	refresher  Refresher
 	clock      Clock
 	ttl        time.Duration
 }
@@ -74,6 +91,7 @@ func New(o Options) *Engine {
 		fetcher:    o.Fetcher,
 		cache:      o.Cache,
 		transcript: o.Transcript,
+		refresher:  o.Refresher,
 		clock:      clock,
 		ttl:        ttl,
 	}
@@ -81,10 +99,10 @@ func New(o Options) *Engine {
 
 func (e *Engine) Resolve(ctx context.Context) *schema.State {
 	now := e.clock.Now()
-	cachedSnap, storedAt, _, haveCache := e.loadCache()
+	cachedSnap, meta, haveCache := e.loadCache()
 
 	if haveCache {
-		if age := now.Sub(storedAt); age >= 0 && age < e.ttl {
+		if age := now.Sub(meta.StoredAt); age >= 0 && age < e.ttl {
 			return snapshotState(cachedSnap, schema.SourceCache, false, 0, schema.AuthOK)
 		}
 	}
@@ -92,24 +110,24 @@ func (e *Engine) Resolve(ctx context.Context) *schema.State {
 	cr, auth := e.resolveToken(now)
 	if cr == nil {
 		if auth == schema.AuthMissing {
-			return e.degradeNoCreds(now, cachedSnap, storedAt, haveCache)
+			return e.degradeNoCreds(now, cachedSnap, meta.StoredAt, haveCache)
 		}
-		return e.degradeAuthExpired(now, cachedSnap, storedAt, haveCache)
+		return e.degradeAuthExpired(now, cachedSnap, meta.StoredAt, haveCache)
 	}
 
 	snap, ferr := e.fetchWithToken(ctx, cr, now)
 	if ferr == nil {
-		merged := usage.Reconcile(cachedSnap, snap, now)
-		e.storeCache(merged)
+		merged := usage.Reconcile(cachedSnap, snap.Snapshot, now)
+		e.storeCache(merged, snap.ScopedProbed)
 		return snapshotState(merged, schema.SourceOAuth, false, 0, schema.AuthOK)
 	}
 
 	if errors.Is(ferr, usage.ErrAuth) {
-		return e.degradeAuthExpired(now, cachedSnap, storedAt, haveCache)
+		return e.degradeAuthExpired(now, cachedSnap, meta.StoredAt, haveCache)
 	}
 
 	if haveCache {
-		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthOK)
+		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(meta.StoredAt), schema.AuthOK)
 	}
 	return e.degradeNoData(now, schema.AuthOK, "usage fetch failed and no cache is available")
 }
@@ -134,7 +152,7 @@ func (e *Engine) resolveToken(now time.Time) (*creds.Credentials, schema.AuthSta
 // fetchWithToken fetches a snapshot, retrying once with a fresh token on a 401
 // if Claude Code has rotated it meanwhile. It returns the original error when
 // the retry is not applicable or also fails.
-func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now time.Time) (*usage.Snapshot, error) {
+func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now time.Time) (*usage.FetchedSnapshot, error) {
 	snap, err := e.fetcher.Fetch(ctx, cr.AccessToken)
 	if err == nil || !errors.Is(err, usage.ErrAuth) {
 		return snap, err
@@ -152,49 +170,44 @@ func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now 
 // on the disk cache. Stdin counts as incomplete while it misses any window the
 // cache carries — crucially a scoped model CC's projection omits, like Fable —
 // or while no probed cache exists to judge against, so those gaps heal instead
-// of freezing. When incomplete and no refresh has run within the TTL it does
-// one bounded refresh (reusing resolveToken/fetchWithToken + Reconcile +
-// storeCache), then re-overlays; a failed refresh records its attempt via
-// Cache.Touch so the ≤1/TTL budget holds even under a failing endpoint, and
-// the cache-backed merge is served marked stale. No suspect guard runs here —
-// the statusline mirrors Claude Code's own values; the guard and its marker
-// live on the ladder.
-func (e *Engine) ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schema.State {
+// of freezing. When incomplete, it claims a refresh slot (claim + spawn are
+// atomic and deduped against concurrent invocations via the cache flock), spawns
+// the detached refresher, and serves the overlay immediately — the statusline
+// path never blocks on the network. A spawn failure falls back to one bounded
+// synchronous refresh. No suspect guard runs here — the statusline mirrors
+// Claude Code's own values; the guard and its marker live on the ladder.
+func (e *Engine) ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State {
 	if stdin == nil {
 		return e.Resolve(ctx)
 	}
 	now := e.clock.Now()
-	cachedSnap, storedAt, attemptedAt, haveCache := e.loadCache()
-	dataStale := !haveCache || now.Sub(storedAt) >= e.ttl
-	lastAttempt := storedAt
-	if attemptedAt.After(lastAttempt) {
-		lastAttempt = attemptedAt
-	}
-	if e.refreshDue(now, lastAttempt) && !stdinComplete(stdin, cachedSnap) {
-		if fresh := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
-			cachedSnap = fresh
-			dataStale = false
-		} else if e.cache != nil {
-			_ = e.cache.Touch(now)
+	cachedSnap, meta, haveCache := e.loadCache()
+	dataStale := !haveCache || now.Sub(meta.StoredAt) >= e.ttl
+	if !stdinComplete(stdin, cachedSnap, meta.ScopedProbed) {
+		if e.cache != nil && e.refresher != nil {
+			if claimed, err := e.cache.ClaimRefresh(now, e.ttl); err == nil && claimed {
+				if serr := e.refresher.Spawn(ctx); serr != nil {
+					if fresh := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
+						cachedSnap = fresh
+						dataStale = false
+					}
+				}
+			}
 		}
 	}
 	merged, usedCache := usage.Overlay(stdin, cachedSnap)
 	stale := usedCache && dataStale
 	var age time.Duration
 	if stale {
-		age = now.Sub(storedAt)
+		age = now.Sub(meta.StoredAt)
 	}
 	return snapshotState(merged, schema.SourceStdin, stale, age, schema.AuthOK)
-}
-
-func (e *Engine) refreshDue(now, lastAttempt time.Time) bool {
-	return lastAttempt.IsZero() || now.Sub(lastAttempt) >= e.ttl
 }
 
 // refreshSnapshot performs a best-effort fresh fetch, reconciles it against the
 // cached snapshot, stores the result, and returns it. Returns nil on any
 // failure (missing ports, no usable credentials, fetch error).
-func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap *usage.Snapshot) *usage.Snapshot {
+func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap *schema.Snapshot) *schema.Snapshot {
 	if e.creds == nil || e.fetcher == nil {
 		return nil
 	}
@@ -208,8 +221,8 @@ func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap 
 	if err != nil {
 		return nil
 	}
-	merged := usage.Reconcile(cachedSnap, snap, now)
-	e.storeCache(merged)
+	merged := usage.Reconcile(cachedSnap, snap.Snapshot, now)
+	e.storeCache(merged, snap.ScopedProbed)
 	return merged
 }
 
@@ -217,14 +230,14 @@ func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap 
 // Without a probed cache it stays incomplete so the first tick bootstraps one:
 // that seeds the cache (and surfaces scoped models CC never pipes), and the
 // cache without scoped limits then proves the plan has none — ending the loop.
-func stdinComplete(s, base *usage.Snapshot) bool {
+func stdinComplete(s, base *schema.Snapshot, probed bool) bool {
 	if s == nil || s.FiveHour == nil || s.SevenDay == nil {
 		return false
 	}
 	if base == nil {
 		return false
 	}
-	if len(s.ScopedLimits) == 0 && !base.ScopedProbed {
+	if len(s.ScopedLimits) == 0 && !probed {
 		return false
 	}
 	for name, w := range base.ScopedLimits {
@@ -238,7 +251,7 @@ func stdinComplete(s, base *usage.Snapshot) bool {
 	return true
 }
 
-func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *usage.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
+func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *schema.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
 	if haveCache {
 		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthMissing)
 	}
@@ -248,7 +261,7 @@ func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *usage.Snapshot, store
 	return errorState(schema.AuthMissing, "no credentials found; run `claude` to log in")
 }
 
-func (e *Engine) degradeAuthExpired(now time.Time, cachedSnap *usage.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
+func (e *Engine) degradeAuthExpired(now time.Time, cachedSnap *schema.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
 	if haveCache {
 		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthExpired)
 	}
@@ -276,25 +289,28 @@ func (e *Engine) probeTranscript(now time.Time) *schema.LimitHit {
 	return lh
 }
 
-func (e *Engine) loadCache() (*usage.Snapshot, time.Time, time.Time, bool) {
+func (e *Engine) loadCache() (*schema.Snapshot, CacheEntry, bool) {
 	if e.cache == nil {
-		return nil, time.Time{}, time.Time{}, false
+		return nil, CacheEntry{}, false
 	}
-	payload, storedAt, attemptedAt, err := e.cache.Load()
-	if err != nil || len(payload) == 0 {
-		return nil, time.Time{}, attemptedAt, false
+	entry, err := e.cache.Load()
+	if err != nil {
+		return nil, CacheEntry{}, false
 	}
-	var snap usage.Snapshot
-	if err := json.Unmarshal(payload, &snap); err != nil {
-		return nil, time.Time{}, attemptedAt, false
+	if len(entry.Payload) == 0 {
+		return nil, *entry, false
+	}
+	var snap schema.Snapshot
+	if err := json.Unmarshal(entry.Payload, &snap); err != nil {
+		return nil, *entry, false
 	}
 	if snap.FiveHour == nil && snap.SevenDay == nil && len(snap.ScopedLimits) == 0 {
-		return nil, storedAt, attemptedAt, false
+		return nil, *entry, false
 	}
-	return &snap, storedAt, attemptedAt, true
+	return &snap, *entry, true
 }
 
-func (e *Engine) storeCache(snap *usage.Snapshot) {
+func (e *Engine) storeCache(snap *schema.Snapshot, probed bool) {
 	if e.cache == nil || snap == nil {
 		return
 	}
@@ -306,5 +322,9 @@ func (e *Engine) storeCache(snap *usage.Snapshot) {
 	if when.IsZero() {
 		when = e.clock.Now()
 	}
-	_ = e.cache.Store(payload, when)
+	_ = e.cache.Store(CacheEntry{
+		Payload:      payload,
+		StoredAt:     when,
+		ScopedProbed: probed,
+	})
 }

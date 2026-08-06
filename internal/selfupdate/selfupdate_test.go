@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -164,6 +167,34 @@ func TestVerifyChecksum(t *testing.T) {
 	}
 	if err := VerifyChecksum(data, "absent.tar.gz", good); err == nil {
 		t.Error("missing checksum entry accepted")
+	}
+}
+
+func TestVerifySignedChecksums(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	checksums := []byte("abc123  ccx_darwin_arm64.tar.gz\n")
+	sigFile := []byte(base64.StdEncoding.EncodeToString(ed25519.Sign(priv, checksums)) + "\n")
+
+	if err := VerifySignedChecksums(checksums, sigFile, pub); err != nil {
+		t.Fatalf("valid signature rejected: %v", err)
+	}
+	if err := VerifySignedChecksums([]byte("tampered"), sigFile, pub); err == nil {
+		t.Fatal("signature over wrong data accepted")
+	}
+	if err := VerifySignedChecksums(checksums, sigFile, ed25519.PublicKey(make([]byte, ed25519.PublicKeySize))); err == nil {
+		t.Fatal("signature by wrong key accepted")
+	}
+	if err := VerifySignedChecksums(checksums, []byte("not-base64!!"), pub); err == nil {
+		t.Fatal("malformed signature accepted")
+	}
+	if err := VerifySignedChecksums(checksums, []byte(base64.StdEncoding.EncodeToString([]byte("short"))+"\n"), pub); err == nil {
+		t.Fatal("short signature accepted")
+	}
+	if err := VerifySignedChecksums(checksums, sigFile, nil); err == nil {
+		t.Fatal("nil public key accepted")
 	}
 }
 

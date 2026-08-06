@@ -78,3 +78,57 @@ func TestSuspectOmittedWhenFalse(t *testing.T) {
 		t.Fatalf("suspect should be omitted when false: %s", b)
 	}
 }
+
+// TestSnapshotMarshalEmitsAliases guards the wire contract: legacy
+// seven_day_opus / seven_day_fable aliases must be emitted from ScopedLimits at
+// marshal time (only for those two models), and must round-trip through the
+// Snapshot type without leaking into internal state.
+func TestSnapshotMarshalEmitsAliases(t *testing.T) {
+	reset := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC)
+	s := &Snapshot{
+		FetchedAt: reset.Add(-time.Hour),
+		FiveHour:  &Window{Utilization: 23, ResetsAt: reset},
+		ScopedLimits: map[string]*Window{
+			"Opus":   {Utilization: 10, ResetsAt: reset},
+			"Fable":  {Utilization: 94, ResetsAt: reset},
+			"Sonnet": {Utilization: 33, ResetsAt: reset},
+		},
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(b, &generic); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := generic["seven_day_opus"]; !ok {
+		t.Fatalf("missing seven_day_opus alias: %s", b)
+	}
+	if _, ok := generic["seven_day_fable"]; !ok {
+		t.Fatalf("missing seven_day_fable alias: %s", b)
+	}
+	sc, _ := generic["scoped_limits"].(map[string]any)
+	if len(sc) != 3 {
+		t.Fatalf("scoped_limits has %d entries, want 3 (including new models): %s", len(sc), b)
+	}
+
+	var back Snapshot
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("unmarshal alias JSON: %v", err)
+	}
+	if back.ScopedLimits["Opus"] == nil || back.ScopedLimits["Fable"] == nil || back.ScopedLimits["Sonnet"] == nil {
+		t.Fatalf("aliases must not replace scoped_limits state: %+v", back.ScopedLimits)
+	}
+}
+
+func TestSnapshotMarshalOmitsAliasesWithoutScopedModels(t *testing.T) {
+	s := &Snapshot{FiveHour: &Window{Utilization: 5, ResetsAt: time.Now()}}
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "seven_day_opus") || strings.Contains(string(b), "seven_day_fable") {
+		t.Fatalf("aliases should be omitted when no scoped models: %s", b)
+	}
+}

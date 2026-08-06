@@ -11,19 +11,18 @@ import (
 
 	"github.com/seosd97/cc-token-exposer/internal/engine"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
-	"github.com/seosd97/cc-token-exposer/internal/usage"
 )
 
 // fakeResolver returns a canned State, exercising the full command path
 // (flags, rendering, exit codes) without any real IO.
 type fakeResolver struct {
 	st    *schema.State
-	stdin *usage.Snapshot
+	stdin *schema.Snapshot
 }
 
 func (f *fakeResolver) Resolve(context.Context) *schema.State { return f.st }
 
-func (f *fakeResolver) ResolveStdin(_ context.Context, stdin *usage.Snapshot) *schema.State {
+func (f *fakeResolver) ResolveStdin(_ context.Context, stdin *schema.Snapshot) *schema.State {
 	f.stdin = stdin
 	return f.st
 }
