@@ -17,9 +17,9 @@ func newNowCmd(res resolver) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "now",
 		Short: "Show current plan usage once",
-		Long: "Resolve and print the current plan credit-limit windows a single time " +
-			"(used by the CLI and statusline). Reads the disk cache when fresh and " +
-			"only calls the usage API when the cache TTL has elapsed.",
+		Long: "Resolve and print the current plan credit-limit windows a single time. " +
+			"Reads the disk cache when fresh and only calls the usage API when the " +
+			"cache TTL has elapsed.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), nowTimeout)

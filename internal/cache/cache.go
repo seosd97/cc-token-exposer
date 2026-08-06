@@ -13,8 +13,6 @@ import (
 	"github.com/gofrs/flock"
 )
 
-const DefaultTTL = 120 * time.Second
-
 var ErrMiss = errors.New("cache: no entry")
 
 type Entry struct {
@@ -23,21 +21,8 @@ type Entry struct {
 	Payload     json.RawMessage `json:"payload"`
 }
 
-func (e *Entry) Age(now time.Time) time.Duration { return now.Sub(e.FetchedAt) }
-
 type Cache struct {
 	path string
-	ttl  time.Duration
-}
-
-type Option func(*Cache)
-
-func WithTTL(ttl time.Duration) Option {
-	return func(c *Cache) {
-		if ttl > 0 {
-			c.ttl = ttl
-		}
-	}
 }
 
 func DefaultPath() (string, error) {
@@ -48,25 +33,19 @@ func DefaultPath() (string, error) {
 	return filepath.Join(dir, "cc-token-exposer", "snapshot.json"), nil
 }
 
-func New(opts ...Option) (*Cache, error) {
+func New() (*Cache, error) {
 	path, err := DefaultPath()
 	if err != nil {
 		return nil, err
 	}
-	return Open(path, opts...), nil
+	return Open(path), nil
 }
 
-func Open(path string, opts ...Option) *Cache {
-	c := &Cache{path: path, ttl: DefaultTTL}
-	for _, opt := range opts {
-		opt(c)
-	}
-	return c
+func Open(path string) *Cache {
+	return &Cache{path: path}
 }
 
 func (c *Cache) Path() string { return c.path }
-
-func (c *Cache) TTL() time.Duration { return c.ttl }
 
 func (c *Cache) lockPath() string { return c.path + ".lock" }
 
@@ -79,9 +58,8 @@ func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time) error {
 	})
 }
 
-// Touch records a refresh attempt at now without altering the cached payload or
-// its fetched-at timestamp, so a failed refresh still counts against the
-// once-per-TTL budget. With no existing entry it records a payload-less attempt.
+// Touch records a refresh attempt without altering the cached payload or its
+// fetched-at timestamp; with no existing entry it records a payload-less attempt.
 func (c *Cache) Touch(attemptedAt time.Time) error {
 	return c.withWriteLock(func() error {
 		e, err := c.readEntry()
@@ -109,13 +87,6 @@ func (c *Cache) Load() (*Entry, error) {
 	defer func() { _ = lock.Unlock() }()
 
 	return c.readEntry()
-}
-
-func (c *Cache) Fresh(e *Entry, now time.Time) bool {
-	if e == nil {
-		return false
-	}
-	return e.Age(now) < c.ttl
 }
 
 func (c *Cache) withWriteLock(fn func() error) error {

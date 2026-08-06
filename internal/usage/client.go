@@ -168,6 +168,7 @@ func (c *Client) decode(body io.Reader) (*Snapshot, error) {
 		FiveHour:     r.FiveHour,
 		SevenDay:     r.SevenDay,
 		ScopedLimits: scoped,
+		ScopedProbed: true,
 		ExtraUsage:   r.ExtraUsage,
 	}
 	return snap, nil

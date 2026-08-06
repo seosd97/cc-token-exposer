@@ -11,10 +11,10 @@ import (
 	"time"
 )
 
-func tempCache(t *testing.T, opts ...Option) *Cache {
+func tempCache(t *testing.T) *Cache {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "snapshot.json")
-	return Open(path, opts...)
+	return Open(path)
 }
 
 func TestStoreLoadRoundTrip(t *testing.T) {
@@ -86,38 +86,6 @@ func TestTouchWithoutEntryRecordsAttempt(t *testing.T) {
 	}
 	if e.AttemptedAt == nil || !e.AttemptedAt.Equal(attemptedAt) {
 		t.Errorf("AttemptedAt = %v, want %v", e.AttemptedAt, attemptedAt)
-	}
-}
-
-func TestFreshTTL(t *testing.T) {
-	c := tempCache(t, WithTTL(120*time.Second))
-	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	if err := c.Store(json.RawMessage(`{}`), base); err != nil {
-		t.Fatalf("Store: %v", err)
-	}
-	e, err := c.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	if !c.Fresh(e, base.Add(119*time.Second)) {
-		t.Errorf("expected fresh within TTL")
-	}
-	if c.Fresh(e, base.Add(120*time.Second)) {
-		t.Errorf("expected stale at exactly TTL")
-	}
-	if c.Fresh(e, base.Add(5*time.Minute)) {
-		t.Errorf("expected stale past TTL")
-	}
-	if c.Fresh(nil, base) {
-		t.Errorf("nil entry must not be fresh")
-	}
-}
-
-func TestDefaultTTL(t *testing.T) {
-	c := tempCache(t)
-	if c.TTL() != DefaultTTL {
-		t.Errorf("TTL = %v, want %v", c.TTL(), DefaultTTL)
 	}
 }
 
