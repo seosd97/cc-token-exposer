@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
 const (
@@ -90,7 +92,7 @@ func New(opts ...Option) *Client {
 	return c
 }
 
-func (c *Client) Fetch(ctx context.Context, token string) (*Snapshot, error) {
+func (c *Client) Fetch(ctx context.Context, token string) (*FetchedSnapshot, error) {
 	if token == "" {
 		return nil, fmt.Errorf("%w: empty token", ErrAuth)
 	}
@@ -129,11 +131,11 @@ func (c *Client) Fetch(ctx context.Context, token string) (*Snapshot, error) {
 }
 
 type apiResponse struct {
-	FiveHour     *Window      `json:"five_hour"`
-	SevenDay     *Window      `json:"seven_day"`
-	SevenDayOpus *Window      `json:"seven_day_opus"`
-	ExtraUsage   *ExtraUsage  `json:"extra_usage"`
-	Limits       []limitEntry `json:"limits"`
+	FiveHour     *schema.Window     `json:"five_hour"`
+	SevenDay     *schema.Window     `json:"seven_day"`
+	SevenDayOpus *schema.Window     `json:"seven_day_opus"`
+	ExtraUsage   *schema.ExtraUsage `json:"extra_usage"`
+	Limits       []limitEntry       `json:"limits"`
 }
 
 type limitEntry struct {
@@ -148,7 +150,7 @@ type limitEntry struct {
 	} `json:"scope"`
 }
 
-func (c *Client) decode(body io.Reader) (*Snapshot, error) {
+func (c *Client) decode(body io.Reader) (*FetchedSnapshot, error) {
 	var r apiResponse
 	dec := json.NewDecoder(io.LimitReader(body, maxBodyBytes))
 	if err := dec.Decode(&r); err != nil {
@@ -158,32 +160,31 @@ func (c *Client) decode(body io.Reader) (*Snapshot, error) {
 	if r.SevenDayOpus != nil {
 		if _, ok := scoped["Opus"]; !ok {
 			if scoped == nil {
-				scoped = make(map[string]*Window)
+				scoped = make(map[string]*schema.Window)
 			}
 			scoped["Opus"] = r.SevenDayOpus
 		}
 	}
-	snap := &Snapshot{
+	snap := &schema.Snapshot{
 		FetchedAt:    c.now(),
 		FiveHour:     r.FiveHour,
 		SevenDay:     r.SevenDay,
 		ScopedLimits: scoped,
-		ScopedProbed: true,
 		ExtraUsage:   r.ExtraUsage,
 	}
-	return snap, nil
+	return &FetchedSnapshot{Snapshot: snap, ScopedProbed: true}, nil
 }
 
-func decodeScopedLimits(limits []limitEntry) map[string]*Window {
-	var m map[string]*Window
+func decodeScopedLimits(limits []limitEntry) map[string]*schema.Window {
+	var m map[string]*schema.Window
 	for _, l := range limits {
 		if l.Scope == nil || l.Scope.Model == nil || l.Scope.Model.DisplayName == "" {
 			continue
 		}
 		if m == nil {
-			m = make(map[string]*Window)
+			m = make(map[string]*schema.Window)
 		}
-		m[l.Scope.Model.DisplayName] = &Window{Utilization: l.Percent, ResetsAt: l.ResetsAt}
+		m[l.Scope.Model.DisplayName] = &schema.Window{Utilization: l.Percent, ResetsAt: l.ResetsAt}
 	}
 	return m
 }

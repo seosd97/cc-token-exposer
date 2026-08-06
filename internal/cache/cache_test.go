@@ -22,7 +22,7 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"type":"snapshot","five_hour":{"utilization":23}}`)
 
-	if err := c.Store(payload, fetchedAt); err != nil {
+	if err := c.Store(payload, fetchedAt, false); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -46,17 +46,27 @@ func TestLoadMiss(t *testing.T) {
 	}
 }
 
-func TestTouchRecordsAttemptPreservingData(t *testing.T) {
+func TestLoadMissWhenParentDirAbsent(t *testing.T) {
+	// Loading a cache whose parent directory does not exist must be a fast
+	// miss, never a lock- or mkdir-induced error (hot path on cold start).
+	c := Open(filepath.Join(t.TempDir(), "missing", "snapshot.json"))
+	if _, err := c.Load(); err != ErrMiss {
+		t.Fatalf("Load with absent parent dir = %v, want ErrMiss", err)
+	}
+}
+
+func TestClaimRefreshRecordsAttemptPreservingData(t *testing.T) {
 	c := tempCache(t)
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, fetchedAt); err != nil {
+	if err := c.Store(payload, fetchedAt, false); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
-	attemptedAt := fetchedAt.Add(10 * time.Minute)
-	if err := c.Touch(attemptedAt); err != nil {
-		t.Fatalf("Touch: %v", err)
+	claim := fetchedAt.Add(10 * time.Minute)
+	got, err := c.ClaimRefresh(claim, time.Minute)
+	if err != nil || !got {
+		t.Fatalf("ClaimRefresh = %v, %v; want true, nil", got, err)
 	}
 
 	e, err := c.Load()
@@ -64,34 +74,91 @@ func TestTouchRecordsAttemptPreservingData(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	if !e.FetchedAt.Equal(fetchedAt) {
-		t.Errorf("Touch changed FetchedAt = %v, want %v preserved", e.FetchedAt, fetchedAt)
+		t.Errorf("ClaimRefresh changed FetchedAt = %v, want %v preserved", e.FetchedAt, fetchedAt)
 	}
 	if !jsonEqual(t, e.Payload, payload) {
-		t.Errorf("Touch changed payload = %s, want %s preserved", e.Payload, payload)
+		t.Errorf("ClaimRefresh changed payload = %s, want %s preserved", e.Payload, payload)
 	}
-	if e.AttemptedAt == nil || !e.AttemptedAt.Equal(attemptedAt) {
-		t.Errorf("AttemptedAt = %v, want %v", e.AttemptedAt, attemptedAt)
+	if e.AttemptedAt == nil || !e.AttemptedAt.Equal(claim) {
+		t.Errorf("AttemptedAt = %v, want %v", e.AttemptedAt, claim)
 	}
 }
 
-func TestTouchWithoutEntryRecordsAttempt(t *testing.T) {
+func TestClaimRefreshWithoutEntryClaimsOnce(t *testing.T) {
 	c := tempCache(t)
-	attemptedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	if err := c.Touch(attemptedAt); err != nil {
-		t.Fatalf("Touch on empty cache: %v", err)
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	got, err := c.ClaimRefresh(now, time.Hour)
+	if err != nil || !got {
+		t.Fatalf("ClaimRefresh on empty cache = %v, %v; want true, nil", got, err)
 	}
 	e, err := c.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if e.AttemptedAt == nil || !e.AttemptedAt.Equal(attemptedAt) {
-		t.Errorf("AttemptedAt = %v, want %v", e.AttemptedAt, attemptedAt)
+	if e.AttemptedAt == nil || !e.AttemptedAt.Equal(now) {
+		t.Errorf("AttemptedAt = %v, want %v", e.AttemptedAt, now)
+	}
+}
+
+func TestClaimRefreshThrottlesWithinBackoff(t *testing.T) {
+	c := tempCache(t)
+	t0 := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	const backoff = 120 * time.Second
+
+	if got, err := c.ClaimRefresh(t0, backoff); err != nil || !got {
+		t.Fatalf("first claim = %v, %v; want true", got, err)
+	}
+	if got, err := c.ClaimRefresh(t0.Add(time.Second), backoff); err != nil || got {
+		t.Fatalf("second claim within backoff = %v, %v; want false", got, err)
+	}
+	if got, err := c.ClaimRefresh(t0.Add(backoff), backoff); err != nil || !got {
+		t.Fatalf("claim after backoff = %v, %v; want true", got, err)
+	}
+	// A fresh data store becomes the later of the two and throttles a claim.
+	if err := c.Store(json.RawMessage(`{"v":1}`), t0.Add(2*backoff-20*time.Second), false); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if got, err := c.ClaimRefresh(t0.Add(2*backoff), backoff); err != nil || got {
+		t.Fatalf("claim gated on fresh fetched_at = %v, %v; want false", got, err)
+	}
+}
+
+// TestClaimRefreshConcurrent hammers ClaimRefresh from many goroutines at the
+// same instant and asserts exactly one claim wins — the cross-process (here
+// cross-goroutine) dedup that bounds refreshes to ≤1 per backoff.
+func TestClaimRefreshConcurrent(t *testing.T) {
+	c := tempCache(t)
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	const workers = 16
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	wins := 0
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := c.ClaimRefresh(now, time.Hour)
+			if err != nil {
+				t.Errorf("ClaimRefresh: %v", err)
+				return
+			}
+			if got {
+				mu.Lock()
+				wins++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("concurrent claims = %d, want exactly 1 winner", wins)
 	}
 }
 
 func TestStoreRejectsInvalidJSON(t *testing.T) {
 	c := tempCache(t)
-	if err := c.Store(json.RawMessage(`{not json`), time.Now()); err == nil {
+	if err := c.Store(json.RawMessage(`{not json`), time.Now(), false); err == nil {
 		t.Fatalf("Store accepted invalid JSON, want error")
 	}
 	// Nothing should have been written.
@@ -109,7 +176,7 @@ func TestNoTokenInCacheFile(t *testing.T) {
 	const token = "sk-ant-oat-SUPER-SECRET-TOKEN"
 	// A realistic, token-free State payload.
 	payload := json.RawMessage(`{"schema_version":1,"type":"snapshot","auth":"ok","five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, time.Now()); err != nil {
+	if err := c.Store(payload, time.Now(), false); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -137,14 +204,48 @@ func TestNoTokenInCacheFile(t *testing.T) {
 	}
 }
 
+// TestScopedProbedRoundTrip asserts the provenance flag is persisted at the
+// entry level (never inside the opaque payload) and round-trips through
+// Store/Load.
+func TestScopedProbedRoundTrip(t *testing.T) {
+	c := tempCache(t)
+	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
+
+	if err := c.Store(payload, fetchedAt, true); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	e, err := c.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !e.ScopedProbed {
+		t.Errorf("ScopedProbed = false, want true")
+	}
+	if strings.Contains(string(e.Payload), "scoped_probed") {
+		t.Errorf("scoped_probed leaked into the payload: %s", e.Payload)
+	}
+
+	if err := c.Store(payload, fetchedAt, false); err != nil {
+		t.Fatalf("Store(false): %v", err)
+	}
+	e, err = c.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if e.ScopedProbed {
+		t.Errorf("ScopedProbed = true, want false after Store(false)")
+	}
+}
+
 func TestStoreOverwrites(t *testing.T) {
 	c := tempCache(t)
 	t0 := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	if err := c.Store(json.RawMessage(`{"v":1}`), t0); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":1}`), t0, false); err != nil {
 		t.Fatalf("Store1: %v", err)
 	}
 	t1 := t0.Add(time.Minute)
-	if err := c.Store(json.RawMessage(`{"v":2}`), t1); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":2}`), t1, false); err != nil {
 		t.Fatalf("Store2: %v", err)
 	}
 	e, err := c.Load()
@@ -166,7 +267,7 @@ func TestConcurrentAccess(t *testing.T) {
 	c := tempCache(t)
 	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	// Seed so early readers don't all miss.
-	if err := c.Store(json.RawMessage(`{"writer":0,"i":0}`), base); err != nil {
+	if err := c.Store(json.RawMessage(`{"writer":0,"i":0}`), base, false); err != nil {
 		t.Fatalf("seed Store: %v", err)
 	}
 
@@ -179,7 +280,7 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				p := json.RawMessage(`{"writer":` + strconv.Itoa(w) + `,"i":` + strconv.Itoa(i) + `}`)
-				if err := c.Store(p, base.Add(time.Duration(i)*time.Second)); err != nil {
+				if err := c.Store(p, base.Add(time.Duration(i)*time.Second), false); err != nil {
 					t.Errorf("writer %d Store: %v", w, err)
 					return
 				}

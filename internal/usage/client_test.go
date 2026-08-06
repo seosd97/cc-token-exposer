@@ -73,24 +73,27 @@ func TestFetchOK(t *testing.T) {
 		t.Errorf("Accept = %q, want application/json", got)
 	}
 
-	if !snap.FetchedAt.Equal(now) {
-		t.Errorf("FetchedAt = %v, want %v", snap.FetchedAt, now)
+	if !snap.ScopedProbed {
+		t.Errorf("ScopedProbed = false, want true (decode sets API provenance)")
 	}
-	if snap.FiveHour == nil || snap.FiveHour.Utilization != 23 {
-		t.Errorf("five_hour = %+v, want utilization 23", snap.FiveHour)
+	if !snap.Snapshot.FetchedAt.Equal(now) {
+		t.Errorf("FetchedAt = %v, want %v", snap.Snapshot.FetchedAt, now)
+	}
+	if snap.Snapshot.FiveHour == nil || snap.Snapshot.FiveHour.Utilization != 23 {
+		t.Errorf("five_hour = %+v, want utilization 23", snap.Snapshot.FiveHour)
 	}
 	wantReset := time.Date(2026, 6, 12, 18, 0, 0, 0, time.UTC)
-	if snap.FiveHour == nil || !snap.FiveHour.ResetsAt.Equal(wantReset) {
-		t.Errorf("five_hour resets_at = %v, want %v", snap.FiveHour.ResetsAt, wantReset)
+	if snap.Snapshot.FiveHour == nil || !snap.Snapshot.FiveHour.ResetsAt.Equal(wantReset) {
+		t.Errorf("five_hour resets_at = %v, want %v", snap.Snapshot.FiveHour.ResetsAt, wantReset)
 	}
-	if snap.SevenDay == nil || snap.SevenDay.Utilization != 41 {
-		t.Errorf("seven_day = %+v, want utilization 41", snap.SevenDay)
+	if snap.Snapshot.SevenDay == nil || snap.Snapshot.SevenDay.Utilization != 41 {
+		t.Errorf("seven_day = %+v, want utilization 41", snap.Snapshot.SevenDay)
 	}
-	if w := snap.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
+	if w := snap.Snapshot.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
 		t.Errorf("scoped_limits[Opus] = %+v, want utilization 10 (legacy top-level fallback)", w)
 	}
-	if snap.ExtraUsage == nil || snap.ExtraUsage.Utilization == nil || *snap.ExtraUsage.Utilization != 5 {
-		t.Errorf("extra_usage = %+v, want utilization 5", snap.ExtraUsage)
+	if snap.Snapshot.ExtraUsage == nil || snap.Snapshot.ExtraUsage.Utilization == nil || *snap.Snapshot.ExtraUsage.Utilization != 5 {
+		t.Errorf("extra_usage = %+v, want utilization 5", snap.Snapshot.ExtraUsage)
 	}
 }
 
@@ -125,24 +128,24 @@ func TestFetchParsesScopedLimits(t *testing.T) {
 		t.Fatalf("Fetch: %v", err)
 	}
 
-	if len(snap.ScopedLimits) != 2 {
-		t.Fatalf("scoped_limits has %d entries, want 2", len(snap.ScopedLimits))
+	if len(snap.Snapshot.ScopedLimits) != 2 {
+		t.Fatalf("scoped_limits has %d entries, want 2", len(snap.Snapshot.ScopedLimits))
 	}
-	if w := snap.ScopedLimits["Fable"]; w == nil || w.Utilization != 94 {
+	if w := snap.Snapshot.ScopedLimits["Fable"]; w == nil || w.Utilization != 94 {
 		t.Errorf("scoped_limits[Fable] = %+v, want utilization 94 from limits[]", w)
 	}
 	wantReset := time.Date(2026, 7, 8, 20, 59, 59, 0, time.UTC)
-	if w := snap.ScopedLimits["Fable"]; w == nil || !w.ResetsAt.Equal(wantReset) {
-		t.Errorf("fable resets_at = %v, want %v", snap.ScopedLimits["Fable"], wantReset)
+	if w := snap.Snapshot.ScopedLimits["Fable"]; w == nil || !w.ResetsAt.Equal(wantReset) {
+		t.Errorf("fable resets_at = %v, want %v", snap.Snapshot.ScopedLimits["Fable"], wantReset)
 	}
-	if w := snap.ScopedLimits["Opus"]; w == nil || w.Utilization != 30 {
+	if w := snap.Snapshot.ScopedLimits["Opus"]; w == nil || w.Utilization != 30 {
 		t.Errorf("scoped_limits[Opus] = %+v, want 30 sourced from limits[]", w)
 	}
-	if snap.FiveHour == nil || snap.FiveHour.Utilization != 19 {
-		t.Errorf("five_hour = %+v, want 19", snap.FiveHour)
+	if snap.Snapshot.FiveHour == nil || snap.Snapshot.FiveHour.Utilization != 19 {
+		t.Errorf("five_hour = %+v, want 19", snap.Snapshot.FiveHour)
 	}
-	if snap.SevenDay == nil || snap.SevenDay.Utilization != 58 {
-		t.Errorf("seven_day = %+v, want 58", snap.SevenDay)
+	if snap.Snapshot.SevenDay == nil || snap.Snapshot.SevenDay.Utilization != 58 {
+		t.Errorf("seven_day = %+v, want 58", snap.Snapshot.SevenDay)
 	}
 }
 
@@ -158,10 +161,10 @@ func TestFetchScopedLimitsAbsentLeavesWindowsNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if _, ok := snap.ScopedLimits["Fable"]; ok {
-		t.Errorf("scoped_limits[Fable] should be absent, got %+v", snap.ScopedLimits["Fable"])
+	if _, ok := snap.Snapshot.ScopedLimits["Fable"]; ok {
+		t.Errorf("scoped_limits[Fable] should be absent, got %+v", snap.Snapshot.ScopedLimits["Fable"])
 	}
-	if w := snap.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
+	if w := snap.Snapshot.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
 		t.Errorf("scoped_limits[Opus] = %+v, want 10 from top-level fallback", w)
 	}
 }
@@ -186,13 +189,13 @@ func TestFetchDynamicScopedModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if len(snap.ScopedLimits) != 2 {
-		t.Fatalf("scoped_limits has %d entries, want 2", len(snap.ScopedLimits))
+	if len(snap.Snapshot.ScopedLimits) != 2 {
+		t.Fatalf("scoped_limits has %d entries, want 2", len(snap.Snapshot.ScopedLimits))
 	}
-	if w := snap.ScopedLimits["Sonnet"]; w == nil || w.Utilization != 33 {
+	if w := snap.Snapshot.ScopedLimits["Sonnet"]; w == nil || w.Utilization != 33 {
 		t.Errorf("scoped_limits[Sonnet] = %+v, want 33", w)
 	}
-	if w := snap.ScopedLimits["Cowork"]; w == nil || w.Utilization != 88 {
+	if w := snap.Snapshot.ScopedLimits["Cowork"]; w == nil || w.Utilization != 88 {
 		t.Errorf("scoped_limits[Cowork] = %+v, want 88", w)
 	}
 }

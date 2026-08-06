@@ -20,11 +20,11 @@ import (
 
 var version = "dev"
 
-var errSilentExit = errors.New("")
+var errSilentExit = errors.New("error state already printed to stdout")
 
 type resolver interface {
 	Resolve(ctx context.Context) *schema.State
-	ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schema.State
+	ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State
 }
 
 func versionString() string {
@@ -53,6 +53,7 @@ func main() {
 		Fetcher:    usage.New(),
 		Cache:      engine.CacheFrom(openCache()),
 		Transcript: transcript.NewProbe(),
+		Refresher:  processRefresher{},
 	})
 
 	root := &cobra.Command{
@@ -72,6 +73,7 @@ func main() {
 
 	root.AddCommand(newNowCmd(eng))
 	root.AddCommand(newStatuslineCmd(eng))
+	root.AddCommand(newRefreshCmd(eng))
 	root.AddCommand(newUpdateCmd(defaultUpdater()))
 
 	if err := root.Execute(); err != nil {

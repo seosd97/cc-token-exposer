@@ -86,7 +86,7 @@ replacing /Users/you/go/bin/ccx ...
 updated v0.1.0 -> v0.2.0
 ```
 
-It checks the latest release, downloads the binary for your OS/arch, verifies its SHA-256 against `checksums.txt`, and atomically replaces the running executable. Use `--check` to only report whether a newer version exists. Homebrew installs are left to `brew upgrade ccx`.
+It checks the latest release, downloads the binary for your OS/arch, verifies the release's ed25519 signature on `checksums.txt` (anchored to a public key embedded in the binary), verifies the archive's SHA-256, and atomically replaces the running executable. Use `--check` to only report whether a newer version exists. Homebrew installs are left to `brew upgrade ccx`.
 
 ---
 
@@ -96,7 +96,7 @@ It checks the latest release, downloads the binary for your OS/arch, verifies it
 
 `ccx` reuses Claude Code's existing OAuth token (read from `~/.claude/.credentials.json` or the macOS Keychain). The token is never persisted or printed — memory only.
 
-Responses are cached to disk for 120 seconds, so the statusline never hammers the API. On any failure the tool degrades gracefully: stale cache → transcript fallback → error state. It never shows a blank screen.
+Responses are cached to disk for 120 seconds, so the statusline never hammers the API. The statusline path never blocks on the network either: when the cache needs refreshing it spawns a detached background refresh and renders immediately, so gaps (like a per-model window Claude Code doesn't pipe) heal on the next tick. On any failure the tool degrades gracefully: stale cache → transcript fallback → error state. It never shows a blank screen.
 
 Cache: `<os.UserCacheDir()>/cc-token-exposer/snapshot.json`
 

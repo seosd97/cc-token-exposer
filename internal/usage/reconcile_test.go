@@ -3,6 +3,8 @@ package usage
 import (
 	"testing"
 	"time"
+
+	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
 func TestReconcile(t *testing.T) {
@@ -10,26 +12,26 @@ func TestReconcile(t *testing.T) {
 	future := now.Add(2 * time.Hour) // window not yet reset
 	past := now.Add(-1 * time.Hour)  // window already elapsed
 
-	win := func(util float64, reset time.Time) *Window {
-		return &Window{Utilization: util, ResetsAt: reset}
+	win := func(util float64, reset time.Time) *schema.Window {
+		return &schema.Window{Utilization: util, ResetsAt: reset}
 	}
 
 	t.Run("next nil returns nil", func(t *testing.T) {
-		if got := Reconcile(&Snapshot{}, nil, now); got != nil {
+		if got := Reconcile(&schema.Snapshot{}, nil, now); got != nil {
 			t.Fatalf("got %+v, want nil", got)
 		}
 	})
 
 	t.Run("prev nil returns next", func(t *testing.T) {
-		next := &Snapshot{FiveHour: win(10, future)}
+		next := &schema.Snapshot{FiveHour: win(10, future)}
 		if got := Reconcile(nil, next, now); got != next {
 			t.Fatalf("got %+v, want next unchanged", got)
 		}
 	})
 
 	t.Run("suspect drop within same window keeps prev", func(t *testing.T) {
-		prev := &Snapshot{FiveHour: win(80, future)}
-		next := &Snapshot{FiveHour: win(45, future)} // 35pt drop, > threshold
+		prev := &schema.Snapshot{FiveHour: win(80, future)}
+		next := &schema.Snapshot{FiveHour: win(45, future)} // 35pt drop, > threshold
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 80 {
 			t.Errorf("utilization = %v, want retained 80", got.FiveHour.Utilization)
@@ -44,8 +46,8 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("small drop is accepted", func(t *testing.T) {
-		prev := &Snapshot{FiveHour: win(80, future)}
-		next := &Snapshot{FiveHour: win(60, future)} // 20pt drop, < threshold
+		prev := &schema.Snapshot{FiveHour: win(80, future)}
+		next := &schema.Snapshot{FiveHour: win(60, future)} // 20pt drop, < threshold
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 60 || got.FiveHour.Suspect {
 			t.Errorf("got %+v, want 60 non-suspect", got.FiveHour)
@@ -53,8 +55,8 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("exactly threshold is suspect", func(t *testing.T) {
-		prev := &Snapshot{FiveHour: win(80, future)}
-		next := &Snapshot{FiveHour: win(50, future)} // exactly 30pt
+		prev := &schema.Snapshot{FiveHour: win(80, future)}
+		next := &schema.Snapshot{FiveHour: win(50, future)} // exactly 30pt
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 80 || !got.FiveHour.Suspect {
 			t.Errorf("got %+v, want retained 80 suspect", got.FiveHour)
@@ -62,8 +64,8 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("window reset allows legitimate drop", func(t *testing.T) {
-		prev := &Snapshot{FiveHour: win(80, past)}
-		next := &Snapshot{FiveHour: win(5, future)} // boundary advanced
+		prev := &schema.Snapshot{FiveHour: win(80, past)}
+		next := &schema.Snapshot{FiveHour: win(5, future)} // boundary advanced
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 5 || got.FiveHour.Suspect {
 			t.Errorf("got %+v, want fresh 5 non-suspect", got.FiveHour)
@@ -71,8 +73,8 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("increase is accepted", func(t *testing.T) {
-		prev := &Snapshot{FiveHour: win(40, future)}
-		next := &Snapshot{FiveHour: win(55, future)}
+		prev := &schema.Snapshot{FiveHour: win(40, future)}
+		next := &schema.Snapshot{FiveHour: win(55, future)}
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 55 || got.FiveHour.Suspect {
 			t.Errorf("got %+v, want 55 non-suspect", got.FiveHour)
@@ -80,8 +82,8 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("nil prev window passes next through", func(t *testing.T) {
-		prev := &Snapshot{}
-		next := &Snapshot{SevenDay: win(70, future)}
+		prev := &schema.Snapshot{}
+		next := &schema.Snapshot{SevenDay: win(70, future)}
 		got := Reconcile(prev, next, now)
 		if got.SevenDay.Utilization != 70 || got.SevenDay.Suspect {
 			t.Errorf("got %+v, want 70 non-suspect", got.SevenDay)
@@ -89,8 +91,8 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("scoped window reconciles like the others", func(t *testing.T) {
-		prev := &Snapshot{ScopedLimits: map[string]*Window{"Fable": win(90, future)}}
-		next := &Snapshot{ScopedLimits: map[string]*Window{"Fable": win(40, future)}}
+		prev := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": win(90, future)}}
+		next := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": win(40, future)}}
 		got := Reconcile(prev, next, now)
 		if w := got.ScopedLimits["Fable"]; w == nil || w.Utilization != 90 || !w.Suspect {
 			t.Errorf("scoped_limits[Fable] = %+v, want retained 90 suspect", w)
@@ -98,8 +100,8 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("scoped key disappears from next is dropped", func(t *testing.T) {
-		prev := &Snapshot{ScopedLimits: map[string]*Window{"Fable": win(90, future)}}
-		next := &Snapshot{ScopedLimits: map[string]*Window{"Opus": win(40, future)}}
+		prev := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": win(90, future)}}
+		next := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Opus": win(40, future)}}
 		got := Reconcile(prev, next, now)
 		if _, ok := got.ScopedLimits["Fable"]; ok {
 			t.Errorf("Fable should be dropped when absent from next")
@@ -110,11 +112,11 @@ func TestReconcile(t *testing.T) {
 	})
 
 	t.Run("per-window independence", func(t *testing.T) {
-		prev := &Snapshot{
+		prev := &schema.Snapshot{
 			FiveHour: win(90, future),
 			SevenDay: win(50, future),
 		}
-		next := &Snapshot{
+		next := &schema.Snapshot{
 			FiveHour: win(10, future), // suspect drop
 			SevenDay: win(55, future), // normal increase
 		}

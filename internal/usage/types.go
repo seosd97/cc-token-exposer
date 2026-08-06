@@ -1,23 +1,13 @@
 // Package usage implements the Anthropic OAuth usage HTTP client.
 package usage
 
-import "time"
+import "github.com/seosd97/cc-token-exposer/internal/schema"
 
-type Window struct {
-	Utilization float64   `json:"utilization"`
-	ResetsAt    time.Time `json:"resets_at"`
-	Suspect     bool      `json:"suspect,omitempty"`
-}
-
-type ExtraUsage struct {
-	Utilization *float64 `json:"utilization,omitempty"`
-}
-
-type Snapshot struct {
-	FetchedAt    time.Time          `json:"fetched_at"`
-	FiveHour     *Window            `json:"five_hour,omitempty"`
-	SevenDay     *Window            `json:"seven_day,omitempty"`
-	ScopedLimits map[string]*Window `json:"scoped_limits,omitempty"`
-	ScopedProbed bool               `json:"scoped_probed,omitempty"`
-	ExtraUsage   *ExtraUsage        `json:"extra_usage,omitempty"`
+// FetchedSnapshot is a snapshot plus its API provenance: ScopedProbed is set
+// only by a real endpoint decode (never by a stdin projection) and marks that
+// the API answered about scoped limits, which the engine uses to judge stdin
+// completeness.
+type FetchedSnapshot struct {
+	Snapshot     *schema.Snapshot
+	ScopedProbed bool
 }

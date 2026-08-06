@@ -42,39 +42,59 @@ threshold notifications (`internal/notify`), history logging
 
 ```
 cmd/ccx/main.go      composition root: builds the ONE production engine and
-                     injects it into commands as a `resolver` interface
+                     injects it into commands as a `resolver` interface;
+                     also composes the processRefresher (detached `ccx refresh`
+                     spawner) and the embedded release-signature public key
 cmd/ccx/now.go       rendering + exit-code policy
 cmd/ccx/statusline.go  statusline formatting + stdin rate_limits parsing
-                     (rate_limits -> usage.Snapshot -> engine.ResolveStdin)
+                     (rate_limits -> schema.Snapshot -> engine.ResolveStdin)
+cmd/ccx/refresh.go   hidden `ccx refresh` (internal): runs the ladder once,
+                     discards the State — the detached statusline refresher
 cmd/ccx/update.go    self-update command (thin) over internal/selfupdate
+cmd/ccx-sign/        release-time checksums signer (stdlib ed25519); never
+                     shipped (goreleaser builds only ./cmd/ccx)
 internal/
   selfupdate/  GitHub-release self-update: Latest (releases/latest) ->
-               FetchAsset -> VerifyChecksum (checksums.txt) -> ExtractBinary
+               FetchAsset -> VerifySignedChecksums (checksums.txt.sig is an
+               ed25519 signature over checksums.txt by the embedded public
+               key) -> VerifyChecksum (checksums.txt) -> ExtractBinary
                (tar.gz) -> Apply (atomic rename over os.Executable). Stdlib
                only; injectable http client + apiBase + platform for tests.
   engine/      THE BRAIN. Resolve(ctx) and ResolveStdin(ctx, snap) ->
-               *schema.State, runs the degrade ladder. Depends only on 5
+               *schema.State, runs the degrade ladder. Depends only on 6
                consumer-side interfaces it defines:
-               CredResolver / Fetcher / Cache / TranscriptProbe / Clock.
+               CredResolver / Fetcher / Cache / TranscriptProbe / Clock /
+               Refresher.
   schema/      The wire contract (State, schema_version=1). Leaf package,
                imports nothing internal. The PUBLIC CONTRACT is the JSON
                emitted by `now --json`, not the Go types (internal/ blocks
-               external import by design). ScopedLimits (map[string]*Window)
-               is additive over schema_version=1; seven_day_opus/fable remain
-               as backward-compat aliases.
+               external import by design). Snapshot is the ONE snapshot type
+               end-to-end: usage decodes straight into it and engine carries
+               it unmodified. The legacy seven_day_opus/fable compat aliases
+               are NOT struct fields — Snapshot.MarshalJSON injects them from
+               ScopedLimits at serialize time (new models stay under
+               scoped_limits only).
   usage/       oauth/usage HTTP client + Reconcile consistency guard +
-               Overlay gap-fill merge. decode populates Snapshot.ScopedLimits
-               dynamically from all weekly_scoped entries in limits[]; no
-               model name is hardcoded. decode is also the only producer that
-               sets Snapshot.ScopedProbed (marks "the API answered about
-               scoped limits"), which the engine uses to judge stdin
-               completeness.
+               Overlay gap-fill merge. Produces/operates on schema.Snapshot
+               directly (no duplicated window types). Fetch returns
+               usage.FetchedSnapshot{Snapshot, ScopedProbed}; decode is the
+               only producer that sets ScopedProbed=true (marks "the API
+               answered about scoped limits"), which the engine uses to judge
+               stdin completeness.
   creds/       credential acquisition: file > macOS keychain shell-out.
   cache/       flock-protected, atomic-write disk cache of opaque JSON.
-               Store records {fetched_at, payload}; Touch(attempted_at)
-               stamps a refresh attempt without touching payload/fetched_at.
+               Entry = {fetched_at, attempted_at?, scoped_probed, payload}.
+               ClaimRefresh(now, backoff) atomically claims a refresh slot
+               (check-and-set of attempted_at under the write lock, keyed off
+               the later of fetched_at/attempted_at), returning whether the
+               caller may spawn a refresher.
   transcript/  last-resort fallback: parses limit-hit messages from
                ~/.claude/projects/**/*.jsonl (read-only, best-effort).
+               FindTranscripts keeps only the k newest files via a bounded
+               heap; ScanLatest scans newest-first and stops once a file's
+               mtime can no longer hold a newer hit; ScanFile reads the last
+               512KB first, falling back to a full scan. Hits whose reset has
+               already passed are discarded.
 ```
 
 Engine's degrade ladder (Resolve never fails — it always returns a State
@@ -112,19 +132,28 @@ does not carry it.
            establishes the reference set. A plan proven scoped-less
            (`ScopedProbed`, no scoped keys) terminates the loop instead of
            polling forever.
-3. refresh bounded: `resolveToken` → `fetchWithToken` (5s budget) →
-           `Reconcile` → `storeCache`. Failure records the attempt via
-           `Cache.Touch` (`payload`/`fetched_at` untouched), so a persistently
-           failing endpoint still yields ≤1 attempt per TTL instead of a fetch
-           on every statusline tick.
+3. refresh detached: when incomplete, `Cache.ClaimRefresh(now, ttl)` atomically
+            claims a refresh slot (check-and-set of attempted_at under the write
+            flock, keyed off the later of fetched_at/attempted_at). On success
+            `Refresher.Spawn` starts a detached `ccx refresh` subprocess
+            (Setsid, stdio to /dev/null) that runs the ladder
+            (resolveToken → fetchWithToken → Reconcile → storeCache) and exits;
+            the parent serves the overlay immediately — the statusline path
+            never blocks on the network. A spawn failure falls back to one
+            bounded synchronous refresh (5s budget). Because the claim is atomic,
+            concurrent ticks/sessions dedupe to ≤1 spawn per TTL; a failed
+            refresh inside the child still counts as an attempt (the claim
+            already stamped attempted_at), so a persistently failing endpoint
+            yields ≤1 spawn per TTL instead of one per tick.
 4. serve   `usage.Overlay(stdin, cache)` — per window stdin wins, gaps fill
-           from cache, `ExtraUsage` always from the fresh side — served with
-           `source: "stdin"`. The `stale`/≈ marker keys off data age
-           (`fetched_at`), not attempt recency: a failed refresh shows ≈
-           honestly while the next attempt stays throttled. No suspect guard
-           runs here — the statusline mirrors Claude Code's own values; the
-           ≥30pt-drop guard and its `(suspect)` marker live on the ladder
-           (`now`), where the marker is visible.
+            from cache, `ExtraUsage` always from the fresh side — served with
+            `source: "stdin"`. The `stale`/≈ marker keys off data age
+            (`fetched_at`), not attempt recency: while a detached refresh is in
+            flight the line honestly shows ≈; after it lands, the next tick
+            serves the healed cache. No suspect guard runs here — the statusline
+            mirrors Claude Code's own values; the ≥30pt-drop guard and its
+            `(suspect)` marker live on the ladder (`now`), where the marker is
+            visible.
 
 ## Invariants — do not break these
 
@@ -140,15 +169,18 @@ snapshot covering every cache-known window means zero calls, while a
 cache-known scoped model missing from stdin (e.g. Fable) costs ≤1 call per
 TTL. A plan proven to have no scoped limits (`ScopedProbed`, no scoped keys)
 terminates the loop instead of polling forever. Both paths share the flock'd cache,
-   so the per-machine bound holds. Caveat: the check→fetch→store sequence is not
-   locked end-to-end, so several concurrent sessions crossing the TTL boundary
-   at once can each fetch before the first store lands (bounded by session
-   count, self-healing on the next store); the flock serializes writes, not
-   fetch de-duplication.
+   so the per-machine bound holds. The statusline path additionally dedupes
+   fetches across concurrent ticks/sessions: `ClaimRefresh` is an atomic
+   check-and-set under the write flock, so exactly one spawner wins per TTL even
+   when several sessions cross the boundary at once — the old
+   check→fetch→store race is closed on this path. Caveat: `now` (the manual
+   ladder) deliberately ignores attempted_at, so a few one-shot `ccx now`
+   invocations crossing the TTL at once can each fetch (bounded by how many
+   `now`s a user actually runs; self-healing on the next store).
 2. **Token hygiene.** The OAuth token is read-only and in-memory only. It must
    never appear in logs, error messages, the cache file, test fixtures, or
    `String()` output (creds redacts). The cache stores only
-   `{fetched_at, attempted_at?, payload}` where payload is a token-free usage
+    `{fetched_at, attempted_at?, scoped_probed, payload}` where payload is a token-free usage
    snapshot and `attempted_at` is an optional refresh-attempt timestamp.
 3. **No self refresh.** Never run an OAuth refresh grant. Refresh tokens may
    rotate; consuming one can invalidate Claude Code's stored refresh token and
@@ -275,6 +307,15 @@ go vet ./... && gofmt -l .
   (module `github.com/seosd97/cc-token-exposer`), so plain `v0.1.0` tags work.
   Before tagging: verify the GitHub account matches the module path (`github.com/seosd97/cc-token-exposer`), then
   tag `v0.1.0`. CI (.github/workflows/ci.yml) already exists.
+- **Signing key handoff (do once before the first release):** the ed25519
+  private key for release signing was generated locally and handed to the owner
+  at `…/opencode/ccx-signing.key` (0600) — move it into the GitHub Actions
+  secret `CCX_SIGNING_KEY` (raw base64, no newline) and then delete it; it must
+  never be committed. The matching public key is embedded in
+  `cmd/ccx/signkey.go`. The release workflow signs `checksums.txt` after
+  goreleaser uploads it and uploads `checksums.txt.sig`. To rotate: generate a
+  new keypair, update `signkey.go`, cut a release that users install manually,
+  and document that old binaries stop self-updating until reinstalled.
 
 ## Decision log (abridged)
 
@@ -296,12 +337,57 @@ go vet ./... && gofmt -l .
   use the last *attempt* time, not just cache staleness. Keying off staleness
   alone means a failed refresh (429 / network down) leaves the cache stale, so
   every statusline tick — auto-fired every few seconds — re-fetches, amplifying
-  the exact 429 the tool exists to avoid. So a failed refresh writes an
-  `attempted_at` stamp (`Cache.Touch`) that throttles the next attempt for a
-  TTL, while the `stale`/≈ marker stays keyed to data age (`fetched_at`) so the
-  UI is still honest. `now`/Resolve deliberately ignores `attempted_at` (manual
-  one-shot; a single fetch is fine) and Touch never moves `fetched_at`, so the
-  ladder path is unaffected.
+  the exact 429 the tool exists to avoid. So a refresh writes an `attempted_at`
+  stamp that throttles the next attempt for a TTL, while the `stale`/≈ marker
+  stays keyed to data age (`fetched_at`) so the UI is still honest.
+  `now`/Resolve deliberately ignores `attempted_at` (manual one-shot; a single
+  fetch is fine). Today the stamp and the gate live in one atomic operation:
+  `cache.ClaimRefresh` (check-and-set under the write flock) both decides a
+  slot is due AND records it, replacing the old synchronous
+  refresh-failure-`Touch` flow.
+- statusline refresh is detached, never synchronous: the statusline path must
+  not block the render on the network (Claude Code invokes it every few
+  seconds; a slow endpoint would stall or kill the tick). When stdin is
+  incomplete and a claim succeeds, the engine spawns a detached `ccx refresh`
+  (Setsid, stdio /dev/null) that runs the ladder and stores the cache for the
+  NEXT tick; the parent serves the overlay immediately. Consequences:
+  (a) new installs surface allowlist-filtered scoped models one tick late
+  (a one-tick cold-start cost), (b) a failed refresh still leaves an
+  `attempted_at` claim so re-spawning stays ≤1/TTL, (c) the old
+  check→fetch→store race was an acknowledged caveat for concurrent tickets —
+  the atomic claim closes it. A spawn failure (non-Unix, resource limits)
+  falls back to one bounded synchronous refresh (5s budget) so gaps still heal.
+- ScopedProbed is cache metadata, not snapshot data: the flag that "the API (as
+  opposed to a stdin projection) answered about scoped limits" is provenance,
+  and it now lives on the cache Entry (`scoped_probed`) instead of inside the
+  snapshot payload. The snapshot stays pure data; `usage.FetchedSnapshot`
+  carries the flag out of decode at fetch time, and the cache carries it across
+  the disk.
+- one Snapshot type end-to-end: `usage.Snapshot`/`usage.Window`/`Usage`
+  duplicates were removed and the whole pipeline (decode, Reconcile, Overlay,
+  engine, stdin parser) operates on `schema.Snapshot`. The hand-written engine
+  mapping layer disappeared. The legacy `seven_day_opus`/`seven_day_fable`
+  compat aliases are now emitted by `schema.Snapshot.MarshalJSON` from
+  ScopedLimits instead of struct fields, so new models never need a new field
+  and internal code can't accidentally diverge aliases from scoped_limits.
+- transcript probe reads are bounded: `FindTranscripts` keeps only the k newest
+  files via a bounded heap (no full-tree collect+sort); `ScanLatest` stops as
+  soon as a file's mtime can no longer hold a hit newer than the one found
+  (a hit's timestamp never exceeds its file's mtime); `ScanFile` reads the last
+  512KB first and falls back to a full scan. Probe also discards hits whose
+  reset has already passed — a past limit is not an active limit. The probe is
+  still last-resort-only, so the constants are tuned for "make it fast when the
+  ladder bottoms out", not for correctness-critical paths.
+- release integrity is anchored by a signature, not by same-release checksums:
+  checksums.txt and archives come from the same GitHub release, so a tampered
+  release could rewrite both. Release now uploads `checksums.txt.sig` — an
+  ed25519 signature over checksums.txt by `cmd/ccx-sign` (stdlib ed25519, no
+  dependency footprint) — and `ccx update` verifies it against the public key
+  embedded in the binary before trusting any checksum. The private key is kept
+  ONLY in the GitHub Actions secret `CCX_SIGNING_KEY` (see the key handoff note
+  under Publish prep); a lost/leaked key forces a new keypair + new release and
+  reinstalls for existing users. Old binaries without embedded keys simply
+  error on the missing signature asset rather than skip verification.
 - stdin path suspect guard: intentionally absent. The statusline mirrors
   Claude Code's own displayed values; the ≥30pt-drop guard (`Reconcile`)
   applies only to fetched/ladder data and renders its `(suspect)` marker in

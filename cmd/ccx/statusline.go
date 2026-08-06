@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/seosd97/cc-token-exposer/internal/schema"
-	"github.com/seosd97/cc-token-exposer/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -54,7 +53,7 @@ func newStatuslineCmd(res resolver) *cobra.Command {
 			out := cmd.OutOrStdout()
 			colored := os.Getenv("NO_COLOR") == ""
 
-			var stdinSnap *usage.Snapshot
+			var stdinSnap *schema.Snapshot
 			stdin := cmd.InOrStdin()
 			if !isTerminal(stdin) {
 				if in, err := readStatuslineInput(stdin); err == nil {
@@ -197,11 +196,11 @@ func (w *rlWindow) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (w *rlWindow) toUsage() *usage.Window {
+func (w *rlWindow) toUsage() *schema.Window {
 	if w == nil || !w.hasUsed {
 		return nil
 	}
-	return &usage.Window{
+	return &schema.Window{
 		Utilization: w.used,
 		ResetsAt:    w.resetsAt,
 	}
@@ -240,7 +239,7 @@ type rlScoped struct {
 // snapshot; ok is false when it carries no usable window. model_scoped entries
 // keyed by display_name are the canonical scoped limits; seven_day_opus only
 // backfills Opus when model_scoped lacks it.
-func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*usage.Snapshot, bool) {
+func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*schema.Snapshot, bool) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, false
 	}
@@ -254,7 +253,7 @@ func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*usage.Snapshot
 		return nil, false
 	}
 
-	snap := &usage.Snapshot{FetchedAt: now}
+	snap := &schema.Snapshot{FetchedAt: now}
 	n := 0
 	if w := obj.FiveHour.toUsage(); w != nil {
 		snap.FiveHour = w
@@ -264,15 +263,15 @@ func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*usage.Snapshot
 		snap.SevenDay = w
 		n++
 	}
-	var scoped map[string]*usage.Window
+	var scoped map[string]*schema.Window
 	for _, ms := range obj.ModelScoped {
 		if ms.DisplayName == "" || ms.Utilization == nil {
 			continue
 		}
 		if scoped == nil {
-			scoped = make(map[string]*usage.Window, len(obj.ModelScoped))
+			scoped = make(map[string]*schema.Window, len(obj.ModelScoped))
 		}
-		scoped[ms.DisplayName] = &usage.Window{
+		scoped[ms.DisplayName] = &schema.Window{
 			Utilization: *ms.Utilization,
 			ResetsAt:    parseTolerantTime(ms.ResetsAt),
 		}
@@ -281,7 +280,7 @@ func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*usage.Snapshot
 	if w := obj.SevenDayOpus.toUsage(); w != nil {
 		if _, ok := scoped["Opus"]; !ok {
 			if scoped == nil {
-				scoped = make(map[string]*usage.Window, 1)
+				scoped = make(map[string]*schema.Window, 1)
 			}
 			scoped["Opus"] = w
 			n++

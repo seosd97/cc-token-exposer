@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,49 +42,79 @@ func (f *fakeCreds) Resolve() (*creds.Credentials, error) {
 }
 
 type fakeFetcher struct {
-	fn    func(token string) (*usage.Snapshot, error)
-	calls []string
+	fn     func(token string) (*schema.Snapshot, error)
+	probed bool
+	calls  []string
 }
 
-func (f *fakeFetcher) Fetch(_ context.Context, token string) (*usage.Snapshot, error) {
+func (f *fakeFetcher) Fetch(_ context.Context, token string) (*usage.FetchedSnapshot, error) {
 	f.calls = append(f.calls, token)
-	return f.fn(token)
+	s, err := f.fn(token)
+	if err != nil {
+		return nil, err
+	}
+	return &usage.FetchedSnapshot{Snapshot: s, ScopedProbed: f.probed}, nil
 }
 
 type fakeCache struct {
-	payload     []byte
-	storedAt    time.Time
-	attemptedAt time.Time
-	has         bool
-	stores      int
-	touches     int
-	lastStored  []byte
+	payload      []byte
+	storedAt     time.Time
+	attemptedAt  time.Time
+	scopedProbed bool
+	has          bool
+	stores       int
+	claims       int
+	claimResult  bool
+	claimErr     error
+	lastStored   []byte
 }
 
-func (c *fakeCache) Load() ([]byte, time.Time, time.Time, error) {
+func (c *fakeCache) Load() (*engine.CacheEntry, error) {
 	if !c.has {
-		return nil, time.Time{}, c.attemptedAt, engine.ErrNoCache
+		return nil, engine.ErrNoCache
 	}
-	return c.payload, c.storedAt, c.attemptedAt, nil
+	return &engine.CacheEntry{
+		Payload:      c.payload,
+		StoredAt:     c.storedAt,
+		AttemptedAt:  c.attemptedAt,
+		ScopedProbed: c.scopedProbed,
+	}, nil
 }
 
-func (c *fakeCache) Store(payload []byte, storedAt time.Time) error {
+func (c *fakeCache) Store(e engine.CacheEntry) error {
 	c.stores++
-	c.lastStored = payload
-	c.payload = payload
-	c.storedAt = storedAt
+	c.lastStored = e.Payload
+	c.payload = e.Payload
+	c.storedAt = e.StoredAt
+	c.scopedProbed = e.ScopedProbed
 	c.has = true
 	return nil
 }
 
-func (c *fakeCache) Touch(attemptedAt time.Time) error {
-	c.touches++
+func (c *fakeCache) ClaimRefresh(attemptedAt time.Time, _ time.Duration) (bool, error) {
+	c.claims++
 	c.attemptedAt = attemptedAt
-	if !c.has {
-		c.payload = []byte("null")
-		c.has = true
+	if c.claimErr != nil {
+		return false, c.claimErr
 	}
-	return nil
+	if c.claimResult {
+		if !c.has {
+			c.payload = []byte("null")
+			c.has = true
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+type fakeRefresher struct {
+	spawns int
+	err    error
+}
+
+func (r *fakeRefresher) Spawn(context.Context) error {
+	r.spawns++
+	return r.err
 }
 
 type fakeTranscript struct {
@@ -98,10 +129,10 @@ func okCreds(token string) *fakeCreds {
 	return &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: token}}}}
 }
 
-func snapWith(util float64, resetsAt time.Time) *usage.Snapshot {
-	return &usage.Snapshot{
+func snapWith(util float64, resetsAt time.Time) *schema.Snapshot {
+	return &schema.Snapshot{
 		FetchedAt: baseTime,
-		FiveHour:  &usage.Window{Utilization: util, ResetsAt: resetsAt},
+		FiveHour:  &schema.Window{Utilization: util, ResetsAt: resetsAt},
 	}
 }
 
@@ -140,7 +171,7 @@ func TestFreshCacheServedWithoutFetch(t *testing.T) {
 		storedAt: baseTime.Add(-30 * time.Second), // within 120s TTL
 		has:      true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("fetch must not be called on fresh cache")
 		return nil, nil
 	}}
@@ -165,7 +196,7 @@ func TestStaleCacheTriggersFetchAndStore(t *testing.T) {
 		storedAt: baseTime.Add(-10 * time.Minute), // older than TTL
 		has:      true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		return snapWith(42, baseTime.Add(time.Hour)), nil
 	}}
 
@@ -191,7 +222,7 @@ func TestReconcileGuardRetainsSuspectValue(t *testing.T) {
 		has:      true,
 	}
 	// Fresh value drops 40 points within the same (not-yet-reset) window.
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		return snapWith(40, reset), nil
 	}}
 
@@ -209,7 +240,7 @@ func TestTransientErrorServesStaleCache(t *testing.T) {
 		storedAt: baseTime.Add(-10 * time.Minute),
 		has:      true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		return nil, usage.ErrTransient
 	}}
 
@@ -230,7 +261,7 @@ func TestRateLimitedServesStaleCache(t *testing.T) {
 		storedAt: baseTime.Add(-10 * time.Minute),
 		has:      true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		return nil, &usage.RateLimitError{RetryAfter: time.Minute, StatusCode: 429}
 	}}
 
@@ -242,7 +273,7 @@ func TestRateLimitedServesStaleCache(t *testing.T) {
 
 func TestTransientErrorNoCacheIsError(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		return nil, usage.ErrTransient
 	}}
 
@@ -255,7 +286,7 @@ func TestTransientErrorNoCacheIsError(t *testing.T) {
 func TestMissingCredsNoCacheIsAuthMissing(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cr := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("fetch must not be called without creds")
 		return nil, nil
 	}}
@@ -274,7 +305,7 @@ func TestMissingCredsServesStaleCache(t *testing.T) {
 		has:      true,
 	}
 	cr := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return nil, nil }}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 
 	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Cache: cache})
 	if st.Source != schema.SourceCache || !st.Stale || st.Auth != schema.AuthMissing {
@@ -287,7 +318,7 @@ func TestExpiredTokenReReadRecovers(t *testing.T) {
 	expired := &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}
 	fresh := &creds.Credentials{AccessToken: "new", ExpiresAt: baseTime.Add(time.Hour)}
 	cr := &fakeCreds{results: []credResult{{c: expired}, {c: fresh}}}
-	fetch := &fakeFetcher{fn: func(token string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(token string) (*schema.Snapshot, error) {
 		if token != "new" {
 			t.Fatalf("fetched with stale token %q", token)
 		}
@@ -304,7 +335,7 @@ func TestExpiredTokenStillExpiredIsAuthExpired(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	expired := &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}
 	cr := &fakeCreds{results: []credResult{{c: expired}}}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("fetch must not run with an expired token")
 		return nil, nil
 	}}
@@ -320,7 +351,7 @@ func TestAuthErrorRetriesWithNewToken(t *testing.T) {
 	first := &creds.Credentials{AccessToken: "tok-A"}
 	second := &creds.Credentials{AccessToken: "tok-B"}
 	cr := &fakeCreds{results: []credResult{{c: first}, {c: second}}}
-	fetch := &fakeFetcher{fn: func(token string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(token string) (*schema.Snapshot, error) {
 		if token == "tok-A" {
 			return nil, usage.ErrAuth
 		}
@@ -345,7 +376,7 @@ func TestAuthErrorSameTokenDegradesToStaleCache(t *testing.T) {
 		storedAt: baseTime.Add(-10 * time.Minute),
 		has:      true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		return nil, usage.ErrAuth
 	}}
 
@@ -359,7 +390,7 @@ func TestTranscriptFallbackWhenNoCacheNoCreds(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	reset := baseTime.Add(2 * time.Hour)
 	cr := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return nil, nil }}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 	tr := &fakeTranscript{lh: &schema.LimitHit{ResetsAt: &reset, Message: "session limit", DetectedAt: baseTime}}
 
 	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Transcript: tr})
@@ -371,7 +402,7 @@ func TestTranscriptFallbackWhenNoCacheNoCreds(t *testing.T) {
 	}
 }
 
-func resolveStdin(t *testing.T, o engine.Options, stdin *usage.Snapshot) *schema.State {
+func resolveStdin(t *testing.T, o engine.Options, stdin *schema.Snapshot) *schema.State {
 	t.Helper()
 	if o.Clock == nil {
 		o.Clock = &fakeClock{t: baseTime}
@@ -383,12 +414,12 @@ func resolveStdin(t *testing.T, o engine.Options, stdin *usage.Snapshot) *schema
 	return st
 }
 
-func fullSnap(five, seven float64, resetsAt time.Time) *usage.Snapshot {
-	return &usage.Snapshot{
+func fullSnap(five, seven float64, resetsAt time.Time) *schema.Snapshot {
+	return &schema.Snapshot{
 		FetchedAt:    baseTime,
-		FiveHour:     &usage.Window{Utilization: five, ResetsAt: resetsAt},
-		SevenDay:     &usage.Window{Utilization: seven, ResetsAt: resetsAt.Add(5 * 24 * time.Hour)},
-		ScopedLimits: map[string]*usage.Window{"Sonnet": {Utilization: 7, ResetsAt: resetsAt.Add(5 * 24 * time.Hour)}},
+		FiveHour:     &schema.Window{Utilization: five, ResetsAt: resetsAt},
+		SevenDay:     &schema.Window{Utilization: seven, ResetsAt: resetsAt.Add(5 * 24 * time.Hour)},
+		ScopedLimits: map[string]*schema.Window{"Sonnet": {Utilization: 7, ResetsAt: resetsAt.Add(5 * 24 * time.Hour)}},
 	}
 }
 
@@ -399,7 +430,7 @@ func TestStdinNilFallsBackToResolve(t *testing.T) {
 		storedAt: baseTime.Add(-30 * time.Second),
 		has:      true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("fetch must not be called on fresh cache")
 		return nil, nil
 	}}
@@ -412,66 +443,97 @@ func TestStdinNilFallsBackToResolve(t *testing.T) {
 
 func TestStdinCompleteSnapshotServedNoIO(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("complete stdin must not fetch")
 		return nil, nil
 	}}
 	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
-	cached.ScopedLimits["Fable"] = &usage.Window{Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
-	cached.ScopedProbed = true
+	cached.ScopedLimits["Fable"] = &schema.Window{Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute),
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		has:          true,
 	}
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
-	stdin.ScopedLimits["Fable"] = &usage.Window{Utilization: 55, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
+	stdin.ScopedLimits["Fable"] = &schema.Window{Utilization: 55, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
 	st := resolveStdin(t, engine.Options{Clock: clk, Fetcher: fetch, Cache: cache}, stdin)
 
 	if st.Source != schema.SourceStdin || st.Stale || st.Auth != schema.AuthOK {
 		t.Fatalf("got source=%s stale=%v auth=%s, want stdin/false/ok", st.Source, st.Stale, st.Auth)
 	}
-	if len(fetch.calls) != 0 || cache.stores != 0 || cache.touches != 0 {
-		t.Fatalf("stdin covering every cached window did I/O: fetch=%d stores=%d touches=%d", len(fetch.calls), cache.stores, cache.touches)
+	if len(fetch.calls) != 0 || cache.stores != 0 || cache.claims != 0 {
+		t.Fatalf("stdin covering every cached window did I/O: fetch=%d stores=%d claims=%d", len(fetch.calls), cache.stores, cache.claims)
 	}
 	if st.Snapshot.ScopedLimits["Fable"] == nil || st.Snapshot.ScopedLimits["Fable"].Utilization != 55 {
 		t.Fatalf("Fable = %+v, want stdin value 55 to win over cached 40", st.Snapshot.ScopedLimits["Fable"])
 	}
-	if st.Snapshot.SevenDayFable == nil {
-		t.Fatalf("fable alias not populated: %+v", st.Snapshot)
+	// The fable alias is a wire-level concern: it must appear when the State is
+	// marshaled to JSON, not as a struct field.
+	b, err := json.Marshal(st.Snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if !strings.Contains(string(b), "seven_day_fable") {
+		t.Fatalf("fable alias not emitted on the wire: %s", b)
 	}
 }
 
-func TestStdinMissingCachedScopedModelRefreshesNotFrozen(t *testing.T) {
+func TestStdinMissingCachedScopedModelSpawnsRefresh(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
-	cached.ScopedLimits["Fable"] = &usage.Window{Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
-	cached.ScopedProbed = true
+	cached.ScopedLimits["Fable"] = &schema.Window{Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute),
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
 	}
 	fetched := fullSnap(99, 30, baseTime.Add(time.Hour))
-	fetched.ScopedLimits["Fable"] = &usage.Window{Utilization: 62, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
-	fetched.ScopedProbed = true
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return fetched, nil }}
+	fetched.ScopedLimits["Fable"] = &schema.Window{Utilization: 62, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return fetched, nil }}
+	fetch.probed = true
+	ref := &fakeRefresher{}
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, stdin)
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
 
-	if len(fetch.calls) != 1 || cache.stores != 1 {
-		t.Fatalf("stdin missing a cached scoped model must refresh once, got fetch=%d stores=%d", len(fetch.calls), cache.stores)
+	// The parent must never fetch: it claims a slot and spawns the refresher.
+	if ref.spawns != 1 || len(fetch.calls) != 0 || cache.claims != 1 {
+		t.Fatalf("expected one claim+spawn and no parent fetch, got spawn=%d fetch=%d claims=%d", ref.spawns, len(fetch.calls), cache.claims)
 	}
-	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 62 {
-		t.Fatalf("Fable = %+v, want refreshed 62 instead of the frozen cached 40", f)
+	// This tick honestly serves the stale cached Fable until the child lands.
+	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 40 {
+		t.Fatalf("Fable = %+v, want cached 40 until the detached refresh lands", f)
 	}
-	if st.Stale {
-		t.Fatal("successful refresh must not mark the state stale")
+	if !st.Stale {
+		t.Fatal("stale cache contribution should mark the line ≈ until the refresh lands")
 	}
 	if st.Snapshot.FiveHour.Utilization != 18 || st.Snapshot.ScopedLimits["Sonnet"].Utilization != 7 {
 		t.Fatalf("stdin must still win for the windows it carries: %+v", st.Snapshot)
+	}
+
+	// Model the detached refresher completing: it stores the fetched snapshot.
+	if err := cache.Store(engine.CacheEntry{
+		Payload:      mustMarshal(t, fetched),
+		StoredAt:     clk.Now(),
+		ScopedProbed: true,
+	}); err != nil {
+		t.Fatalf("model detached child store: %v", err)
+	}
+	cache.claimResult = false // fetched_at is now fresh within the TTL
+	clk.t = baseTime.Add(3 * time.Second)
+	st = resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 62 {
+		t.Fatalf("Fable = %+v, want healed 62 from cache on the next tick", f)
+	}
+	if len(fetch.calls) != 0 || ref.spawns != 1 {
+		t.Fatalf("a healed cache must not re-refresh: fetch=%d spawn=%d", len(fetch.calls), ref.spawns)
+	}
+	if st.Stale {
+		t.Fatal("fresh cache should not mark the line stale")
 	}
 }
 
@@ -479,26 +541,26 @@ func TestStdinScopedEmptyWithProbedScopedlessCacheNeedsNoRefresh(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
 	cached.ScopedLimits = nil
-	cached.ScopedProbed = true
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute),
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		has:          true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("a probed cache without scoped limits proves stdin complete")
 		return nil, nil
 	}}
 
-	stdin := &usage.Snapshot{
+	stdin := &schema.Snapshot{
 		FetchedAt: baseTime,
-		FiveHour:  &usage.Window{Utilization: 18, ResetsAt: baseTime.Add(time.Hour)},
-		SevenDay:  &usage.Window{Utilization: 41, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
+		FiveHour:  &schema.Window{Utilization: 18, ResetsAt: baseTime.Add(time.Hour)},
+		SevenDay:  &schema.Window{Utilization: 41, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
 	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, stdin)
 
-	if len(fetch.calls) != 0 || cache.touches != 0 {
-		t.Fatalf("expected zero I/O, got fetch=%d touches=%d", len(fetch.calls), cache.touches)
+	if len(fetch.calls) != 0 || cache.claims != 0 {
+		t.Fatalf("expected zero I/O, got fetch=%d claims=%d", len(fetch.calls), cache.claims)
 	}
 	if st.Stale {
 		t.Fatal("no cache contribution means not stale")
@@ -507,36 +569,48 @@ func TestStdinScopedEmptyWithProbedScopedlessCacheNeedsNoRefresh(t *testing.T) {
 
 func TestStdinWithoutCacheBootstrapsOnce(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	cache := &fakeCache{}
+	cache := &fakeCache{claimResult: true}
 	fetched := fullSnap(99, 30, baseTime.Add(time.Hour))
-	fetched.ScopedLimits["Fable"] = &usage.Window{Utilization: 55, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
-	fetched.ScopedProbed = true
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return fetched, nil }}
+	fetched.ScopedLimits["Fable"] = &schema.Window{Utilization: 55, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return fetched, nil }}
+	fetch.probed = true
+	ref := &fakeRefresher{}
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, stdin)
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
 
-	if len(fetch.calls) != 1 || cache.stores != 1 {
-		t.Fatalf("no cache must bootstrap exactly one refresh, got fetch=%d stores=%d", len(fetch.calls), cache.stores)
+	if ref.spawns != 1 || len(fetch.calls) != 0 || cache.stores != 0 {
+		t.Fatalf("no cache must spawn exactly one refresh and never fetch in the parent, got spawn=%d fetch=%d stores=%d", ref.spawns, len(fetch.calls), cache.stores)
 	}
-	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 55 {
-		t.Fatalf("bootstrap must surface scoped models stdin lacks: %+v", st.Snapshot.ScopedLimits)
+	if st.Snapshot.ScopedLimits["Fable"] != nil {
+		t.Fatal("bootstrap spawn must not surface scoped models until the detached refresh lands")
 	}
 	if st.Stale {
-		t.Fatal("bootstrap refresh success must not be stale")
+		t.Fatal("stdin-only serve should not be stale")
+	}
+
+	// Model the detached refresher completing, then the next tick.
+	if err := cache.Store(engine.CacheEntry{Payload: mustMarshal(t, fetched), StoredAt: clk.Now(), ScopedProbed: true}); err != nil {
+		t.Fatalf("model detached child store: %v", err)
+	}
+	cache.claimResult = false
+	clk.t = baseTime.Add(3 * time.Second)
+	st = resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 55 {
+		t.Fatalf("bootstrap must surface scoped models the next tick: %+v", st.Snapshot.ScopedLimits)
 	}
 }
 
 func TestStdinCompleteWithStaleCacheStillNoFetch(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := snapWith(99, baseTime.Add(time.Hour))
-	cached.ExtraUsage = &usage.ExtraUsage{Utilization: ptr(5.0)}
+	cached.ExtraUsage = &schema.ExtraUsage{Utilization: ptr(5.0)}
 	cache := &fakeCache{
 		payload:  mustMarshal(t, cached),
 		storedAt: baseTime.Add(-10 * time.Minute),
 		has:      true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("complete stdin must not fetch even with stale cache")
 		return nil, nil
 	}}
@@ -547,6 +621,9 @@ func TestStdinCompleteWithStaleCacheStillNoFetch(t *testing.T) {
 	if st.Stale {
 		t.Fatal("complete stdin should not be stale")
 	}
+	if cache.claims != 0 {
+		t.Fatalf("complete stdin must not try to claim a refresh slot, got claims=%d", cache.claims)
+	}
 	if st.Snapshot.FiveHour.Utilization != 18 || st.Snapshot.SevenDay.Utilization != 41 {
 		t.Fatalf("snap = %+v, want stdin values", st.Snapshot)
 	}
@@ -555,20 +632,22 @@ func TestStdinCompleteWithStaleCacheStillNoFetch(t *testing.T) {
 func TestStdinGapsFilledFromFreshCacheNotStale(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := snapWith(99, baseTime.Add(time.Hour))
-	cached.ScopedLimits = map[string]*usage.Window{
+	cached.ScopedLimits = map[string]*schema.Window{
 		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-30 * time.Second), // within TTL
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-30 * time.Second), // within TTL
+		scopedProbed: true,
+		has:          true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
+	ref := &fakeRefresher{}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("fresh cache must not trigger a refresh")
 		return nil, nil
 	}}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
 	if st.Snapshot.FiveHour.Utilization != 18 {
 		t.Fatalf("five_hour = %v, want stdin 18", st.Snapshot.FiveHour.Utilization)
@@ -579,82 +658,93 @@ func TestStdinGapsFilledFromFreshCacheNotStale(t *testing.T) {
 	if st.Stale {
 		t.Fatal("cache within TTL should not mark the state stale")
 	}
+	// Incomplete stdin asks for a claim, but the fresh fetched_at means the
+	// real cache declines it — here the fake's claimResult=false models that.
+	if cache.claims != 1 || ref.spawns != 0 {
+		t.Fatalf("fresh-cache incomplete stdin should claim-but-not-spawn, got claims=%d spawn=%d", cache.claims, ref.spawns)
+	}
 }
 
-func TestStdinIncompleteTriggersBoundedRefresh(t *testing.T) {
+func TestStdinIncompleteClaimsRefreshSlot(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := snapWith(99, baseTime.Add(time.Hour))
-	cached.ScopedLimits = map[string]*usage.Window{
+	cached.ScopedLimits = map[string]*schema.Window{
 		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute), // stale
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute), // stale
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
-		return fullSnap(99, 30, baseTime.Add(time.Hour)), nil
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
 	}}
+	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
-	if len(fetch.calls) != 1 || cache.stores != 1 {
-		t.Fatalf("expected exactly one refresh fetch+store, got fetch=%d stores=%d", len(fetch.calls), cache.stores)
+	if ref.spawns != 1 || cache.claims != 1 {
+		t.Fatalf("expected exactly one claimed+spawned refresh, got spawn=%d claims=%d", ref.spawns, cache.claims)
 	}
-	if st.Stale {
-		t.Fatal("successful refresh should yield a fresh state")
+	if !st.Stale {
+		t.Fatal("stale cache contribution should mark the line ≈ until the refresh lands")
 	}
 	if st.Snapshot.FiveHour.Utilization != 18 {
-		t.Fatalf("five_hour = %v, want stdin 18 to win over fetched 99", st.Snapshot.FiveHour.Utilization)
+		t.Fatalf("five_hour = %v, want stdin 18 to win", st.Snapshot.FiveHour.Utilization)
 	}
-	if st.Snapshot.SevenDay == nil || st.Snapshot.SevenDay.Utilization != 30 {
-		t.Fatalf("seven_day = %+v, want fetched 30", st.Snapshot.SevenDay)
-	}
-	if st.Snapshot.ScopedLimits["Sonnet"] == nil || st.Snapshot.ScopedLimits["Sonnet"].Utilization != 7 {
-		t.Fatalf("scoped = %+v, want Sonnet 7 from fetched snapshot", st.Snapshot.ScopedLimits)
+	if st.Snapshot.ScopedLimits["Fable"] == nil || st.Snapshot.ScopedLimits["Fable"].Utilization != 40 {
+		t.Fatalf("scoped = %+v, want Fable 40 from cache until healed", st.Snapshot.ScopedLimits)
 	}
 }
 
-func TestStdinIncompleteNoCacheFetchesOnce(t *testing.T) {
+func TestStdinIncompleteNoCacheSpawnsRefresh(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	cache := &fakeCache{}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
-		return fullSnap(99, 30, baseTime.Add(time.Hour)), nil
+	cache := &fakeCache{claimResult: true}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
 	}}
+	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
-	if len(fetch.calls) != 1 {
-		t.Fatalf("fetch calls = %d, want 1", len(fetch.calls))
+	if ref.spawns != 1 || len(fetch.calls) != 0 {
+		t.Fatalf("expected one spawn and no parent fetch, got spawn=%d fetch=%d", ref.spawns, len(fetch.calls))
 	}
-	if st.Snapshot.SevenDay == nil || st.Snapshot.SevenDay.Utilization != 30 {
-		t.Fatalf("seven_day = %+v, want fetched 30", st.Snapshot.SevenDay)
+	if st.Snapshot.SevenDay != nil {
+		t.Fatal("no cache means seven_day cannot be healed until the detached refresh lands")
 	}
 	if st.Stale {
-		t.Fatal("no-cache incomplete stdin with successful refresh should not be stale")
+		t.Fatal("stdin-only serve with no cache contribution should not be stale")
 	}
 }
 
-func TestStdinRefreshFailureServesStaleMerged(t *testing.T) {
+func TestStdinRefreshSpawnsAndServesStale(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := snapWith(99, baseTime.Add(time.Hour))
-	cached.ScopedLimits = map[string]*usage.Window{
+	cached.ScopedLimits = map[string]*schema.Window{
 		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute),
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return nil, usage.ErrTransient }}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
-	if len(fetch.calls) != 1 {
-		t.Fatalf("refresh must be attempted exactly once, got fetch=%d", len(fetch.calls))
-	}
-	if cache.touches != 1 {
-		t.Fatalf("a failed refresh must record its attempt via Touch, got touches=%d", cache.touches)
+	if ref.spawns != 1 {
+		t.Fatalf("refresh must be claimed+spawned exactly once, got spawn=%d", ref.spawns)
 	}
 	if !st.Stale || st.StaleAge == nil || time.Duration(*st.StaleAge) != 10*time.Minute {
 		t.Fatalf("got stale=%v age=%v, want true/10m", st.Stale, st.StaleAge)
@@ -663,98 +753,145 @@ func TestStdinRefreshFailureServesStaleMerged(t *testing.T) {
 		t.Fatalf("stale serve should still merge stdin+cache: %+v", st.Snapshot)
 	}
 	if st.Auth != schema.AuthOK {
-		t.Fatalf("refresh failure should not surface auth noise: auth=%s", st.Auth)
+		t.Fatalf("spawn path should not surface auth noise: auth=%s", st.Auth)
 	}
 }
 
-func TestStdinRefreshAuthFailureServesStale(t *testing.T) {
+func TestStdinSpawnPathNeverConsultsCreds(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := snapWith(99, baseTime.Add(time.Hour))
-	cached.ScopedLimits = map[string]*usage.Window{
+	cached.ScopedLimits = map[string]*schema.Window{
 		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute),
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
 	}
-	cr := &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: "tok"}}}}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return nil, usage.ErrAuth }}
+	cr := &fakeCreds{results: []credResult{{err: errors.New("must not resolve creds in the spawn path")}}}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Cache: cache}, snapWith(18, baseTime.Add(time.Hour)))
-
-	if !st.Stale {
-		t.Fatal("auth failure on refresh should serve stale, not a fresh state")
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
+	if ref.spawns != 1 {
+		t.Fatalf("expected a spawn, got %d", ref.spawns)
 	}
 	if st.Auth != schema.AuthOK {
-		t.Fatalf("refresh auth failure should not mark the statusline state auth-expired: %s", st.Auth)
+		t.Fatalf("spawn path must not surface auth status: auth=%s", st.Auth)
 	}
 }
 
-func TestStdinRefreshFailureThrottledUntilTTL(t *testing.T) {
+func TestStdinSpawnFailureFallsBackToSyncRefresh(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := snapWith(99, baseTime.Add(time.Hour))
-	cached.ScopedLimits = map[string]*usage.Window{
+	cached.ScopedLimits = map[string]*schema.Window{
 		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute), // stale
-		has:      true,
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return nil, usage.ErrTransient }}
-	o := engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}
-	stdin := snapWith(18, baseTime.Add(time.Hour))
+	fetched := fullSnap(99, 30, baseTime.Add(time.Hour))
+	fetched.ScopedLimits["Fable"] = &schema.Window{Utilization: 62, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return fetched, nil }}
+	fetch.probed = true
+	ref := &fakeRefresher{err: errors.New("spawn failed")}
 
-	st1 := resolveStdin(t, o, stdin)
-	clk.t = baseTime.Add(3 * time.Second) // still within TTL
-	st2 := resolveStdin(t, o, stdin)
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
-	if len(fetch.calls) != 1 {
-		t.Fatalf("a failed refresh must throttle re-fetch within the TTL, got fetch=%d, want 1", len(fetch.calls))
+	if ref.spawns != 1 || len(fetch.calls) != 1 || cache.stores != 1 {
+		t.Fatalf("spawn failure must fall back to one sync refresh, got spawn=%d fetch=%d stores=%d", ref.spawns, len(fetch.calls), cache.stores)
 	}
-	if !st1.Stale || !st2.Stale {
-		t.Fatalf("both throttled ticks should serve stale cache: st1=%v st2=%v", st1.Stale, st2.Stale)
+	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 62 {
+		t.Fatalf("Fable = %+v, want healed 62 from the fallback fetch", f)
 	}
-
-	clk.t = baseTime.Add(3*time.Second + engine.DefaultTTL) // TTL elapsed since the attempt
-	_ = resolveStdin(t, o, stdin)
-	if len(fetch.calls) != 2 {
-		t.Fatalf("refresh should resume once the TTL elapses, got fetch=%d, want 2", len(fetch.calls))
+	if st.Stale {
+		t.Fatal("successful fallback refresh should not be stale")
 	}
 }
 
-func TestStdinScopedEmptyIsIncompleteAndRefreshes(t *testing.T) {
+func TestStdinClaimFalseThrottlesSpawn(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cached := snapWith(99, baseTime.Add(time.Hour))
+	cached.ScopedLimits = map[string]*schema.Window{
+		"Fable": {Utilization: 40, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
+	}
+	cache := &fakeCache{
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+	o := engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}
+	stdin := snapWith(18, baseTime.Add(time.Hour))
+
+	resolveStdin(t, o, stdin)
+	// A second tick while the claim is still outstanding (cache says no slot)
+	// must not spawn again.
+	cache.claimResult = false
+	clk.t = baseTime.Add(3 * time.Second)
+	resolveStdin(t, o, stdin)
+	if ref.spawns != 1 {
+		t.Fatalf("an unelapsed claim must throttle re-spawn, got spawn=%d, want 1", ref.spawns)
+	}
+
+	// Once the claim elapses, an incomplete stdin re-spawns.
+	cache.claimResult = true
+	clk.t = baseTime.Add(3*time.Second + engine.DefaultTTL)
+	resolveStdin(t, o, stdin)
+	if ref.spawns != 2 {
+		t.Fatalf("a claim should resume once the TTL elapses, got spawn=%d, want 2", ref.spawns)
+	}
+}
+
+func TestStdinScopedEmptyIsIncompleteAndSpawnsRefresh(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cached := snapWith(99, baseTime.Add(time.Hour))
 	cache := &fakeCache{
-		payload:  mustMarshal(t, cached),
-		storedAt: baseTime.Add(-10 * time.Minute), // stale
-		has:      true,
+		payload:     mustMarshal(t, cached),
+		storedAt:    baseTime.Add(-10 * time.Minute), // stale
+		claimResult: true,
+		has:         true,
 	}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) {
-		return fullSnap(99, 30, baseTime.Add(time.Hour)), nil
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
 	}}
+	ref := &fakeRefresher{}
 
-	stdin := &usage.Snapshot{
+	stdin := &schema.Snapshot{
 		FetchedAt: baseTime,
-		FiveHour:  &usage.Window{Utilization: 18, ResetsAt: baseTime.Add(time.Hour)},
-		SevenDay:  &usage.Window{Utilization: 41, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
+		FiveHour:  &schema.Window{Utilization: 18, ResetsAt: baseTime.Add(time.Hour)},
+		SevenDay:  &schema.Window{Utilization: 41, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, stdin)
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
 
-	if len(fetch.calls) != 1 {
-		t.Fatalf("five_hour+seven_day with empty scoped limits must be incomplete and refresh once, got fetch=%d", len(fetch.calls))
+	if ref.spawns != 1 {
+		t.Fatalf("five_hour+seven_day with empty stdin scoped must be incomplete and spawn once, got spawn=%d", ref.spawns)
 	}
-	if st.Snapshot.ScopedLimits["Sonnet"] == nil {
-		t.Fatalf("empty scoped limits should be healed by the refresh: %+v", st.Snapshot.ScopedLimits)
+	if st.Snapshot.ScopedLimits["Sonnet"] != nil {
+		t.Fatalf("empty scoped limits heal only after the detached refresh lands: %+v", st.Snapshot.ScopedLimits)
 	}
 }
 
 func TestErrorStateCarriesNoSnapshot(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cr := &fakeCreds{results: []credResult{{err: errors.New("boom")}}}
-	fetch := &fakeFetcher{fn: func(string) (*usage.Snapshot, error) { return nil, nil }}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 
 	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch})
 	if st.Snapshot != nil {
