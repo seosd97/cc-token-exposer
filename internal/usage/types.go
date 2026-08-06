@@ -18,5 +18,6 @@ type Snapshot struct {
 	FiveHour     *Window            `json:"five_hour,omitempty"`
 	SevenDay     *Window            `json:"seven_day,omitempty"`
 	ScopedLimits map[string]*Window `json:"scoped_limits,omitempty"`
+	ScopedProbed bool               `json:"scoped_probed,omitempty"`
 	ExtraUsage   *ExtraUsage        `json:"extra_usage,omitempty"`
 }

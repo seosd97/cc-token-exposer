@@ -149,13 +149,16 @@ func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now 
 }
 
 // ResolveStdin serves a snapshot piped in by Claude Code's statusline, overlaid
-// on the disk cache. When stdin is incomplete and no refresh has run within the
-// TTL it does one bounded refresh (reusing resolveToken/fetchWithToken +
-// Reconcile + storeCache) to heal the gaps, then re-overlays; a failed refresh
-// records its attempt via Cache.Touch so the ≤1/TTL budget holds even under a
-// failing endpoint, and the cache-backed merge is served marked stale. No
-// suspect guard runs here — the statusline mirrors Claude Code's own values;
-// the guard and its marker live on the ladder.
+// on the disk cache. Stdin counts as incomplete while it misses any window the
+// cache carries — crucially a scoped model CC's projection omits, like Fable —
+// or while no probed cache exists to judge against, so those gaps heal instead
+// of freezing. When incomplete and no refresh has run within the TTL it does
+// one bounded refresh (reusing resolveToken/fetchWithToken + Reconcile +
+// storeCache), then re-overlays; a failed refresh records its attempt via
+// Cache.Touch so the ≤1/TTL budget holds even under a failing endpoint, and
+// the cache-backed merge is served marked stale. No suspect guard runs here —
+// the statusline mirrors Claude Code's own values; the guard and its marker
+// live on the ladder.
 func (e *Engine) ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schema.State {
 	if stdin == nil {
 		return e.Resolve(ctx)
@@ -167,7 +170,7 @@ func (e *Engine) ResolveStdin(ctx context.Context, stdin *usage.Snapshot) *schem
 	if attemptedAt.After(lastAttempt) {
 		lastAttempt = attemptedAt
 	}
-	if e.refreshDue(now, lastAttempt) && !stdinComplete(stdin) {
+	if e.refreshDue(now, lastAttempt) && !stdinComplete(stdin, cachedSnap) {
 		if fresh := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
 			cachedSnap = fresh
 			dataStale = false
@@ -210,8 +213,29 @@ func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap 
 	return merged
 }
 
-func stdinComplete(s *usage.Snapshot) bool {
-	return s != nil && s.FiveHour != nil && s.SevenDay != nil && len(s.ScopedLimits) > 0
+// stdinComplete reports whether stdin covers every window the cache knows.
+// Without a probed cache it stays incomplete so the first tick bootstraps one:
+// that seeds the cache (and surfaces scoped models CC never pipes), and the
+// cache without scoped limits then proves the plan has none — ending the loop.
+func stdinComplete(s, base *usage.Snapshot) bool {
+	if s == nil || s.FiveHour == nil || s.SevenDay == nil {
+		return false
+	}
+	if base == nil {
+		return false
+	}
+	if len(s.ScopedLimits) == 0 && !base.ScopedProbed {
+		return false
+	}
+	for name, w := range base.ScopedLimits {
+		if w == nil {
+			continue
+		}
+		if _, ok := s.ScopedLimits[name]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *usage.Snapshot, storedAt time.Time, haveCache bool) *schema.State {

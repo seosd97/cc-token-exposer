@@ -1,4 +1,4 @@
-// Ccg tracks Claude Pro/Max plan credit-limit windows for the CLI and the
+// Ccx tracks Claude Pro/Max plan credit-limit windows for the CLI and the
 // Claude Code statusline.
 package main
 

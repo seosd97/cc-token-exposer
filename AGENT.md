@@ -65,7 +65,10 @@ internal/
   usage/       oauth/usage HTTP client + Reconcile consistency guard +
                Overlay gap-fill merge. decode populates Snapshot.ScopedLimits
                dynamically from all weekly_scoped entries in limits[]; no
-               model name is hardcoded.
+               model name is hardcoded. decode is also the only producer that
+               sets Snapshot.ScopedProbed (marks "the API answered about
+               scoped limits"), which the engine uses to judge stdin
+               completeness.
   creds/       credential acquisition: file > macOS keychain shell-out.
   cache/       flock-protected, atomic-write disk cache of opaque JSON.
                Store records {fetched_at, payload}; Touch(attempted_at)
@@ -84,20 +87,44 @@ carrying the best known truth plus its freshness):
    otherwise `auth: "expired"` (still with stale data if available).
 5. No cache at all → transcript limit-hit probe → else error State.
 
-ResolveStdin (statusline only) overlays the parsed stdin snapshot on the cache
-(`usage.Overlay` — per window, stdin wins, gaps fill from cache, ExtraUsage
-always from the fresh side) and serves it with `source: "stdin"`. When stdin is
-incomplete and no refresh has run within the TTL it does one bounded refresh
-(reusing `resolveToken`/`fetchWithToken` + `Reconcile` + `storeCache`) to heal
-the gaps, then re-overlays. The refresh gate keys off the *later* of the cache's
-`fetched_at` and `attempted_at`, NOT off data staleness alone: on refresh failure
-`Cache.Touch(now)` records the attempt (payload/`fetched_at` untouched), so a
-persistently failing endpoint still yields ≤1 attempt per TTL instead of a fetch
-on every statusline tick. The served state's `stale` marker keys off data age
-(`fetched_at`), so a failed refresh still shows `≈` honestly while the attempt is
-throttled. No suspect guard runs here — the statusline mirrors Claude Code's own
-displayed values; the ≥30pt-drop guard (`Reconcile`) and its `(suspect)` marker
-live on the ladder (`now`), where the marker is actually visible.
+ResolveStdin (statusline only) is a four-stage pipeline. Design principle: the
+disk cache is the reference set of windows the plan reports; the bounded
+refresh exists to HEAL GAPS in what is served, never to keep the cache warm —
+a cached window refreshes only when the served line depends on it and stdin
+does not carry it.
+
+1. parse   `rate_limits` → `usage.Snapshot` (tolerant: `used_percentage` or
+           `utilization`; resets_at as ISO or epoch; `model_scoped` keyed by
+           `display_name`; `utilization: null` entries dropped — unknown ≠ 0;
+           `seven_day_opus` backfills Opus only). No usable window → nil → the
+           ladder handles the tick.
+2. gate    a refresh runs only when BOTH hold: (a) no attempt within the TTL —
+           keyed off the *later* of the cache's `fetched_at` and
+           `attempted_at`, NOT data staleness; and (b) stdin is incomplete.
+           Completeness is cache-relative, not shape-absolute: stdin is
+           complete when it covers every window the cache carries — every
+           scoped model included. CC's stdin projection omits scoped models
+           outside its allowlist (typically Fable), so a cache-known model
+           missing from stdin is a gap that re-opens the ≤1/TTL refresh. No
+           cache at all, or only a snapshot never produced by an API decode
+           (`usage.Snapshot.ScopedProbed` — set only by `usage.decode`), is
+           also incomplete: the first tick bootstraps one seeded refresh that
+           establishes the reference set. A plan proven scoped-less
+           (`ScopedProbed`, no scoped keys) terminates the loop instead of
+           polling forever.
+3. refresh bounded: `resolveToken` → `fetchWithToken` (5s budget) →
+           `Reconcile` → `storeCache`. Failure records the attempt via
+           `Cache.Touch` (`payload`/`fetched_at` untouched), so a persistently
+           failing endpoint still yields ≤1 attempt per TTL instead of a fetch
+           on every statusline tick.
+4. serve   `usage.Overlay(stdin, cache)` — per window stdin wins, gaps fill
+           from cache, `ExtraUsage` always from the fresh side — served with
+           `source: "stdin"`. The `stale`/≈ marker keys off data age
+           (`fetched_at`), not attempt recency: a failed refresh shows ≈
+           honestly while the next attempt stays throttled. No suspect guard
+           runs here — the statusline mirrors Claude Code's own values; the
+           ≥30pt-drop guard and its `(suspect)` marker live on the ladder
+           (`now`), where the marker is visible.
 
 ## Invariants — do not break these
 
@@ -107,9 +134,12 @@ live on the ladder (`now`), where the marker is actually visible.
    Breaking this gets the user rate-limited (the endpoint 429s aggressively).
    The stdin rate_limits path keeps that cap: it does at most one bounded
    refresh per TTL, gated on the *later* of the cache's `fetched_at` and
-   `attempted_at`. A failed refresh records its attempt (`Cache.Touch`) so a
-   failing/429ing endpoint does NOT re-fetch on every statusline tick; a
-   complete stdin snapshot means zero calls. Both paths share the flock'd cache,
+`attempted_at`. A failed refresh records its attempt (`Cache.Touch`) so a
+failing/429ing endpoint does NOT re-fetch on every statusline tick; a stdin
+snapshot covering every cache-known window means zero calls, while a
+cache-known scoped model missing from stdin (e.g. Fable) costs ≤1 call per
+TTL. A plan proven to have no scoped limits (`ScopedProbed`, no scoped keys)
+terminates the loop instead of polling forever. Both paths share the flock'd cache,
    so the per-machine bound holds. Caveat: the check→fetch→store sequence is not
    locked end-to-end, so several concurrent sessions crossing the TTL boundary
    at once can each fetch before the first store lands (bounded by session
@@ -277,3 +307,24 @@ go vet ./... && gofmt -l .
   applies only to fetched/ladder data and renders its `(suspect)` marker in
   `now`, where the marker is visible. Guarding on the statusline would make
   ccx diverge from CC's UI while hiding the reason.
+- cache is a pure opaque store; its vestigial TTL machinery (`WithTTL`,
+  `Fresh`, `TTL()`, `DefaultTTL`, `Entry.Age`) had zero production consumers —
+  TTL judgment lives solely in the engine (`engine.DefaultTTL`) — and was
+  removed along with a duplicate 120s constant. `usage.RateLimitError` /
+  `parseRetryAfter` deliberately remain despite having no v1 behavioral
+  consumer (the ladder treats 429 like any transient failure): they are the
+  tested seeds for the deferred Backoff feature and carry no complexity the
+  429 budget story doesn't already assume.
+- stdin completeness is cache-relative, not shape-absolute (Fable-freeze fix):
+  the original `stdinComplete` counted "any scoped model present" as complete,
+  so when CC's stdin projection omitted a model outside its allowlist
+  (typically Fable) while piping another (e.g. Opus), the bounded refresh
+  never ran and `Overlay` served Fable frozen from the cache forever —
+  including stale prev-cycle values after a reset. Completeness now means
+  stdin covers every window the cache carries; a cache-known model missing
+  from stdin re-opens the ≤1/TTL refresh. `ScopedProbed` (API decode only)
+  lets a genuinely scoped-less plan terminate the loop, and a missing cache
+  bootstraps exactly one refresh so fresh installs surface allowlist-filtered
+  models at all. The stdin parser still drops `utilization: null`
+  model_scoped entries (null = unknown, not 0); the refresh path then fetches
+  the real value instead of rendering a guessed 0.

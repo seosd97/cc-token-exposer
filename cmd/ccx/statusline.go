@@ -35,7 +35,9 @@ usage API.
 
 If the statusline stdin session JSON carries a "rate_limits" field (intermittent
 across Claude Code versions, #40094), it is used directly; windows it lacks are
-filled from the disk cache, and no usage API call ever happens on this path.
+filled from the disk cache. A window the cache knows but stdin lacks — notably
+a scoped model Claude Code never pipes — triggers at most one bounded usage API
+refresh per cache TTL, so it still tracks the real value.
 
 Install: add to ~/.claude/settings.json
 
