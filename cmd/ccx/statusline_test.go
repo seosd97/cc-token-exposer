@@ -114,6 +114,16 @@ func TestFormatStatusline(t *testing.T) {
 			want: "≈ ◷ 5h ▮▯▯▯▯ 23% ↻ 4h12m · ◷ 7d ▮▮▯▯▯ 41% ↻ 3d0h · ⚠ login",
 		},
 		{
+			name: "window without any reset omits the reset part",
+			st: &schema.State{
+				Auth: schema.AuthOK,
+				Snapshot: &schema.Snapshot{
+					FiveHour: win(50, time.Time{}),
+				},
+			},
+			want: "◷ 5h ▮▮▮▯▯ 50%",
+		},
+		{
 			name: "all resets elapsed omits the reset part",
 			st: &schema.State{
 				Auth: schema.AuthOK,
@@ -270,6 +280,22 @@ func TestSnapshotFromRateLimits(t *testing.T) {
 		snap, ok := snapshotFromRateLimits(raw, now)
 		if !ok || snap.FiveHour.Utilization != 70 {
 			t.Errorf("got %+v, want used_percentage 70 to win", snap)
+		}
+	})
+
+	t.Run("window without resets_at keeps its percentage", func(t *testing.T) {
+		// CC can pipe null/missing resets_at; the window must survive (the
+		// engine backfills the reset from cache or heals it via refresh).
+		raw := []byte(`{"five_hour":{"used_percentage":47},"seven_day":{"used_percentage":20,"resets_at":null}}`)
+		snap, ok := snapshotFromRateLimits(raw, now)
+		if !ok {
+			t.Fatal("expected a snapshot")
+		}
+		if snap.FiveHour == nil || snap.FiveHour.Utilization != 47 || !snap.FiveHour.ResetsAt.IsZero() {
+			t.Errorf("five_hour = %+v, want 47%% with zero reset", snap.FiveHour)
+		}
+		if snap.SevenDay == nil || snap.SevenDay.Utilization != 20 || !snap.SevenDay.ResetsAt.IsZero() {
+			t.Errorf("seven_day = %+v, want 20%% with zero reset", snap.SevenDay)
 		}
 	})
 
