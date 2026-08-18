@@ -555,7 +555,7 @@ func TestStdinScopedEmptyWithProbedScopedlessCacheNeedsNoRefresh(t *testing.T) {
 	stdin := &schema.Snapshot{
 		FetchedAt: baseTime,
 		FiveHour:  &schema.Window{Utilization: 18, ResetsAt: baseTime.Add(time.Hour)},
-		SevenDay:  &schema.Window{Utilization: 41, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
+		SevenDay:  &schema.Window{Utilization: 41, ResetsAt: baseTime.Add(time.Hour + 5*24*time.Hour)},
 	}
 	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, stdin)
 
@@ -885,6 +885,106 @@ func TestStdinScopedEmptyIsIncompleteAndSpawnsRefresh(t *testing.T) {
 	}
 	if st.Snapshot.ScopedLimits["Sonnet"] != nil {
 		t.Fatalf("empty scoped limits heal only after the detached refresh lands: %+v", st.Snapshot.ScopedLimits)
+	}
+}
+
+func TestStdinResetlessWindowIsIncompleteAndBackfilled(t *testing.T) {
+	// CC can pipe five_hour utilization with no usable resets_at; the served
+	// line must borrow the cached reset, and the gate must open the bounded
+	// refresh so the gap heals.
+	clk := &fakeClock{t: baseTime}
+	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
+	cache := &fakeCache{
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-30 * time.Second), // within TTL
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+
+	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
+	stdin.FiveHour.ResetsAt = time.Time{} // resets_at: null on the wire
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+
+	if ref.spawns != 1 || cache.claims != 1 {
+		t.Fatalf("a reset-less stdin window must open the bounded refresh, got spawn=%d claims=%d", ref.spawns, cache.claims)
+	}
+	if st.Snapshot.FiveHour.Utilization != 18 {
+		t.Fatalf("five_hour util = %v, want stdin 18", st.Snapshot.FiveHour.Utilization)
+	}
+	if !st.Snapshot.FiveHour.ResetsAt.Equal(baseTime.Add(time.Hour)) {
+		t.Fatalf("five_hour reset = %v, want the cached reset backfilled", st.Snapshot.FiveHour.ResetsAt)
+	}
+	if st.Stale {
+		t.Fatal("a fresh cache contributing only the reset must not mark the line stale")
+	}
+}
+
+func TestStdinElapsedResetIsIncompleteAndHeals(t *testing.T) {
+	// Right after a window reset CC keeps piping the previous (elapsed)
+	// resets_at; the line keeps its countdown via the cache and a refresh heals.
+	clk := &fakeClock{t: baseTime}
+	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
+	cache := &fakeCache{
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute), // stale
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("parent must not fetch on the stdin path")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+
+	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
+	stdin.FiveHour.ResetsAt = baseTime.Add(-time.Minute)
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+
+	if ref.spawns != 1 {
+		t.Fatalf("an elapsed stdin reset must open the bounded refresh, got spawn=%d", ref.spawns)
+	}
+	if !st.Snapshot.FiveHour.ResetsAt.Equal(baseTime.Add(time.Hour)) {
+		t.Fatalf("five_hour reset = %v, want the cache's future reset", st.Snapshot.FiveHour.ResetsAt)
+	}
+	if !st.Stale {
+		t.Fatal("a stale cache contributing the reset must mark the line ≈")
+	}
+}
+
+func TestStdinResetlessWindowNeedsNoHealWhenCacheLacksIt(t *testing.T) {
+	// A probed cache without the window means the API reports none — nothing
+	// to heal, so the refresh loop stays closed.
+	clk := &fakeClock{t: baseTime}
+	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
+	cached.FiveHour = nil
+	cache := &fakeCache{
+		payload:      mustMarshal(t, cached),
+		storedAt:     baseTime.Add(-10 * time.Minute),
+		scopedProbed: true,
+		has:          true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("nothing to heal when the cache lacks the window")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+
+	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
+	stdin.FiveHour.ResetsAt = time.Time{}
+	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+
+	if cache.claims != 0 || ref.spawns != 0 || len(fetch.calls) != 0 {
+		t.Fatalf("expected zero I/O, got claims=%d spawns=%d fetch=%d", cache.claims, ref.spawns, len(fetch.calls))
+	}
+	if st.Snapshot.FiveHour == nil || st.Snapshot.FiveHour.Utilization != 18 {
+		t.Fatalf("stdin five_hour must still serve: %+v", st.Snapshot.FiveHour)
 	}
 }
 

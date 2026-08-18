@@ -102,4 +102,69 @@ func TestOverlaySkipsNilBaseWindows(t *testing.T) {
 	}
 }
 
+func TestOverlayBackfillsMissingResetFromBase(t *testing.T) {
+	// stdin can carry utilization without a usable resets_at (null/missing);
+	// the cached reset must fill in instead of dropping the countdown.
+	fresh := &schema.Snapshot{FiveHour: &schema.Window{Utilization: 20}, SevenDay: owin(30)}
+	base := &schema.Snapshot{FiveHour: owin(99), SevenDay: owin(99)}
+	got, used := Overlay(fresh, base)
+	if !used {
+		t.Fatal("a base reset backfill counts as contributing")
+	}
+	if got.FiveHour.Utilization != 20 {
+		t.Errorf("utilization = %v, want fresh 20", got.FiveHour.Utilization)
+	}
+	if !got.FiveHour.ResetsAt.Equal(mergeBase.Add(time.Hour)) {
+		t.Errorf("resets_at = %v, want the base reset backfilled", got.FiveHour.ResetsAt)
+	}
+	if fresh.FiveHour.ResetsAt != (time.Time{}) {
+		t.Error("fresh window must not be mutated")
+	}
+}
+
+func TestOverlayPrefersLaterResetFromBase(t *testing.T) {
+	// A stdin reset already elapsed (CC projection lagging across a window
+	// reset) must yield to the cache's still-future one.
+	fresh := &schema.Snapshot{FiveHour: &schema.Window{Utilization: 20, ResetsAt: mergeBase.Add(-time.Hour)}}
+	base := &schema.Snapshot{FiveHour: owin(99)}
+	got, used := Overlay(fresh, base)
+	if !used {
+		t.Fatal("a later base reset counts as contributing")
+	}
+	if got.FiveHour.Utilization != 20 || !got.FiveHour.ResetsAt.Equal(mergeBase.Add(time.Hour)) {
+		t.Errorf("got %+v, want fresh 20 with the base's later reset", got.FiveHour)
+	}
+}
+
+func TestOverlayKeepsLaterFreshReset(t *testing.T) {
+	fresh := &schema.Snapshot{FiveHour: &schema.Window{Utilization: 20, ResetsAt: mergeBase.Add(2 * time.Hour)}}
+	base := &schema.Snapshot{FiveHour: owin(99)}
+	got, used := Overlay(fresh, base)
+	if used {
+		t.Fatal("an earlier base reset must not contribute")
+	}
+	if got.FiveHour.ResetsAt != fresh.FiveHour.ResetsAt {
+		t.Errorf("resets_at = %v, want the fresh later reset kept", got.FiveHour.ResetsAt)
+	}
+}
+
+func TestOverlayScopedBackfillsReset(t *testing.T) {
+	fresh := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": {Utilization: 40}}}
+	base := &schema.Snapshot{ScopedLimits: map[string]*schema.Window{"Fable": owin(99), "Opus": owin(50)}}
+	got, used := Overlay(fresh, base)
+	if !used {
+		t.Fatal("base must contribute the Fable reset and the Opus window")
+	}
+	if got.ScopedLimits["Fable"].Utilization != 40 ||
+		!got.ScopedLimits["Fable"].ResetsAt.Equal(mergeBase.Add(time.Hour)) {
+		t.Errorf("Fable = %+v, want fresh 40 with the backfilled reset", got.ScopedLimits["Fable"])
+	}
+	if got.ScopedLimits["Opus"].Utilization != 50 {
+		t.Errorf("Opus = %+v, want base window 50", got.ScopedLimits["Opus"])
+	}
+	if len(fresh.ScopedLimits) != 1 {
+		t.Errorf("fresh map mutated: %+v", fresh.ScopedLimits)
+	}
+}
+
 func ptr(v float64) *float64 { return &v }

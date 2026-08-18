@@ -118,20 +118,24 @@ does not carry it.
            `display_name`; `utilization: null` entries dropped — unknown ≠ 0;
            `seven_day_opus` backfills Opus only). No usable window → nil → the
            ladder handles the tick.
-2. gate    a refresh runs only when BOTH hold: (a) no attempt within the TTL —
-           keyed off the *later* of the cache's `fetched_at` and
-           `attempted_at`, NOT data staleness; and (b) stdin is incomplete.
-           Completeness is cache-relative, not shape-absolute: stdin is
-           complete when it covers every window the cache carries — every
-           scoped model included. CC's stdin projection omits scoped models
-           outside its allowlist (typically Fable), so a cache-known model
-           missing from stdin is a gap that re-opens the ≤1/TTL refresh. No
-           cache at all, or only a snapshot never produced by an API decode
-           (`usage.Snapshot.ScopedProbed` — set only by `usage.decode`), is
-           also incomplete: the first tick bootstraps one seeded refresh that
-           establishes the reference set. A plan proven scoped-less
-           (`ScopedProbed`, no scoped keys) terminates the loop instead of
-           polling forever.
+ 2. gate    a refresh runs only when BOTH hold: (a) no attempt within the TTL —
+            keyed off the *later* of the cache's `fetched_at` and
+            `attempted_at`, NOT data staleness; and (b) stdin is incomplete.
+            Completeness is cache-relative, not shape-absolute: stdin is
+            complete when it covers every window the cache carries — every
+            scoped model included — and each covered window carries a
+            still-future reset time. CC's stdin projection omits scoped models
+            outside its allowlist (typically Fable) and can pipe null, missing
+            or already-elapsed `resets_at`, so a cache-known model missing
+            from stdin — or any cached window whose reset stdin doesn't carry
+            forward — is a gap that re-opens the ≤1/TTL refresh. No
+            cache at all, or only a snapshot never produced by an API decode
+            (`usage.Snapshot.ScopedProbed` — set only by `usage.decode`), is
+            also incomplete: the first tick bootstraps one seeded refresh that
+            establishes the reference set. A plan proven scoped-less
+            (`ScopedProbed`, no scoped keys) — or proven without a given
+            window, since coverage is keyed off what the cache carries —
+            terminates the loop instead of polling forever.
 3. refresh detached: when incomplete, `Cache.ClaimRefresh(now, ttl)` atomically
             claims a refresh slot (check-and-set of attempted_at under the write
             flock, keyed off the later of fetched_at/attempted_at). On success
@@ -145,8 +149,13 @@ does not carry it.
             refresh inside the child still counts as an attempt (the claim
             already stamped attempted_at), so a persistently failing endpoint
             yields ≤1 spawn per TTL instead of one per tick.
-4. serve   `usage.Overlay(stdin, cache)` — per window stdin wins, gaps fill
-            from cache, `ExtraUsage` always from the fresh side — served with
+ 4. serve   `usage.Overlay(stdin, cache)` — per window stdin's utilization
+            wins, gaps fill from cache; within one window the LATER reset time
+            wins (reset boundaries only move forward between cycles), so a
+            stdin window with a zero/missing or elapsed `resets_at` borrows
+            the cache's still-future reset and keeps its countdown. Borrowed
+            data counts as a cache contribution for the `stale`/≈ marker.
+            `ExtraUsage` always comes from the fresh side — served with
             `source: "stdin"`. The `stale`/≈ marker keys off data age
             (`fetched_at`), not attempt recency: while a detached refresh is in
             flight the line honestly shows ≈; after it lands, the next tick
@@ -237,7 +246,10 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
   `seven_day_oauth_apps` / `seven_day_opus` / `seven_day_sonnet` windows,
   `model_scoped: [{display_name, utilization|null, resets_at ISO|null}]`
   (projected by CC from the server limits[] overage-included-models
-  allowlist, present only when non-empty), and `extra_usage`. The parser maps
+  allowlist, present only when non-empty), and `extra_usage`. Any window's
+  `resets_at` may be null or missing — CC refreshes its projection only on
+  its own usage fetches, so it can lag across window resets; the parser keeps
+  the utilization with a zero reset and the engine backfills/heals it. The parser maps
   model_scoped by display_name into ScopedLimits (seven_day_opus only
   backfills Opus); sonnet/oauth_apps/extra_usage are ignored, consistent
   with the API path.
@@ -408,9 +420,25 @@ go vet ./... && gofmt -l .
   never ran and `Overlay` served Fable frozen from the cache forever —
   including stale prev-cycle values after a reset. Completeness now means
   stdin covers every window the cache carries; a cache-known model missing
-  from stdin re-opens the ≤1/TTL refresh. `ScopedProbed` (API decode only)
+  from stdin re-opens the ≤1/TTL refresh.   `ScopedProbed` (API decode only)
   lets a genuinely scoped-less plan terminate the loop, and a missing cache
   bootstraps exactly one refresh so fresh installs surface allowlist-filtered
   models at all. The stdin parser still drops `utilization: null`
   model_scoped entries (null = unknown, not 0); the refresh path then fetches
   the real value instead of rendering a guessed 0.
+- completeness is reset-time-aware, and Overlay merges resets (missing 5h
+  countdown fix): presence-only completeness + wholesale-stdin Overlay meant a
+  piped `five_hour` whose `resets_at` was null/missing or already elapsed
+  (CC's projection is refreshed only by CC's own usage fetches, so it lags
+  across window resets and sends null resets for inactive scoped models)
+  rendered the window with NO countdown — and never healed, because the gate
+  judged the window covered while Overlay ignored the cache's valid reset.
+  Now a cached window counts as covered only with a stdin window carrying a
+  still-future reset (a reset-less one re-opens the ≤1/TTL refresh, bounded
+  exactly like the scoped-model gap), and `Overlay` merges per window: fresh
+  utilization wins, reset time takes the LATER value (boundaries only move
+  forward between cycles), backfilling the zero/elapsed stdin reset from the
+  cache — counted as a cache contribution, so the ≈ marker stays honest.
+  Coverage keyed off the cache also means a window the cache doesn't carry
+  (API never reported it, e.g. an idle plan's `five_hour`) needs no healing,
+  closing the theoretical ≤1/TTL spawn loop such plans would otherwise open.

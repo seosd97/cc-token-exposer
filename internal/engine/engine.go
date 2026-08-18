@@ -169,13 +169,15 @@ func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now 
 // ResolveStdin serves a snapshot piped in by Claude Code's statusline, overlaid
 // on the disk cache. Stdin counts as incomplete while it misses any window the
 // cache carries — crucially a scoped model CC's projection omits, like Fable —
-// or while no probed cache exists to judge against, so those gaps heal instead
-// of freezing. When incomplete, it claims a refresh slot (claim + spawn are
-// atomic and deduped against concurrent invocations via the cache flock), spawns
-// the detached refresher, and serves the overlay immediately — the statusline
-// path never blocks on the network. A spawn failure falls back to one bounded
-// synchronous refresh. No suspect guard runs here — the statusline mirrors
-// Claude Code's own values; the guard and its marker live on the ladder.
+// or carries a cached window without a still-future reset time (CC pipes
+// null or lagging resets_at), or while no probed cache exists to judge
+// against, so those gaps heal instead of freezing. When incomplete, it claims
+// a refresh slot (claim + spawn are atomic and deduped against concurrent
+// invocations via the cache flock), spawns the detached refresher, and serves
+// the overlay immediately — the statusline path never blocks on the network.
+// A spawn failure falls back to one bounded synchronous refresh. No suspect
+// guard runs here — the statusline mirrors Claude Code's own values; the guard
+// and its marker live on the ladder.
 func (e *Engine) ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State {
 	if stdin == nil {
 		return e.Resolve(ctx)
@@ -183,7 +185,7 @@ func (e *Engine) ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *sche
 	now := e.clock.Now()
 	cachedSnap, meta, haveCache := e.loadCache()
 	dataStale := !haveCache || now.Sub(meta.StoredAt) >= e.ttl
-	if !stdinComplete(stdin, cachedSnap, meta.ScopedProbed) {
+	if !stdinComplete(stdin, cachedSnap, meta.ScopedProbed, now) {
 		if e.cache != nil && e.refresher != nil {
 			if claimed, err := e.cache.ClaimRefresh(now, e.ttl); err == nil && claimed {
 				if serr := e.refresher.Spawn(ctx); serr != nil {
@@ -226,15 +228,21 @@ func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap 
 	return merged
 }
 
-// stdinComplete reports whether stdin covers every window the cache knows.
-// Without a probed cache it stays incomplete so the first tick bootstraps one:
-// that seeds the cache (and surfaces scoped models CC never pipes), and the
-// cache without scoped limits then proves the plan has none — ending the loop.
-func stdinComplete(s, base *schema.Snapshot, probed bool) bool {
-	if s == nil || s.FiveHour == nil || s.SevenDay == nil {
+// stdinComplete reports whether stdin covers every window the cache knows:
+// present AND carrying a still-future reset time — a null, missing or already
+// elapsed resets_at leaves the served countdown missing, which is a gap the
+// bounded refresh must heal. Without a probed cache it stays incomplete so the
+// first tick bootstraps one: that seeds the cache (and surfaces scoped models
+// CC never pipes), and the cache without scoped limits then proves the plan
+// has none — ending the loop.
+func stdinComplete(s, base *schema.Snapshot, probed bool, now time.Time) bool {
+	if s == nil || base == nil {
 		return false
 	}
-	if base == nil {
+	if !coversWindow(s.FiveHour, base.FiveHour, now) {
+		return false
+	}
+	if !coversWindow(s.SevenDay, base.SevenDay, now) {
 		return false
 	}
 	if len(s.ScopedLimits) == 0 && !probed {
@@ -244,11 +252,21 @@ func stdinComplete(s, base *schema.Snapshot, probed bool) bool {
 		if w == nil {
 			continue
 		}
-		if _, ok := s.ScopedLimits[name]; !ok {
+		if !coversWindow(s.ScopedLimits[name], w, now) {
 			return false
 		}
 	}
 	return true
+}
+
+// coversWindow reports whether the stdin window fully covers what the cache
+// reports for one window: the cache side absent, or the stdin side present
+// with a still-future reset time.
+func coversWindow(stdinW, baseW *schema.Window, now time.Time) bool {
+	if baseW == nil {
+		return true
+	}
+	return stdinW != nil && stdinW.ResetsAt.After(now)
 }
 
 func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *schema.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
