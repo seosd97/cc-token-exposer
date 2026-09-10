@@ -310,3 +310,20 @@ func keys(m map[string]json.RawMessage) []string {
 	}
 	return out
 }
+
+func TestDefaultPathForKeepsProvidersInSeparateFiles(t *testing.T) {
+	legacy, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath: %v", err)
+	}
+	if filepath.Base(legacy) != "snapshot.json" {
+		t.Fatalf("legacy cache file = %s, want snapshot.json", legacy)
+	}
+	codex, err := DefaultPathFor("codex")
+	if err != nil {
+		t.Fatalf("DefaultPathFor: %v", err)
+	}
+	if filepath.Base(codex) != "codex.json" || filepath.Dir(codex) != filepath.Dir(legacy) {
+		t.Fatalf("named cache = %s, want codex.json beside %s", codex, legacy)
+	}
+}

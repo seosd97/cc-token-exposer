@@ -23,6 +23,7 @@ var errSilentExit = errors.New("error state already printed to stdout")
 type resolver interface {
 	Resolve(ctx context.Context) *schema.State
 	ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State
+	ResolveDetached(ctx context.Context) *schema.State
 }
 
 func versionString() string {
@@ -37,22 +38,29 @@ func versionString() string {
 	return version
 }
 
-func openCache() *cache.Cache {
-	c, err := cache.New()
+func openCache(name string) *cache.Cache {
+	c, err := cache.NewNamed(name)
 	if err != nil {
 		return nil
 	}
 	return c
 }
 
+func productionProviders() providers {
+	return providers{
+		schema.ProviderClaude: engine.New(engine.Options{
+			Provider:   engine.ClaudeProvider,
+			Creds:      creds.Default(),
+			Fetcher:    usage.New(),
+			Cache:      engine.CacheFrom(openCache(cache.DefaultName)),
+			Transcript: transcript.NewProbe(),
+			Refresher:  processRefresher{provider: schema.ProviderClaude},
+		}),
+	}
+}
+
 func main() {
-	eng := engine.New(engine.Options{
-		Creds:      creds.Default(),
-		Fetcher:    usage.New(),
-		Cache:      engine.CacheFrom(openCache()),
-		Transcript: transcript.NewProbe(),
-		Refresher:  processRefresher{},
-	})
+	ps := productionProviders()
 
 	root := &cobra.Command{
 		Use:           "ccx",
@@ -69,9 +77,9 @@ func main() {
 		},
 	})
 
-	root.AddCommand(newNowCmd(eng))
-	root.AddCommand(newStatuslineCmd(eng))
-	root.AddCommand(newRefreshCmd(eng))
+	root.AddCommand(newNowCmd(ps))
+	root.AddCommand(newStatuslineCmd(ps))
+	root.AddCommand(newRefreshCmd(ps))
 	root.AddCommand(newUpdateCmd(defaultUpdater()))
 
 	if err := root.Execute(); err != nil {

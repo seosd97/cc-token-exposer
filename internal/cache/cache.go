@@ -26,16 +26,22 @@ type Cache struct {
 	path string
 }
 
-func DefaultPath() (string, error) {
+const DefaultName = "snapshot"
+
+func DefaultPath() (string, error) { return DefaultPathFor(DefaultName) }
+
+func DefaultPathFor(name string) (string, error) {
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("cache: resolve cache dir: %w", err)
 	}
-	return filepath.Join(dir, "cc-token-exposer", "snapshot.json"), nil
+	return filepath.Join(dir, "cc-token-exposer", name+".json"), nil
 }
 
-func New() (*Cache, error) {
-	path, err := DefaultPath()
+func New() (*Cache, error) { return NewNamed(DefaultName) }
+
+func NewNamed(name string) (*Cache, error) {
+	path, err := DefaultPathFor(name)
 	if err != nil {
 		return nil, err
 	}

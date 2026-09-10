@@ -7,16 +7,22 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
-type processRefresher struct{}
+type processRefresher struct{ provider string }
 
-func (processRefresher) Spawn(ctx context.Context) error {
+func (p processRefresher) Spawn(ctx context.Context) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(exe, "refresh")
+	name := p.provider
+	if name == "" {
+		name = schema.ProviderClaude
+	}
+	cmd := exec.Command(exe, "refresh", "--provider", name)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
