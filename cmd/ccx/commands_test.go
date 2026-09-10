@@ -103,6 +103,39 @@ func TestNowJSONEmitsVersionedState(t *testing.T) {
 	}
 }
 
+// Drift indicators from the last live fetch render as a line in `now` output,
+// where the marker is visible.
+func TestNowRendersDriftIndicators(t *testing.T) {
+	st := snapshotState(47, 23, time.Now().UTC().Add(2*time.Hour))
+	st.Drift = []string{"five_hour missing resets_at", `unknown scoped limits kind "x"`}
+	cmd := newNowCmd(&fakeResolver{st: st})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs(nil)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "drift: five_hour missing resets_at · unknown scoped limits kind \"x\"") {
+		t.Fatalf("output missing drift line:\n%s", got)
+	}
+}
+
+func TestNowOmitsDriftLineWhenClean(t *testing.T) {
+	cmd := newNowCmd(&fakeResolver{st: snapshotState(47, 23, time.Now().UTC().Add(2*time.Hour))})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs(nil)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if strings.Contains(out.String(), "drift") {
+		t.Fatalf("drift line must be absent without indicators:\n%s", out.String())
+	}
+}
+
 func TestStatuslineUsesInjectedResolver(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	st := snapshotState(72, 41, time.Now().UTC().Add(4*time.Hour))
@@ -164,6 +197,27 @@ func TestStatuslineNoRateLimitsYieldsNilStdin(t *testing.T) {
 	}
 	if res.stdin != nil {
 		t.Fatalf("empty stdin should yield nil snapshot, got %+v", res.stdin)
+	}
+}
+
+// The statusline mirrors Claude Code's own displayed values, so drift markers
+// stay on the `now` path where they are visible (same rule as the suspect
+// guard); a drift-carrying state must not change the statusline output.
+func TestStatuslineOmitsDriftMarkers(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	st := snapshotState(47, 23, time.Now().UTC().Add(2*time.Hour))
+	st.Drift = []string{"seven_day missing resets_at"}
+	cmd := newStatuslineCmd(&fakeResolver{st: st})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetIn(bytes.NewBufferString("{}"))
+	cmd.SetArgs(nil)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if strings.Contains(out.String(), "drift") {
+		t.Fatalf("statusline must not render drift markers: %q", out.String())
 	}
 }
 

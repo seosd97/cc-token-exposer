@@ -22,7 +22,7 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"type":"snapshot","five_hour":{"utilization":23}}`)
 
-	if err := c.Store(payload, fetchedAt, false); err != nil {
+	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -59,7 +59,7 @@ func TestClaimRefreshRecordsAttemptPreservingData(t *testing.T) {
 	c := tempCache(t)
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, fetchedAt, false); err != nil {
+	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestClaimRefreshThrottlesWithinBackoff(t *testing.T) {
 		t.Fatalf("claim after backoff = %v, %v; want true", got, err)
 	}
 	// A fresh data store becomes the later of the two and throttles a claim.
-	if err := c.Store(json.RawMessage(`{"v":1}`), t0.Add(2*backoff-20*time.Second), false); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":1}`), t0.Add(2*backoff-20*time.Second), false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	if got, err := c.ClaimRefresh(t0.Add(2*backoff), backoff); err != nil || got {
@@ -158,7 +158,7 @@ func TestClaimRefreshConcurrent(t *testing.T) {
 
 func TestStoreRejectsInvalidJSON(t *testing.T) {
 	c := tempCache(t)
-	if err := c.Store(json.RawMessage(`{not json`), time.Now(), false); err == nil {
+	if err := c.Store(json.RawMessage(`{not json`), time.Now(), false, nil); err == nil {
 		t.Fatalf("Store accepted invalid JSON, want error")
 	}
 	// Nothing should have been written.
@@ -176,7 +176,7 @@ func TestNoTokenInCacheFile(t *testing.T) {
 	const token = "sk-ant-oat-SUPER-SECRET-TOKEN"
 	// A realistic, token-free State payload.
 	payload := json.RawMessage(`{"schema_version":1,"type":"snapshot","auth":"ok","five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, time.Now(), false); err != nil {
+	if err := c.Store(payload, time.Now(), false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -212,7 +212,7 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
 
-	if err := c.Store(payload, fetchedAt, true); err != nil {
+	if err := c.Store(payload, fetchedAt, true, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	e, err := c.Load()
@@ -226,7 +226,7 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 		t.Errorf("scoped_probed leaked into the payload: %s", e.Payload)
 	}
 
-	if err := c.Store(payload, fetchedAt, false); err != nil {
+	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
 		t.Fatalf("Store(false): %v", err)
 	}
 	e, err = c.Load()
@@ -241,11 +241,11 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 func TestStoreOverwrites(t *testing.T) {
 	c := tempCache(t)
 	t0 := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	if err := c.Store(json.RawMessage(`{"v":1}`), t0, false); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":1}`), t0, false, nil); err != nil {
 		t.Fatalf("Store1: %v", err)
 	}
 	t1 := t0.Add(time.Minute)
-	if err := c.Store(json.RawMessage(`{"v":2}`), t1, false); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":2}`), t1, false, nil); err != nil {
 		t.Fatalf("Store2: %v", err)
 	}
 	e, err := c.Load()
@@ -267,7 +267,7 @@ func TestConcurrentAccess(t *testing.T) {
 	c := tempCache(t)
 	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	// Seed so early readers don't all miss.
-	if err := c.Store(json.RawMessage(`{"writer":0,"i":0}`), base, false); err != nil {
+	if err := c.Store(json.RawMessage(`{"writer":0,"i":0}`), base, false, nil); err != nil {
 		t.Fatalf("seed Store: %v", err)
 	}
 
@@ -280,7 +280,7 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				p := json.RawMessage(`{"writer":` + strconv.Itoa(w) + `,"i":` + strconv.Itoa(i) + `}`)
-				if err := c.Store(p, base.Add(time.Duration(i)*time.Second), false); err != nil {
+				if err := c.Store(p, base.Add(time.Duration(i)*time.Second), false, nil); err != nil {
 					t.Errorf("writer %d Store: %v", w, err)
 					return
 				}

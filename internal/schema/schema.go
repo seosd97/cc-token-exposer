@@ -94,6 +94,7 @@ type State struct {
 	Snapshot      *Snapshot  `json:"snapshot,omitempty"`
 	LimitHit      *LimitHit  `json:"limit_hit,omitempty"`
 	Error         string     `json:"error,omitempty"`
+	Drift         []string   `json:"drift,omitempty"`
 }
 
 type Duration time.Duration

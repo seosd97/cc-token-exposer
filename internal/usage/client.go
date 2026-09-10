@@ -24,6 +24,8 @@ const (
 	requestTimeout = 10 * time.Second
 
 	maxBodyBytes = 1 << 20
+
+	scopedLimitKind = "weekly_scoped"
 )
 
 var (
@@ -172,7 +174,42 @@ func (c *Client) decode(body io.Reader) (*FetchedSnapshot, error) {
 		ScopedLimits: scoped,
 		ExtraUsage:   r.ExtraUsage,
 	}
-	return &FetchedSnapshot{Snapshot: snap, ScopedProbed: true}, nil
+	return &FetchedSnapshot{Snapshot: snap, ScopedProbed: true, Drift: driftIndicators(&r, snap)}, nil
+}
+
+// driftIndicators lists wire-shape anomalies in a decoded response; they are
+// informational and never block the decode.
+func driftIndicators(r *apiResponse, snap *schema.Snapshot) []string {
+	var d []string
+	if snap.FiveHour == nil &&
+		snap.SevenDay == nil &&
+		len(snap.ScopedLimits) == 0 &&
+		(snap.ExtraUsage == nil || snap.ExtraUsage.Utilization == nil) {
+		d = append(d, "empty usage payload")
+	}
+	if r.FiveHour != nil && r.FiveHour.ResetsAt.IsZero() {
+		d = append(d, "five_hour missing resets_at")
+	}
+	if r.SevenDay != nil && r.SevenDay.ResetsAt.IsZero() {
+		d = append(d, "seven_day missing resets_at")
+	}
+	if r.SevenDayOpus != nil && r.SevenDayOpus.ResetsAt.IsZero() && snap.ScopedLimits["Opus"] == r.SevenDayOpus {
+		d = append(d, "seven_day_opus missing resets_at")
+	}
+	for _, l := range r.Limits {
+		if l.Scope == nil || l.Scope.Model == nil {
+			continue
+		}
+		switch {
+		case l.Scope.Model.DisplayName == "":
+			d = append(d, "limits entry missing model display_name")
+		case l.Kind != scopedLimitKind:
+			d = append(d, fmt.Sprintf("unknown scoped limits kind %q", l.Kind))
+		case l.ResetsAt.IsZero() && l.Percent > 0:
+			d = append(d, fmt.Sprintf("scoped limits %q missing resets_at", l.Scope.Model.DisplayName))
+		}
+	}
+	return d
 }
 
 func decodeScopedLimits(limits []limitEntry) map[string]*schema.Window {

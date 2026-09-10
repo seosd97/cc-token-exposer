@@ -56,6 +56,11 @@ $ ccx now --json
   "scoped_limits":{"Fable":{"utilization":94,"resets_at":"…"},"Opus":{"utilization":12,"resets_at":"…"}}}}
 ```
 
+When the endpoint's response shape drifts (a window losing its `resets_at`, a
+renamed field, a new limits kind, …), `now` prints a `drift:` line and the
+JSON state carries a `drift` array — a silent format change becomes visible
+instead of quietly degrading into wrong numbers.
+
 ### `ccx statusline`
 
 Prints a single line for the Claude Code statusline:

@@ -57,6 +57,9 @@ func renderHuman(st *schema.State, now time.Time) string {
 	if b.Len() == 0 {
 		b.WriteString("no usage data\n")
 	}
+	if len(st.Drift) > 0 {
+		b.WriteString("drift: " + strings.Join(st.Drift, " · ") + "\n")
+	}
 
 	b.WriteString(freshnessFooter(st))
 	return b.String()

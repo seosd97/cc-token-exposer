@@ -132,3 +132,31 @@ func TestSnapshotMarshalOmitsAliasesWithoutScopedModels(t *testing.T) {
 		t.Fatalf("aliases should be omitted when no scoped models: %s", b)
 	}
 }
+
+func TestStateDriftOmittedWhenEmpty(t *testing.T) {
+	b, _ := json.Marshal(&State{SchemaVersion: Version, Type: TypeSnapshot, Source: SourceOAuth, Auth: AuthOK})
+	if strings.Contains(string(b), "drift") {
+		t.Fatalf("drift should be omitted when empty: %s", b)
+	}
+}
+
+func TestStateDriftRoundTrip(t *testing.T) {
+	want := []string{"five_hour missing resets_at", `unknown scoped limits kind "x"`}
+	st := &State{SchemaVersion: Version, Type: TypeSnapshot, Source: SourceOAuth, Auth: AuthOK, Drift: want}
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back State
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(back.Drift) != len(want) {
+		t.Fatalf("Drift = %v, want %v", back.Drift, want)
+	}
+	for i := range want {
+		if back.Drift[i] != want[i] {
+			t.Fatalf("Drift[%d] = %q, want %q", i, back.Drift[i], want[i])
+		}
+	}
+}

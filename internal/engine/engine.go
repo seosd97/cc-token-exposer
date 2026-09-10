@@ -37,6 +37,7 @@ type CacheEntry struct {
 	StoredAt     time.Time
 	AttemptedAt  time.Time
 	ScopedProbed bool
+	Drift        []string
 }
 
 type Cache interface {
@@ -103,31 +104,37 @@ func (e *Engine) Resolve(ctx context.Context) *schema.State {
 
 	if haveCache {
 		if age := now.Sub(meta.StoredAt); age >= 0 && age < e.ttl {
-			return snapshotState(cachedSnap, schema.SourceCache, false, 0, schema.AuthOK)
+			st := snapshotState(cachedSnap, schema.SourceCache, false, 0, schema.AuthOK)
+			st.Drift = meta.Drift
+			return st
 		}
 	}
 
 	cr, auth := e.resolveToken(now)
 	if cr == nil {
 		if auth == schema.AuthMissing {
-			return e.degradeNoCreds(now, cachedSnap, meta.StoredAt, haveCache)
+			return e.degradeNoCreds(now, cachedSnap, meta.StoredAt, meta.Drift, haveCache)
 		}
-		return e.degradeAuthExpired(now, cachedSnap, meta.StoredAt, haveCache)
+		return e.degradeAuthExpired(now, cachedSnap, meta.StoredAt, meta.Drift, haveCache)
 	}
 
 	snap, ferr := e.fetchWithToken(ctx, cr, now)
 	if ferr == nil {
 		merged := usage.Reconcile(cachedSnap, snap.Snapshot, now)
-		e.storeCache(merged, snap.ScopedProbed)
-		return snapshotState(merged, schema.SourceOAuth, false, 0, schema.AuthOK)
+		e.storeCache(merged, snap.ScopedProbed, snap.Drift)
+		st := snapshotState(merged, schema.SourceOAuth, false, 0, schema.AuthOK)
+		st.Drift = snap.Drift
+		return st
 	}
 
 	if errors.Is(ferr, usage.ErrAuth) {
-		return e.degradeAuthExpired(now, cachedSnap, meta.StoredAt, haveCache)
+		return e.degradeAuthExpired(now, cachedSnap, meta.StoredAt, meta.Drift, haveCache)
 	}
 
 	if haveCache {
-		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(meta.StoredAt), schema.AuthOK)
+		st := snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(meta.StoredAt), schema.AuthOK)
+		st.Drift = meta.Drift
+		return st
 	}
 	return e.degradeNoData(now, schema.AuthOK, "usage fetch failed and no cache is available")
 }
@@ -224,7 +231,7 @@ func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap 
 		return nil
 	}
 	merged := usage.Reconcile(cachedSnap, snap.Snapshot, now)
-	e.storeCache(merged, snap.ScopedProbed)
+	e.storeCache(merged, snap.ScopedProbed, snap.Drift)
 	return merged
 }
 
@@ -269,9 +276,11 @@ func coversWindow(stdinW, baseW *schema.Window, now time.Time) bool {
 	return stdinW != nil && stdinW.ResetsAt.After(now)
 }
 
-func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *schema.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
+func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *schema.Snapshot, storedAt time.Time, drift []string, haveCache bool) *schema.State {
 	if haveCache {
-		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthMissing)
+		st := snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthMissing)
+		st.Drift = drift
+		return st
 	}
 	if lh := e.probeTranscript(now); lh != nil {
 		return transcriptState(lh, schema.AuthMissing)
@@ -279,9 +288,11 @@ func (e *Engine) degradeNoCreds(now time.Time, cachedSnap *schema.Snapshot, stor
 	return errorState(schema.AuthMissing, "no credentials found; run `claude` to log in")
 }
 
-func (e *Engine) degradeAuthExpired(now time.Time, cachedSnap *schema.Snapshot, storedAt time.Time, haveCache bool) *schema.State {
+func (e *Engine) degradeAuthExpired(now time.Time, cachedSnap *schema.Snapshot, storedAt time.Time, drift []string, haveCache bool) *schema.State {
 	if haveCache {
-		return snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthExpired)
+		st := snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(storedAt), schema.AuthExpired)
+		st.Drift = drift
+		return st
 	}
 	if lh := e.probeTranscript(now); lh != nil {
 		return transcriptState(lh, schema.AuthExpired)
@@ -328,7 +339,7 @@ func (e *Engine) loadCache() (*schema.Snapshot, CacheEntry, bool) {
 	return &snap, *entry, true
 }
 
-func (e *Engine) storeCache(snap *schema.Snapshot, probed bool) {
+func (e *Engine) storeCache(snap *schema.Snapshot, probed bool, drift []string) {
 	if e.cache == nil || snap == nil {
 		return
 	}
@@ -344,5 +355,6 @@ func (e *Engine) storeCache(snap *schema.Snapshot, probed bool) {
 		Payload:      payload,
 		StoredAt:     when,
 		ScopedProbed: probed,
+		Drift:        drift,
 	})
 }

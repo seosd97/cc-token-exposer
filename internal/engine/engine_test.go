@@ -44,6 +44,7 @@ func (f *fakeCreds) Resolve() (*creds.Credentials, error) {
 type fakeFetcher struct {
 	fn     func(token string) (*schema.Snapshot, error)
 	probed bool
+	drift  []string
 	calls  []string
 }
 
@@ -53,7 +54,7 @@ func (f *fakeFetcher) Fetch(_ context.Context, token string) (*usage.FetchedSnap
 	if err != nil {
 		return nil, err
 	}
-	return &usage.FetchedSnapshot{Snapshot: s, ScopedProbed: f.probed}, nil
+	return &usage.FetchedSnapshot{Snapshot: s, ScopedProbed: f.probed, Drift: f.drift}, nil
 }
 
 type fakeCache struct {
@@ -61,6 +62,7 @@ type fakeCache struct {
 	storedAt     time.Time
 	attemptedAt  time.Time
 	scopedProbed bool
+	drift        []string
 	has          bool
 	stores       int
 	claims       int
@@ -78,6 +80,7 @@ func (c *fakeCache) Load() (*engine.CacheEntry, error) {
 		StoredAt:     c.storedAt,
 		AttemptedAt:  c.attemptedAt,
 		ScopedProbed: c.scopedProbed,
+		Drift:        c.drift,
 	}, nil
 }
 
@@ -87,6 +90,7 @@ func (c *fakeCache) Store(e engine.CacheEntry) error {
 	c.payload = e.Payload
 	c.storedAt = e.StoredAt
 	c.scopedProbed = e.ScopedProbed
+	c.drift = e.Drift
 	c.has = true
 	return nil
 }
@@ -996,5 +1000,103 @@ func TestErrorStateCarriesNoSnapshot(t *testing.T) {
 	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch})
 	if st.Snapshot != nil {
 		t.Fatalf("error state should have no snapshot")
+	}
+}
+
+// Wire-drift indicators ride the live fetch into the State and persist
+// through the cache, so a later fresh-cache serve still reports last-seen
+// drift instead of silently dropping it.
+func TestDriftIndicatorsRideLiveFetchAndCache(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	const wantDrift = "five_hour missing resets_at"
+	cache := &fakeCache{}
+	fetch := &fakeFetcher{
+		probed: true,
+		drift:  []string{wantDrift},
+		fn:     func(string) (*schema.Snapshot, error) { return snapWith(23, baseTime.Add(time.Hour)), nil },
+	}
+
+	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	if st.Source != schema.SourceOAuth {
+		t.Fatalf("source = %s, want oauth", st.Source)
+	}
+	if len(st.Drift) != 1 || st.Drift[0] != wantDrift {
+		t.Fatalf("live state Drift = %v, want %v", st.Drift, wantDrift)
+	}
+	if cache.drift == nil || len(cache.drift) != 1 || cache.drift[0] != wantDrift {
+		t.Fatalf("cache did not persist drift: %+v", cache.drift)
+	}
+
+	st = resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	if st.Source != schema.SourceCache {
+		t.Fatalf("source = %s, want cache (fresh serve, no refetch)", st.Source)
+	}
+	if len(st.Drift) != 1 || st.Drift[0] != wantDrift {
+		t.Fatalf("cached state Drift = %v, want persisted drift", st.Drift)
+	}
+}
+
+func TestNoDriftOnCleanFetch(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cache := &fakeCache{}
+	fetch := &fakeFetcher{
+		probed: true,
+		fn:     func(string) (*schema.Snapshot, error) { return snapWith(23, baseTime.Add(time.Hour)), nil },
+	}
+
+	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	if len(st.Drift) != 0 {
+		t.Fatalf("clean fetch state Drift = %v, want none", st.Drift)
+	}
+}
+
+// A stale-cache serve after a failed fetch still reports the drift persisted
+// by the last successful fetch.
+func TestStaleCacheServeCarriesPersistedDrift(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	const wantDrift = "seven_day missing resets_at"
+	cache := &fakeCache{
+		payload:  mustMarshal(t, snapWith(55, baseTime.Add(time.Hour))),
+		storedAt: baseTime.Add(-10 * time.Minute),
+		drift:    []string{wantDrift},
+		has:      true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		return nil, usage.ErrTransient
+	}}
+
+	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	if st.Source != schema.SourceCache || !st.Stale {
+		t.Fatalf("got source=%s stale=%v, want cache/true", st.Source, st.Stale)
+	}
+	if len(st.Drift) != 1 || st.Drift[0] != wantDrift {
+		t.Fatalf("stale state Drift = %v, want [%s]", st.Drift, wantDrift)
+	}
+}
+
+// A clean fetch stores no drift, so previously persisted indicators clear
+// instead of lingering in the cache.
+func TestCleanFetchClearsPersistedDrift(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cache := &fakeCache{
+		payload:  mustMarshal(t, snapWith(55, baseTime.Add(time.Hour))),
+		storedAt: baseTime.Add(-10 * time.Minute),
+		drift:    []string{"seven_day missing resets_at"},
+		has:      true,
+	}
+	fetch := &fakeFetcher{
+		probed: true,
+		fn:     func(string) (*schema.Snapshot, error) { return snapWith(60, baseTime.Add(time.Hour)), nil },
+	}
+
+	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	if st.Source != schema.SourceOAuth {
+		t.Fatalf("source = %s, want oauth", st.Source)
+	}
+	if len(st.Drift) != 0 {
+		t.Fatalf("clean fetch state Drift = %v, want none", st.Drift)
+	}
+	if len(cache.drift) != 0 {
+		t.Fatalf("cache still carries drift after a clean fetch: %v", cache.drift)
 	}
 }

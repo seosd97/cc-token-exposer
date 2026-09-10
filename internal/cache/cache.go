@@ -19,6 +19,7 @@ type Entry struct {
 	FetchedAt    time.Time       `json:"fetched_at"`
 	AttemptedAt  *time.Time      `json:"attempted_at,omitempty"`
 	ScopedProbed bool            `json:"scoped_probed,omitempty"`
+	Drift        []string        `json:"drift,omitempty"`
 	Payload      json.RawMessage `json:"payload"`
 }
 
@@ -50,12 +51,12 @@ func (c *Cache) Path() string { return c.path }
 
 func (c *Cache) lockPath() string { return c.path + ".lock" }
 
-func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time, scopedProbed bool) error {
+func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time, scopedProbed bool, drift []string) error {
 	if !json.Valid(payload) {
 		return errors.New("cache: payload is not valid JSON")
 	}
 	return c.withWriteLock(func() error {
-		return c.writeEntry(Entry{FetchedAt: fetchedAt, ScopedProbed: scopedProbed, Payload: payload})
+		return c.writeEntry(Entry{FetchedAt: fetchedAt, ScopedProbed: scopedProbed, Drift: drift, Payload: payload})
 	})
 }
 

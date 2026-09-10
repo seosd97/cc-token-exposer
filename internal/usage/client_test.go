@@ -208,6 +208,177 @@ func TestFetchEmptyToken(t *testing.T) {
 	}
 }
 
+// driftBody simulates an endpoint whose shape has drifted: a five_hour window
+// that lost its reset time, a scoped entry that lost its display name, and a
+// model-scoped entry under an unknown kind. All three are indicators, but the
+// usable data must still decode.
+const driftBody = `{
+  "five_hour": {"utilization": 23.0},
+  "seven_day": {"utilization": 41.0, "resets_at": "2026-06-18T00:00:00Z"},
+  "limits": [
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 30, "resets_at": "2026-06-18T00:00:00Z", "scope": {"model": {}}},
+    {"kind": "weekly_scoped_v2", "group": "weekly", "percent": 50, "resets_at": "2026-06-18T00:00:00Z", "scope": {"model": {"display_name": "Mystery"}}}
+  ]
+}`
+
+func TestFetchReportsDriftIndicators(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(driftBody))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	want := []string{
+		"five_hour missing resets_at",
+		"limits entry missing model display_name",
+		`unknown scoped limits kind "weekly_scoped_v2"`,
+	}
+	if len(snap.Drift) != len(want) {
+		t.Fatalf("Drift = %v, want %v", snap.Drift, want)
+	}
+	for i, w := range want {
+		if snap.Drift[i] != w {
+			t.Errorf("Drift[%d] = %q, want %q", i, snap.Drift[i], w)
+		}
+	}
+	if snap.Snapshot.FiveHour == nil || snap.Snapshot.FiveHour.Utilization != 23 {
+		t.Errorf("drift must not block decoding: five_hour = %+v", snap.Snapshot.FiveHour)
+	}
+	if w := snap.Snapshot.ScopedLimits["Mystery"]; w == nil || w.Utilization != 50 {
+		t.Errorf("drift must not drop decodable scoped data: Mystery = %+v", w)
+	}
+}
+
+func TestFetchEmptyPayloadFlagsDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"seven_day_opus": null, "limits": []}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "empty usage payload" {
+		t.Fatalf("Drift = %v, want [empty usage payload]", snap.Drift)
+	}
+}
+
+func TestFetchCleanResponseHasNoDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(scopedLimitsBody))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 0 {
+		t.Fatalf("Drift = %v, want none on the documented shape", snap.Drift)
+	}
+}
+
+// A payload whose only limits[] entries are group-scoped (scope: null) decodes
+// to zero usable windows even though the raw response is non-empty; the
+// empty-payload check must key off usable data, not field presence.
+func TestFetchGroupScopedOnlyPayloadFlagsEmptyDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"limits": [
+			{"kind": "session",    "group": "session", "percent": 19, "resets_at": "2026-07-06T07:19:59Z", "scope": null},
+			{"kind": "weekly_all", "group": "weekly",  "percent": 58, "resets_at": "2026-07-08T20:59:59Z", "scope": null}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Snapshot.ScopedLimits) != 0 {
+		t.Fatalf("scoped_limits = %+v, want none (group-scoped entries are not decodable)", snap.Snapshot.ScopedLimits)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "empty usage payload" {
+		t.Fatalf("Drift = %v, want [empty usage payload]", snap.Drift)
+	}
+}
+
+// An empty extra_usage object is wire-present but carries no value, so a
+// response with only that must still flag the empty payload.
+func TestFetchEmptyExtraUsageFlagsEmptyDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"extra_usage": {}}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "empty usage payload" {
+		t.Fatalf("Drift = %v, want [empty usage payload]", snap.Drift)
+	}
+}
+
+// A legacy seven_day_opus window that lost its reset time is backfilled into
+// ScopedLimits["Opus"] with a zero ResetsAt; the indicator must fire so the
+// silent degrade is detectable, without blocking the decode.
+func TestFetchLegacyOpusMissingResetsFlagsDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"seven_day_opus": {"utilization": 10.0}}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "seven_day_opus missing resets_at" {
+		t.Fatalf("Drift = %v, want [seven_day_opus missing resets_at]", snap.Drift)
+	}
+	if w := snap.Snapshot.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
+		t.Fatalf("drift must not block decoding: scoped_limits[Opus] = %+v, want utilization 10", w)
+	}
+}
+
+// When limits[] carries an explicit Opus entry, the legacy seven_day_opus
+// field is not consumed (the backfill is skipped), so its missing reset time
+// is not an anomaly and must not be flagged.
+func TestFetchShadowedLegacyOpusNotFlagged(t *testing.T) {
+	body := `{
+	  "seven_day_opus": {"utilization": 10.0},
+	  "limits": [
+	    {"kind": "weekly_scoped", "group": "weekly", "percent": 30, "resets_at": "2026-07-08T20:59:59Z", "scope": {"model": {"display_name": "Opus"}}}
+	  ]
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 0 {
+		t.Fatalf("Drift = %v, want none (legacy field is shadowed by limits[])", snap.Drift)
+	}
+	if w := snap.Snapshot.ScopedLimits["Opus"]; w == nil || w.Utilization != 30 {
+		t.Fatalf("scoped_limits[Opus] = %+v, want utilization 30 from limits[]", w)
+	}
+}
+
 func TestFetchAuthErrors(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
