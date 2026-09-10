@@ -119,6 +119,10 @@ func (e *Engine) ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *sche
 	return e.tag(e.resolveStdin(ctx, stdin))
 }
 
+func (e *Engine) ResolveDetached(ctx context.Context) *schema.State {
+	return e.tag(e.resolveDetached(ctx))
+}
+
 func (e *Engine) tag(st *schema.State) *schema.State {
 	st.Provider = e.provider.Name
 	return st
@@ -128,12 +132,8 @@ func (e *Engine) resolve(ctx context.Context) *schema.State {
 	now := e.clock.Now()
 	cachedSnap, meta, haveCache := e.loadCache()
 
-	if haveCache {
-		if age := now.Sub(meta.StoredAt); age >= 0 && age < e.ttl {
-			st := snapshotState(cachedSnap, schema.SourceCache, false, 0, schema.AuthOK)
-			st.Drift = meta.Drift
-			return st
-		}
+	if st := e.freshCacheState(now, cachedSnap, meta, haveCache); st != nil {
+		return st
 	}
 
 	cr, auth, cerr := e.resolveToken(now)
@@ -155,11 +155,58 @@ func (e *Engine) resolve(ctx context.Context) *schema.State {
 	}
 
 	if haveCache {
-		st := snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(meta.StoredAt), schema.AuthOK)
-		st.Drift = meta.Drift
-		return st
+		return staleCacheState(now, cachedSnap, meta, schema.AuthOK)
 	}
 	return e.degradeNoData(now, schema.AuthOK, "usage fetch failed and no cache is available")
+}
+
+func (e *Engine) resolveDetached(ctx context.Context) *schema.State {
+	now := e.clock.Now()
+	cachedSnap, meta, haveCache := e.loadCache()
+
+	if st := e.freshCacheState(now, cachedSnap, meta, haveCache); st != nil {
+		return st
+	}
+
+	cr, auth, cerr := e.resolveToken(now)
+	if cr == nil {
+		return e.degradeAuth(now, auth, credsReason(cerr), cachedSnap, meta, haveCache)
+	}
+
+	if e.cache != nil && e.refresher != nil {
+		if claimed, err := e.cache.ClaimRefresh(now, e.ttl); err == nil && claimed {
+			if serr := e.refresher.Spawn(ctx); serr != nil {
+				if fresh, drift := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
+					st := snapshotState(fresh, schema.SourceOAuth, false, 0, schema.AuthOK)
+					st.Drift = drift
+					return st
+				}
+			}
+		}
+	}
+
+	if haveCache {
+		return staleCacheState(now, cachedSnap, meta, schema.AuthOK)
+	}
+	return e.degradeNoData(now, schema.AuthOK, "usage refresh in progress; no cache yet")
+}
+
+func (e *Engine) freshCacheState(now time.Time, cachedSnap *schema.Snapshot, meta CacheEntry, haveCache bool) *schema.State {
+	if !haveCache {
+		return nil
+	}
+	if age := now.Sub(meta.StoredAt); age < 0 || age >= e.ttl {
+		return nil
+	}
+	st := snapshotState(cachedSnap, schema.SourceCache, false, 0, schema.AuthOK)
+	st.Drift = meta.Drift
+	return st
+}
+
+func staleCacheState(now time.Time, cachedSnap *schema.Snapshot, meta CacheEntry, auth schema.AuthStatus) *schema.State {
+	st := snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(meta.StoredAt), auth)
+	st.Drift = meta.Drift
+	return st
 }
 
 func (e *Engine) resolveToken(now time.Time) (*creds.Credentials, schema.AuthStatus, error) {
@@ -283,9 +330,7 @@ func coversWindow(stdinW, baseW *schema.Window, now time.Time) bool {
 
 func (e *Engine) degradeAuth(now time.Time, auth schema.AuthStatus, reason string, cachedSnap *schema.Snapshot, meta CacheEntry, haveCache bool) *schema.State {
 	if haveCache {
-		st := snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(meta.StoredAt), auth)
-		st.Drift = meta.Drift
-		return st
+		return staleCacheState(now, cachedSnap, meta, auth)
 	}
 	if lh := e.probeTranscript(now); lh != nil {
 		return transcriptState(lh, auth)

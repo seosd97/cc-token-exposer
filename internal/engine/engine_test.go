@@ -1137,3 +1137,177 @@ func TestCredentialSourceErrorBecomesTheAuthMissingReason(t *testing.T) {
 		t.Fatalf("ErrNotAvailable should keep the generic hint, got %q", st.Error)
 	}
 }
+
+func resolveDetached(t *testing.T, o engine.Options) *schema.State {
+	t.Helper()
+	if o.Clock == nil {
+		o.Clock = &fakeClock{t: baseTime}
+	}
+	st := engine.New(o).ResolveDetached(context.Background())
+	if st == nil {
+		t.Fatalf("ResolveDetached returned nil state")
+	}
+	return st
+}
+
+func TestDetachedFreshCacheServedWithoutIO(t *testing.T) {
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(23, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-30 * time.Second),
+		drift:       []string{"five_hour missing resets_at"},
+		claimResult: true,
+		has:         true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("fetch must not be called on fresh cache")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+
+	st := resolveDetached(t, engine.Options{Creds: missing, Fetcher: fetch, Cache: cache, Refresher: ref})
+	if st.Source != schema.SourceCache || st.Stale || st.Auth != schema.AuthOK {
+		t.Fatalf("got source=%s stale=%v auth=%s, want cache/false/ok", st.Source, st.Stale, st.Auth)
+	}
+	if cache.claims != 0 || ref.spawns != 0 || missing.calls != 0 {
+		t.Fatalf("fresh cache must do no IO: claims=%d spawns=%d creds=%d", cache.claims, ref.spawns, missing.calls)
+	}
+	if len(st.Drift) != 1 {
+		t.Fatalf("persisted drift not carried: %v", st.Drift)
+	}
+}
+
+func TestDetachedStaleCacheSpawnsRefreshAndServesStale(t *testing.T) {
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(55, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		claimResult: true,
+		has:         true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("detached path must not fetch inline")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+
+	st := resolveDetached(t, engine.Options{Provider: codexProvider, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	if cache.claims != 1 || ref.spawns != 1 {
+		t.Fatalf("claims=%d spawns=%d, want 1/1", cache.claims, ref.spawns)
+	}
+	if st.Source != schema.SourceCache || !st.Stale || st.Provider != schema.ProviderCodex {
+		t.Fatalf("got source=%s stale=%v provider=%s, want cache/true/codex", st.Source, st.Stale, st.Provider)
+	}
+	if st.StaleAge == nil || time.Duration(*st.StaleAge) != 10*time.Minute {
+		t.Fatalf("stale_age = %v, want 10m", st.StaleAge)
+	}
+	if st.Snapshot.FiveHour.Utilization != 55 {
+		t.Fatalf("served snapshot = %+v, want the cached 55", st.Snapshot.FiveHour)
+	}
+}
+
+func TestDetachedClaimDeniedServesStaleWithoutSpawn(t *testing.T) {
+	cache := &fakeCache{
+		payload:  mustMarshal(t, snapWith(55, baseTime.Add(time.Hour))),
+		storedAt: baseTime.Add(-10 * time.Minute),
+		has:      true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
+	ref := &fakeRefresher{}
+
+	st := resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	if cache.claims != 1 || ref.spawns != 0 || len(fetch.calls) != 0 {
+		t.Fatalf("denied claim must neither spawn nor fetch: claims=%d spawns=%d fetch=%d", cache.claims, ref.spawns, len(fetch.calls))
+	}
+	if !st.Stale {
+		t.Fatal("stale cache must still be marked stale while another refresh is in flight")
+	}
+}
+
+func TestDetachedSpawnFailureFallsBackToSyncRefresh(t *testing.T) {
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(10, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		claimResult: true,
+		has:         true,
+	}
+	fetch := &fakeFetcher{
+		fn:    func(string) (*schema.Snapshot, error) { return snapWith(42, baseTime.Add(time.Hour)), nil },
+		drift: []string{"primary_window missing reset"},
+	}
+	ref := &fakeRefresher{err: errors.New("spawn failed")}
+
+	st := resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	if ref.spawns != 1 || len(fetch.calls) != 1 || cache.stores != 1 {
+		t.Fatalf("spawn failure must fall back to one sync refresh: spawns=%d fetch=%d stores=%d", ref.spawns, len(fetch.calls), cache.stores)
+	}
+	if st.Source != schema.SourceOAuth || st.Stale || st.Snapshot.FiveHour.Utilization != 42 {
+		t.Fatalf("got source=%s stale=%v util=%v, want oauth/false/42", st.Source, st.Stale, st.Snapshot.FiveHour.Utilization)
+	}
+	if len(st.Drift) != 1 || st.Drift[0] != "primary_window missing reset" {
+		t.Fatalf("fallback fetch drift not carried: %v", st.Drift)
+	}
+}
+
+func TestDetachedNoCacheWithoutCredsIsAuthMissingWithoutSpawn(t *testing.T) {
+	cache := &fakeCache{claimResult: true}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
+	ref := &fakeRefresher{}
+	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+
+	st := resolveDetached(t, engine.Options{Provider: codexProvider, Creds: missing, Fetcher: fetch, Cache: cache, Refresher: ref})
+	if st.Type != schema.TypeError || st.Auth != schema.AuthMissing {
+		t.Fatalf("got type=%s auth=%s, want error/missing", st.Type, st.Auth)
+	}
+	if !strings.Contains(st.Error, "run `codex login` to log in") {
+		t.Fatalf("error = %q, want the provider login hint", st.Error)
+	}
+	if cache.claims != 0 || ref.spawns != 0 || len(fetch.calls) != 0 {
+		t.Fatalf("no creds must mean no refresh: claims=%d spawns=%d fetch=%d", cache.claims, ref.spawns, len(fetch.calls))
+	}
+}
+
+func TestDetachedExpiredTokenKeepsStaleCacheAndAuthExpired(t *testing.T) {
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(33, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		claimResult: true,
+		has:         true,
+	}
+	expired := &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}}}}
+	ref := &fakeRefresher{}
+
+	st := resolveDetached(t, engine.Options{Creds: expired, Fetcher: &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}, Cache: cache, Refresher: ref})
+	if st.Source != schema.SourceCache || !st.Stale || st.Auth != schema.AuthExpired {
+		t.Fatalf("got source=%s stale=%v auth=%s, want cache/true/expired", st.Source, st.Stale, st.Auth)
+	}
+	if ref.spawns != 0 {
+		t.Fatalf("expired token must not spawn a refresh that cannot authenticate")
+	}
+}
+
+func TestDetachedNoCacheWithCredsSpawnsAndReportsNoDataYet(t *testing.T) {
+	cache := &fakeCache{claimResult: true}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("detached path must not fetch inline")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+
+	st := resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	if cache.claims != 1 || ref.spawns != 1 {
+		t.Fatalf("claims=%d spawns=%d, want 1/1", cache.claims, ref.spawns)
+	}
+	if st.Type != schema.TypeError || st.Auth != schema.AuthOK || st.Snapshot != nil {
+		t.Fatalf("cold start must report an auth-ok error state with no snapshot, got type=%s auth=%s snap=%v", st.Type, st.Auth, st.Snapshot)
+	}
+	if !strings.Contains(st.Error, "refresh in progress") {
+		t.Fatalf("error = %q, want a refresh-in-progress note", st.Error)
+	}
+
+	reset := baseTime.Add(2 * time.Hour)
+	tr := &fakeTranscript{lh: &schema.LimitHit{ResetsAt: &reset, DetectedAt: baseTime}}
+	st = resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: &fakeCache{claimResult: true}, Refresher: ref, Transcript: tr})
+	if st.Source != schema.SourceTranscript || st.LimitHit == nil {
+		t.Fatalf("cold start should still fall back to the transcript probe, got source=%s", st.Source)
+	}
+}
