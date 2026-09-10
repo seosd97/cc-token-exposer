@@ -67,6 +67,8 @@ func errorText(st *schema.State) string {
 		return "no credentials found"
 	case schema.AuthExpired:
 		return "token expired"
+	case schema.AuthNoPlan:
+		return "no plan limits"
 	default:
 		return "unknown error"
 	}
@@ -88,21 +90,34 @@ func writeWindow(b *strings.Builder, label string, w *schema.Window, now time.Ti
 }
 
 func freshnessFooter(st *schema.State) string {
+	var source string
 	switch st.Source {
 	case schema.SourceOAuth:
-		return "source: live\n"
+		source = "source: live"
 	case schema.SourceCache:
+		source = "source: cache"
 		if st.Stale {
-			return "source: cache · stale" + staleSuffix(st) + "\n"
+			source += " · stale" + staleSuffix(st)
 		}
-		return "source: cache\n"
 	case schema.SourceStdin:
+		source = "source: claude code"
 		if st.Stale {
-			return "source: claude code · stale" + staleSuffix(st) + "\n"
+			source += " · stale" + staleSuffix(st)
 		}
-		return "source: claude code\n"
 	case schema.SourceTranscript:
-		return "source: transcript fallback\n"
+		source = "source: transcript fallback"
+	default:
+		return ""
+	}
+	return source + authSuffix(st) + "\n"
+}
+
+func authSuffix(st *schema.State) string {
+	switch st.Auth {
+	case schema.AuthMissing:
+		return " · ⚠ no credentials"
+	case schema.AuthExpired:
+		return " · ⚠ token expired"
 	default:
 		return ""
 	}

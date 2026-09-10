@@ -8,10 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seosd97/cc-token-exposer/internal/creds"
 	"github.com/seosd97/cc-token-exposer/internal/engine"
+	"github.com/seosd97/cc-token-exposer/internal/provider"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
-	"github.com/seosd97/cc-token-exposer/internal/usage"
 )
 
 var baseTime = time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
@@ -21,7 +20,7 @@ type fakeClock struct{ t time.Time }
 func (c *fakeClock) Now() time.Time { return c.t }
 
 type credResult struct {
-	c   *creds.Credentials
+	c   *provider.Credentials
 	err error
 }
 
@@ -30,7 +29,7 @@ type fakeCreds struct {
 	calls   int
 }
 
-func (f *fakeCreds) Resolve() (*creds.Credentials, error) {
+func (f *fakeCreds) Resolve() (*provider.Credentials, error) {
 	i := f.calls
 	if i >= len(f.results) {
 		i = len(f.results) - 1
@@ -46,33 +45,35 @@ type fakeFetcher struct {
 	calls  []string
 }
 
-func (f *fakeFetcher) Fetch(_ context.Context, cr *creds.Credentials) (*usage.FetchedSnapshot, error) {
+func (f *fakeFetcher) Fetch(_ context.Context, cr *provider.Credentials) (*provider.FetchedSnapshot, error) {
 	token := cr.AccessToken
 	f.calls = append(f.calls, token)
 	s, err := f.fn(token)
 	if err != nil {
 		return nil, err
 	}
-	return &usage.FetchedSnapshot{Snapshot: s, ScopedProbed: f.probed, Drift: f.drift}, nil
+	return &provider.FetchedSnapshot{Snapshot: s, ScopedProbed: f.probed, Drift: f.drift}, nil
 }
 
 type fakeCache struct {
-	payload      []byte
-	storedAt     time.Time
-	attemptedAt  time.Time
-	scopedProbed bool
-	drift        []string
-	has          bool
-	stores       int
-	claims       int
-	claimResult  bool
-	claimErr     error
-	lastStored   []byte
+	payload        []byte
+	storedAt       time.Time
+	attemptedAt    time.Time
+	scopedProbed   bool
+	drift          []string
+	has            bool
+	stores         int
+	claims         int
+	claimResult    bool
+	claimErr       error
+	lastStored     []byte
+	limitHit       *schema.LimitHit
+	limitHitStores int
 }
 
 func (c *fakeCache) Load() (*engine.CacheEntry, error) {
 	if !c.has {
-		return nil, engine.ErrNoCache
+		return nil, nil
 	}
 	return &engine.CacheEntry{
 		Payload:      c.payload,
@@ -80,6 +81,7 @@ func (c *fakeCache) Load() (*engine.CacheEntry, error) {
 		AttemptedAt:  c.attemptedAt,
 		ScopedProbed: c.scopedProbed,
 		Drift:        c.drift,
+		LimitHit:     c.limitHit,
 	}, nil
 }
 
@@ -90,7 +92,17 @@ func (c *fakeCache) Store(e engine.CacheEntry) error {
 	c.storedAt = e.StoredAt
 	c.scopedProbed = e.ScopedProbed
 	c.drift = e.Drift
+	c.limitHit = nil
 	c.has = true
+	return nil
+}
+
+func (c *fakeCache) StoreLimitHit(lh *schema.LimitHit) error {
+	c.limitHitStores++
+	c.limitHit = lh
+	if lh != nil {
+		c.has = true
+	}
 	return nil
 }
 
@@ -121,13 +133,17 @@ func (r *fakeRefresher) Spawn(context.Context) error {
 }
 
 type fakeTranscript struct {
-	lh *schema.LimitHit
+	lh    *schema.LimitHit
+	calls int
 }
 
-func (f *fakeTranscript) Probe(time.Time) (*schema.LimitHit, error) { return f.lh, nil }
+func (f *fakeTranscript) Probe(time.Time) (*schema.LimitHit, error) {
+	f.calls++
+	return f.lh, nil
+}
 
 func okCreds(token string) *fakeCreds {
-	return &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: token}}}}
+	return &fakeCreds{results: []credResult{{c: &provider.Credentials{AccessToken: token}}}}
 }
 
 func snapWith(util float64, resetsAt time.Time) *schema.Snapshot {
@@ -148,12 +164,19 @@ func mustMarshal(t *testing.T, v any) []byte {
 	return b
 }
 
-func resolve(t *testing.T, o engine.Options) *schema.State {
-	t.Helper()
+func newEngine(o engine.Options) *engine.Engine {
 	if o.Clock == nil {
 		o.Clock = &fakeClock{t: baseTime}
 	}
-	st := engine.New(o).Resolve(context.Background())
+	if o.Spec.Name == "" {
+		o.Spec.Name, o.Spec.LoginCommand = schema.ProviderClaude, "claude"
+	}
+	return engine.New(o)
+}
+
+func resolve(t *testing.T, o engine.Options) *schema.State {
+	t.Helper()
+	st := newEngine(o).Resolve(context.Background())
 	if st == nil {
 		t.Fatalf("Resolve returned nil state")
 	}
@@ -175,7 +198,7 @@ func TestFreshCacheServedWithoutFetch(t *testing.T) {
 		return nil, nil
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 
 	if st.Source != schema.SourceCache || st.Stale {
 		t.Fatalf("got source=%s stale=%v, want cache/false", st.Source, st.Stale)
@@ -199,7 +222,7 @@ func TestStaleCacheTriggersFetchAndStore(t *testing.T) {
 		return snapWith(42, baseTime.Add(time.Hour)), nil
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 
 	if st.Source != schema.SourceOAuth || st.Stale {
 		t.Fatalf("got source=%s stale=%v, want oauth/false", st.Source, st.Stale)
@@ -224,7 +247,7 @@ func TestReconcileGuardRetainsSuspectValue(t *testing.T) {
 		return snapWith(40, reset), nil
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 
 	if st.Snapshot.FiveHour.Utilization != 80 || !st.Snapshot.FiveHour.Suspect {
 		t.Fatalf("got util=%v suspect=%v, want 80/true", st.Snapshot.FiveHour.Utilization, st.Snapshot.FiveHour.Suspect)
@@ -239,10 +262,10 @@ func TestTransientErrorServesStaleCache(t *testing.T) {
 		has:      true,
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
-		return nil, usage.ErrTransient
+		return nil, provider.ErrTransient
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 
 	if st.Source != schema.SourceCache || !st.Stale {
 		t.Fatalf("got source=%s stale=%v, want cache/true", st.Source, st.Stale)
@@ -260,10 +283,10 @@ func TestRateLimitedServesStaleCache(t *testing.T) {
 		has:      true,
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
-		return nil, &usage.RateLimitError{RetryAfter: time.Minute, StatusCode: 429}
+		return nil, &provider.RateLimitError{RetryAfter: time.Minute, StatusCode: 429}
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceCache || !st.Stale {
 		t.Fatalf("got source=%s stale=%v, want cache/true", st.Source, st.Stale)
 	}
@@ -272,10 +295,10 @@ func TestRateLimitedServesStaleCache(t *testing.T) {
 func TestTransientErrorNoCacheIsError(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
-		return nil, usage.ErrTransient
+		return nil, provider.ErrTransient
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk})
 	if st.Type != schema.TypeError || st.Auth != schema.AuthOK {
 		t.Fatalf("got type=%s auth=%s, want error/ok", st.Type, st.Auth)
 	}
@@ -283,13 +306,13 @@ func TestTransientErrorNoCacheIsError(t *testing.T) {
 
 func TestMissingCredsNoCacheIsAuthMissing(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	cr := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+	cr := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("fetch must not be called without creds")
 		return nil, nil
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk})
 	if st.Type != schema.TypeError || st.Auth != schema.AuthMissing {
 		t.Fatalf("got type=%s auth=%s, want error/missing", st.Type, st.Auth)
 	}
@@ -302,43 +325,44 @@ func TestMissingCredsServesStaleCache(t *testing.T) {
 		storedAt: baseTime.Add(-10 * time.Minute),
 		has:      true,
 	}
-	cr := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+	cr := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceCache || !st.Stale || st.Auth != schema.AuthMissing {
 		t.Fatalf("got source=%s stale=%v auth=%s, want cache/true/missing", st.Source, st.Stale, st.Auth)
 	}
 }
 
-func TestExpiredTokenReReadRecovers(t *testing.T) {
+func TestExpiredTokenIsNotReReadInProcess(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	expired := &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}
-	fresh := &creds.Credentials{AccessToken: "new", ExpiresAt: baseTime.Add(time.Hour)}
+	expired := &provider.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}
+	fresh := &provider.Credentials{AccessToken: "new", ExpiresAt: baseTime.Add(time.Hour)}
 	cr := &fakeCreds{results: []credResult{{c: expired}, {c: fresh}}}
-	fetch := &fakeFetcher{fn: func(token string) (*schema.Snapshot, error) {
-		if token != "new" {
-			t.Fatalf("fetched with stale token %q", token)
-		}
-		return snapWith(12, baseTime.Add(time.Hour)), nil
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("fetch must not run with an expired token")
+		return nil, nil
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch})
-	if st.Source != schema.SourceOAuth || st.Auth != schema.AuthOK {
-		t.Fatalf("got source=%s auth=%s, want oauth/ok", st.Source, st.Auth)
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk})
+	if st.Type != schema.TypeError || st.Auth != schema.AuthExpired {
+		t.Fatalf("got type=%s auth=%s, want error/expired", st.Type, st.Auth)
+	}
+	if cr.calls != 1 {
+		t.Fatalf("credentials resolved %d times, want exactly one read per run", cr.calls)
 	}
 }
 
 func TestExpiredTokenStillExpiredIsAuthExpired(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	expired := &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}
+	expired := &provider.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}
 	cr := &fakeCreds{results: []credResult{{c: expired}}}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		t.Fatalf("fetch must not run with an expired token")
 		return nil, nil
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk})
 	if st.Type != schema.TypeError || st.Auth != schema.AuthExpired {
 		t.Fatalf("got type=%s auth=%s, want error/expired", st.Type, st.Auth)
 	}
@@ -346,17 +370,17 @@ func TestExpiredTokenStillExpiredIsAuthExpired(t *testing.T) {
 
 func TestAuthErrorRetriesWithNewToken(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	first := &creds.Credentials{AccessToken: "tok-A"}
-	second := &creds.Credentials{AccessToken: "tok-B"}
+	first := &provider.Credentials{AccessToken: "tok-A"}
+	second := &provider.Credentials{AccessToken: "tok-B"}
 	cr := &fakeCreds{results: []credResult{{c: first}, {c: second}}}
 	fetch := &fakeFetcher{fn: func(token string) (*schema.Snapshot, error) {
 		if token == "tok-A" {
-			return nil, usage.ErrAuth
+			return nil, provider.ErrAuth
 		}
 		return snapWith(7, baseTime.Add(time.Hour)), nil
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk})
 	if st.Source != schema.SourceOAuth || st.Auth != schema.AuthOK {
 		t.Fatalf("got source=%s auth=%s, want oauth/ok", st.Source, st.Auth)
 	}
@@ -367,7 +391,7 @@ func TestAuthErrorRetriesWithNewToken(t *testing.T) {
 
 func TestAuthErrorSameTokenDegradesToStaleCache(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	tok := &creds.Credentials{AccessToken: "tok"}
+	tok := &provider.Credentials{AccessToken: "tok"}
 	cr := &fakeCreds{results: []credResult{{c: tok}}}
 	cache := &fakeCache{
 		payload:  mustMarshal(t, snapWith(60, baseTime.Add(time.Hour))),
@@ -375,10 +399,10 @@ func TestAuthErrorSameTokenDegradesToStaleCache(t *testing.T) {
 		has:      true,
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
-		return nil, usage.ErrAuth
+		return nil, provider.ErrAuth
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceCache || !st.Stale || st.Auth != schema.AuthExpired {
 		t.Fatalf("got source=%s stale=%v auth=%s, want cache/true/expired", st.Source, st.Stale, st.Auth)
 	}
@@ -387,25 +411,26 @@ func TestAuthErrorSameTokenDegradesToStaleCache(t *testing.T) {
 func TestTranscriptFallbackWhenNoCacheNoCreds(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	reset := baseTime.Add(2 * time.Hour)
-	cr := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+	cr := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 	tr := &fakeTranscript{lh: &schema.LimitHit{ResetsAt: &reset, Message: "session limit", DetectedAt: baseTime}}
+	cache := &fakeCache{}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Transcript: tr})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch, Transcript: tr}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceTranscript || st.LimitHit == nil {
 		t.Fatalf("got source=%s limitHit=%v, want transcript/non-nil", st.Source, st.LimitHit)
 	}
 	if st.Auth != schema.AuthMissing {
 		t.Fatalf("auth = %s, want missing", st.Auth)
 	}
+	if tr.calls != 1 || cache.limitHit == nil {
+		t.Fatalf("the inline ladder must probe once and persist the hit for the statusline: probes=%d persisted=%+v", tr.calls, cache.limitHit)
+	}
 }
 
 func resolveStdin(t *testing.T, o engine.Options, stdin *schema.Snapshot) *schema.State {
 	t.Helper()
-	if o.Clock == nil {
-		o.Clock = &fakeClock{t: baseTime}
-	}
-	st := engine.New(o).ResolveStdin(context.Background(), stdin)
+	st := newEngine(o).ResolveStdin(context.Background(), stdin)
 	if st == nil {
 		t.Fatalf("ResolveStdin returned nil state")
 	}
@@ -421,21 +446,39 @@ func fullSnap(five, seven float64, resetsAt time.Time) *schema.Snapshot {
 	}
 }
 
-func TestStdinNilFallsBackToResolve(t *testing.T) {
+func TestStdinNilUsesTheDetachedLadder(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
-	cache := &fakeCache{
+	fresh := &fakeCache{
 		payload:  mustMarshal(t, snapWith(23, baseTime.Add(time.Hour))),
 		storedAt: baseTime.Add(-30 * time.Second),
 		has:      true,
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
-		t.Fatalf("fetch must not be called on fresh cache")
+		t.Fatalf("the statusline must never fetch inline")
 		return nil, nil
 	}}
+	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, nil)
-	if st.Source != schema.SourceCache || st.Snapshot.FiveHour.Utilization != 23 {
-		t.Fatalf("nil stdin should delegate to Resolve: source=%s snap=%+v", st.Source, st.Snapshot)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: fresh, Refresher: ref}, nil)
+	if st.Source != schema.SourceCache || st.Stale || st.Snapshot.FiveHour.Utilization != 23 {
+		t.Fatalf("fresh cache should serve as-is: source=%s stale=%v snap=%+v", st.Source, st.Stale, st.Snapshot)
+	}
+	if ref.spawns != 0 {
+		t.Fatalf("a fresh cache must not spawn, got %d", ref.spawns)
+	}
+
+	stale := &fakeCache{
+		payload:     mustMarshal(t, snapWith(23, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		has:         true,
+		claimResult: true,
+	}
+	st = resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: stale, Refresher: ref}, nil)
+	if !st.Stale || st.Source != schema.SourceCache {
+		t.Fatalf("stale cache should be served ≈ while the detached refresh runs: %+v", st)
+	}
+	if ref.spawns != 1 || stale.claims != 1 {
+		t.Fatalf("nil stdin must heal through the detached refresher, got spawns=%d claims=%d", ref.spawns, stale.claims)
 	}
 }
 
@@ -456,7 +499,7 @@ func TestStdinCompleteSnapshotServedNoIO(t *testing.T) {
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
 	stdin.ScopedLimits["Fable"] = &schema.Window{Utilization: 55, ResetsAt: baseTime.Add(5 * 24 * time.Hour)}
-	st := resolveStdin(t, engine.Options{Clock: clk, Fetcher: fetch, Cache: cache}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Fetcher: fetch}, Clock: clk, Cache: cache}, stdin)
 
 	if st.Source != schema.SourceStdin || st.Stale || st.Auth != schema.AuthOK {
 		t.Fatalf("got source=%s stale=%v auth=%s, want stdin/false/ok", st.Source, st.Stale, st.Auth)
@@ -494,7 +537,7 @@ func TestStdinMissingCachedScopedModelSpawnsRefresh(t *testing.T) {
 	ref := &fakeRefresher{}
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 
 	if ref.spawns != 1 || len(fetch.calls) != 0 || cache.claims != 1 {
 		t.Fatalf("expected one claim+spawn and no parent fetch, got spawn=%d fetch=%d claims=%d", ref.spawns, len(fetch.calls), cache.claims)
@@ -518,7 +561,7 @@ func TestStdinMissingCachedScopedModelSpawnsRefresh(t *testing.T) {
 	}
 	cache.claimResult = false
 	clk.t = baseTime.Add(3 * time.Second)
-	st = resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st = resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 62 {
 		t.Fatalf("Fable = %+v, want healed 62 from cache on the next tick", f)
 	}
@@ -550,7 +593,7 @@ func TestStdinScopedEmptyWithProbedScopedlessCacheNeedsNoRefresh(t *testing.T) {
 		FiveHour:  &schema.Window{Utilization: 18, ResetsAt: baseTime.Add(time.Hour)},
 		SevenDay:  &schema.Window{Utilization: 41, ResetsAt: baseTime.Add(time.Hour + 5*24*time.Hour)},
 	}
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache}, stdin)
 
 	if len(fetch.calls) != 0 || cache.claims != 0 {
 		t.Fatalf("expected zero I/O, got fetch=%d claims=%d", len(fetch.calls), cache.claims)
@@ -570,7 +613,7 @@ func TestStdinWithoutCacheBootstrapsOnce(t *testing.T) {
 	ref := &fakeRefresher{}
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 
 	if ref.spawns != 1 || len(fetch.calls) != 0 || cache.stores != 0 {
 		t.Fatalf("no cache must spawn exactly one refresh and never fetch in the parent, got spawn=%d fetch=%d stores=%d", ref.spawns, len(fetch.calls), cache.stores)
@@ -587,7 +630,7 @@ func TestStdinWithoutCacheBootstrapsOnce(t *testing.T) {
 	}
 	cache.claimResult = false
 	clk.t = baseTime.Add(3 * time.Second)
-	st = resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st = resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 55 {
 		t.Fatalf("bootstrap must surface scoped models the next tick: %+v", st.Snapshot.ScopedLimits)
 	}
@@ -608,7 +651,7 @@ func TestStdinCompleteWithStaleCacheStillNoFetch(t *testing.T) {
 	}}
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
-	st := resolveStdin(t, engine.Options{Clock: clk, Fetcher: fetch, Cache: cache}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Fetcher: fetch}, Clock: clk, Cache: cache}, stdin)
 
 	if st.Stale {
 		t.Fatal("complete stdin should not be stale")
@@ -639,7 +682,7 @@ func TestStdinGapsFilledFromFreshCacheNotStale(t *testing.T) {
 		return nil, nil
 	}}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
 	if st.Snapshot.FiveHour.Utilization != 18 {
 		t.Fatalf("five_hour = %v, want stdin 18", st.Snapshot.FiveHour.Utilization)
@@ -650,8 +693,8 @@ func TestStdinGapsFilledFromFreshCacheNotStale(t *testing.T) {
 	if st.Stale {
 		t.Fatal("cache within TTL should not mark the state stale")
 	}
-	if cache.claims != 1 || ref.spawns != 0 {
-		t.Fatalf("fresh-cache incomplete stdin should claim-but-not-spawn, got claims=%d spawn=%d", cache.claims, ref.spawns)
+	if cache.claims != 0 || ref.spawns != 0 {
+		t.Fatalf("fresh-cache incomplete stdin must neither claim nor spawn, got claims=%d spawn=%d", cache.claims, ref.spawns)
 	}
 }
 
@@ -674,7 +717,7 @@ func TestStdinIncompleteClaimsRefreshSlot(t *testing.T) {
 	}}
 	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
 	if ref.spawns != 1 || cache.claims != 1 {
 		t.Fatalf("expected exactly one claimed+spawned refresh, got spawn=%d claims=%d", ref.spawns, cache.claims)
@@ -699,7 +742,7 @@ func TestStdinIncompleteNoCacheSpawnsRefresh(t *testing.T) {
 	}}
 	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
 	if ref.spawns != 1 || len(fetch.calls) != 0 {
 		t.Fatalf("expected one spawn and no parent fetch, got spawn=%d fetch=%d", ref.spawns, len(fetch.calls))
@@ -731,7 +774,7 @@ func TestStdinRefreshSpawnsAndServesStale(t *testing.T) {
 	}}
 	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
 	if ref.spawns != 1 {
 		t.Fatalf("refresh must be claimed+spawned exactly once, got spawn=%d", ref.spawns)
@@ -767,7 +810,7 @@ func TestStdinSpawnPathNeverConsultsCreds(t *testing.T) {
 	}}
 	ref := &fakeRefresher{}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 	if ref.spawns != 1 {
 		t.Fatalf("expected a spawn, got %d", ref.spawns)
 	}
@@ -795,7 +838,7 @@ func TestStdinSpawnFailureFallsBackToSyncRefresh(t *testing.T) {
 	fetch.probed = true
 	ref := &fakeRefresher{err: errors.New("spawn failed")}
 
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, snapWith(18, baseTime.Add(time.Hour)))
 
 	if ref.spawns != 1 || len(fetch.calls) != 1 || cache.stores != 1 {
 		t.Fatalf("spawn failure must fall back to one sync refresh, got spawn=%d fetch=%d stores=%d", ref.spawns, len(fetch.calls), cache.stores)
@@ -826,7 +869,7 @@ func TestStdinClaimFalseThrottlesSpawn(t *testing.T) {
 		return nil, nil
 	}}
 	ref := &fakeRefresher{}
-	o := engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}
+	o := engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}
 	stdin := snapWith(18, baseTime.Add(time.Hour))
 
 	resolveStdin(t, o, stdin)
@@ -865,7 +908,7 @@ func TestStdinScopedEmptyIsIncompleteAndSpawnsRefresh(t *testing.T) {
 		FiveHour:  &schema.Window{Utilization: 18, ResetsAt: baseTime.Add(time.Hour)},
 		SevenDay:  &schema.Window{Utilization: 41, ResetsAt: baseTime.Add(5 * 24 * time.Hour)},
 	}
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 
 	if ref.spawns != 1 {
 		t.Fatalf("five_hour+seven_day with empty stdin scoped must be incomplete and spawn once, got spawn=%d", ref.spawns)
@@ -880,7 +923,7 @@ func TestStdinResetlessWindowIsIncompleteAndBackfilled(t *testing.T) {
 	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
 	cache := &fakeCache{
 		payload:      mustMarshal(t, cached),
-		storedAt:     baseTime.Add(-30 * time.Second),
+		storedAt:     baseTime.Add(-10 * time.Minute),
 		scopedProbed: true,
 		claimResult:  true,
 		has:          true,
@@ -893,7 +936,7 @@ func TestStdinResetlessWindowIsIncompleteAndBackfilled(t *testing.T) {
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
 	stdin.FiveHour.ResetsAt = time.Time{}
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 
 	if ref.spawns != 1 || cache.claims != 1 {
 		t.Fatalf("a reset-less stdin window must open the bounded refresh, got spawn=%d claims=%d", ref.spawns, cache.claims)
@@ -904,8 +947,30 @@ func TestStdinResetlessWindowIsIncompleteAndBackfilled(t *testing.T) {
 	if !st.Snapshot.FiveHour.ResetsAt.Equal(baseTime.Add(time.Hour)) {
 		t.Fatalf("five_hour reset = %v, want the cached reset backfilled", st.Snapshot.FiveHour.ResetsAt)
 	}
-	if st.Stale {
-		t.Fatal("a fresh cache contributing only the reset must not mark the line stale")
+	if !st.Stale {
+		t.Fatal("a reset borrowed from a stale cache must mark the line stale")
+	}
+}
+
+func TestStdinResetlessWindowOnFreshCacheBackfillsWithoutClaim(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cache := &fakeCache{
+		payload:      mustMarshal(t, fullSnap(99, 30, baseTime.Add(time.Hour))),
+		storedAt:     baseTime.Add(-30 * time.Second),
+		scopedProbed: true,
+		claimResult:  true,
+		has:          true,
+	}
+	ref := &fakeRefresher{}
+	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
+	stdin.FiveHour.ResetsAt = time.Time{}
+
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok")}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
+	if cache.claims != 0 || ref.spawns != 0 {
+		t.Fatalf("a fresh cache is not due for a refresh, got claims=%d spawn=%d", cache.claims, ref.spawns)
+	}
+	if !st.Snapshot.FiveHour.ResetsAt.Equal(baseTime.Add(time.Hour)) || st.Stale {
+		t.Fatalf("got reset=%v stale=%v, want the fresh cache's reset backfilled without a stale marker", st.Snapshot.FiveHour.ResetsAt, st.Stale)
 	}
 }
 
@@ -927,13 +992,16 @@ func TestStdinElapsedResetIsIncompleteAndHeals(t *testing.T) {
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
 	stdin.FiveHour.ResetsAt = baseTime.Add(-time.Minute)
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 
 	if ref.spawns != 1 {
 		t.Fatalf("an elapsed stdin reset must open the bounded refresh, got spawn=%d", ref.spawns)
 	}
 	if !st.Snapshot.FiveHour.ResetsAt.Equal(baseTime.Add(time.Hour)) {
 		t.Fatalf("five_hour reset = %v, want the cache's future reset", st.Snapshot.FiveHour.ResetsAt)
+	}
+	if st.Snapshot.FiveHour.Utilization != 99 {
+		t.Fatalf("five_hour util = %v, want the cache's 99: an elapsed stdin window belongs to a closed cycle", st.Snapshot.FiveHour.Utilization)
 	}
 	if !st.Stale {
 		t.Fatal("a stale cache contributing the reset must mark the line ≈")
@@ -958,7 +1026,7 @@ func TestStdinResetlessWindowNeedsNoHealWhenCacheLacksIt(t *testing.T) {
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
 	stdin.FiveHour.ResetsAt = time.Time{}
-	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
+	st := resolveStdin(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}, stdin)
 
 	if cache.claims != 0 || ref.spawns != 0 || len(fetch.calls) != 0 {
 		t.Fatalf("expected zero I/O, got claims=%d spawns=%d fetch=%d", cache.claims, ref.spawns, len(fetch.calls))
@@ -973,7 +1041,7 @@ func TestErrorStateCarriesNoSnapshot(t *testing.T) {
 	cr := &fakeCreds{results: []credResult{{err: errors.New("boom")}}}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: cr, Fetcher: fetch})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk})
 	if st.Snapshot != nil {
 		t.Fatalf("error state should have no snapshot")
 	}
@@ -989,7 +1057,7 @@ func TestDriftIndicatorsRideLiveFetchAndCache(t *testing.T) {
 		fn:     func(string) (*schema.Snapshot, error) { return snapWith(23, baseTime.Add(time.Hour)), nil },
 	}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceOAuth {
 		t.Fatalf("source = %s, want oauth", st.Source)
 	}
@@ -1000,7 +1068,7 @@ func TestDriftIndicatorsRideLiveFetchAndCache(t *testing.T) {
 		t.Fatalf("cache did not persist drift: %+v", cache.drift)
 	}
 
-	st = resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st = resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceCache {
 		t.Fatalf("source = %s, want cache (fresh serve, no refetch)", st.Source)
 	}
@@ -1017,7 +1085,7 @@ func TestNoDriftOnCleanFetch(t *testing.T) {
 		fn:     func(string) (*schema.Snapshot, error) { return snapWith(23, baseTime.Add(time.Hour)), nil },
 	}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 	if len(st.Drift) != 0 {
 		t.Fatalf("clean fetch state Drift = %v, want none", st.Drift)
 	}
@@ -1033,10 +1101,10 @@ func TestStaleCacheServeCarriesPersistedDrift(t *testing.T) {
 		has:      true,
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
-		return nil, usage.ErrTransient
+		return nil, provider.ErrTransient
 	}}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceCache || !st.Stale {
 		t.Fatalf("got source=%s stale=%v, want cache/true", st.Source, st.Stale)
 	}
@@ -1058,7 +1126,7 @@ func TestCleanFetchClearsPersistedDrift(t *testing.T) {
 		fn:     func(string) (*schema.Snapshot, error) { return snapWith(60, baseTime.Add(time.Hour)), nil },
 	}
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: cache})
 	if st.Source != schema.SourceOAuth {
 		t.Fatalf("source = %s, want oauth", st.Source)
 	}
@@ -1070,7 +1138,9 @@ func TestCleanFetchClearsPersistedDrift(t *testing.T) {
 	}
 }
 
-var codexProvider = engine.Provider{Name: schema.ProviderCodex, LoginCommand: "codex login"}
+func codexSpec(creds provider.CredResolver, fetcher provider.Fetcher) provider.Spec {
+	return provider.Spec{Name: schema.ProviderCodex, LoginCommand: "codex login", Creds: creds, Fetcher: fetcher}
+}
 
 func TestStatesCarryTheProviderName(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
@@ -1081,17 +1151,17 @@ func TestStatesCarryTheProviderName(t *testing.T) {
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 
-	if st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: fresh}); st.Provider != schema.ProviderClaude {
+	if st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Clock: clk, Cache: fresh}); st.Provider != schema.ProviderClaude {
 		t.Fatalf("default provider = %q, want %q", st.Provider, schema.ProviderClaude)
 	}
 
-	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
-	st := resolve(t, engine.Options{Provider: codexProvider, Clock: clk, Creds: missing, Fetcher: fetch})
+	missing := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
+	st := resolve(t, engine.Options{Spec: codexSpec(missing, fetch), Clock: clk})
 	if st.Provider != schema.ProviderCodex || st.Type != schema.TypeError {
 		t.Fatalf("error state provider=%q type=%s, want codex/error", st.Provider, st.Type)
 	}
 
-	st = resolveStdin(t, engine.Options{Provider: codexProvider, Clock: clk}, snapWith(18, baseTime.Add(time.Hour)))
+	st = resolveStdin(t, engine.Options{Spec: codexSpec(nil, nil), Clock: clk}, snapWith(18, baseTime.Add(time.Hour)))
 	if st.Provider != schema.ProviderCodex || st.Source != schema.SourceStdin {
 		t.Fatalf("stdin state provider=%q source=%s, want codex/stdin", st.Provider, st.Source)
 	}
@@ -1101,19 +1171,19 @@ func TestLoginHintsUseTheProviderLoginCommand(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 
-	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
-	st := resolve(t, engine.Options{Provider: codexProvider, Clock: clk, Creds: missing, Fetcher: fetch})
+	missing := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
+	st := resolve(t, engine.Options{Spec: codexSpec(missing, fetch), Clock: clk})
 	if st.Auth != schema.AuthMissing || !strings.Contains(st.Error, "run `codex login` to log in") {
 		t.Fatalf("missing-creds hint = %q (auth %s), want codex login hint", st.Error, st.Auth)
 	}
 
-	expired := &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}}}}
-	st = resolve(t, engine.Options{Provider: codexProvider, Clock: clk, Creds: expired, Fetcher: fetch})
+	expired := &fakeCreds{results: []credResult{{c: &provider.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}}}}
+	st = resolve(t, engine.Options{Spec: codexSpec(expired, fetch), Clock: clk})
 	if st.Auth != schema.AuthExpired || !strings.Contains(st.Error, "run `codex login` to refresh it") {
 		t.Fatalf("expired hint = %q (auth %s), want codex login hint", st.Error, st.Auth)
 	}
 
-	st = resolve(t, engine.Options{Clock: clk, Creds: missing, Fetcher: fetch})
+	st = resolve(t, engine.Options{Spec: provider.Spec{Creds: missing, Fetcher: fetch}, Clock: clk})
 	if !strings.Contains(st.Error, "run `claude` to log in") {
 		t.Fatalf("default hint = %q, want claude login hint", st.Error)
 	}
@@ -1125,14 +1195,14 @@ func TestCredentialSourceErrorBecomesTheAuthMissingReason(t *testing.T) {
 		t.Fatalf("fetch must not be called without creds")
 		return nil, nil
 	}}
-	reason := errors.New("codex: logged in with an API key; plan limits do not apply")
+	reason := errors.New("claude: parse ~/.claude/.credentials.json: unexpected end of JSON input")
 
-	st := resolve(t, engine.Options{Clock: clk, Creds: &fakeCreds{results: []credResult{{err: reason}}}, Fetcher: fetch})
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: &fakeCreds{results: []credResult{{err: reason}}}, Fetcher: fetch}, Clock: clk})
 	if st.Auth != schema.AuthMissing || st.Error != reason.Error() {
 		t.Fatalf("got auth=%s error=%q, want missing with the source's reason", st.Auth, st.Error)
 	}
 
-	st = resolve(t, engine.Options{Clock: clk, Creds: &fakeCreds{results: []credResult{{err: creds.ErrNotAvailable}}}, Fetcher: fetch})
+	st = resolve(t, engine.Options{Spec: provider.Spec{Creds: &fakeCreds{results: []credResult{{err: provider.ErrNotAvailable}}}, Fetcher: fetch}, Clock: clk})
 	if !strings.Contains(st.Error, "no credentials found") {
 		t.Fatalf("ErrNotAvailable should keep the generic hint, got %q", st.Error)
 	}
@@ -1140,10 +1210,7 @@ func TestCredentialSourceErrorBecomesTheAuthMissingReason(t *testing.T) {
 
 func resolveDetached(t *testing.T, o engine.Options) *schema.State {
 	t.Helper()
-	if o.Clock == nil {
-		o.Clock = &fakeClock{t: baseTime}
-	}
-	st := engine.New(o).ResolveDetached(context.Background())
+	st := newEngine(o).ResolveDetached(context.Background())
 	if st == nil {
 		t.Fatalf("ResolveDetached returned nil state")
 	}
@@ -1163,9 +1230,9 @@ func TestDetachedFreshCacheServedWithoutIO(t *testing.T) {
 		return nil, nil
 	}}
 	ref := &fakeRefresher{}
-	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+	missing := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
 
-	st := resolveDetached(t, engine.Options{Creds: missing, Fetcher: fetch, Cache: cache, Refresher: ref})
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: missing, Fetcher: fetch}, Cache: cache, Refresher: ref})
 	if st.Source != schema.SourceCache || st.Stale || st.Auth != schema.AuthOK {
 		t.Fatalf("got source=%s stale=%v auth=%s, want cache/false/ok", st.Source, st.Stale, st.Auth)
 	}
@@ -1190,7 +1257,7 @@ func TestDetachedStaleCacheSpawnsRefreshAndServesStale(t *testing.T) {
 	}}
 	ref := &fakeRefresher{}
 
-	st := resolveDetached(t, engine.Options{Provider: codexProvider, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	st := resolveDetached(t, engine.Options{Spec: codexSpec(okCreds("tok"), fetch), Cache: cache, Refresher: ref})
 	if cache.claims != 1 || ref.spawns != 1 {
 		t.Fatalf("claims=%d spawns=%d, want 1/1", cache.claims, ref.spawns)
 	}
@@ -1214,7 +1281,7 @@ func TestDetachedClaimDeniedServesStaleWithoutSpawn(t *testing.T) {
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 	ref := &fakeRefresher{}
 
-	st := resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Cache: cache, Refresher: ref})
 	if cache.claims != 1 || ref.spawns != 0 || len(fetch.calls) != 0 {
 		t.Fatalf("denied claim must neither spawn nor fetch: claims=%d spawns=%d fetch=%d", cache.claims, ref.spawns, len(fetch.calls))
 	}
@@ -1236,7 +1303,7 @@ func TestDetachedSpawnFailureFallsBackToSyncRefresh(t *testing.T) {
 	}
 	ref := &fakeRefresher{err: errors.New("spawn failed")}
 
-	st := resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Cache: cache, Refresher: ref})
 	if ref.spawns != 1 || len(fetch.calls) != 1 || cache.stores != 1 {
 		t.Fatalf("spawn failure must fall back to one sync refresh: spawns=%d fetch=%d stores=%d", ref.spawns, len(fetch.calls), cache.stores)
 	}
@@ -1252,9 +1319,9 @@ func TestDetachedNoCacheWithoutCredsIsAuthMissingWithoutSpawn(t *testing.T) {
 	cache := &fakeCache{claimResult: true}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
 	ref := &fakeRefresher{}
-	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+	missing := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
 
-	st := resolveDetached(t, engine.Options{Provider: codexProvider, Creds: missing, Fetcher: fetch, Cache: cache, Refresher: ref})
+	st := resolveDetached(t, engine.Options{Spec: codexSpec(missing, fetch), Cache: cache, Refresher: ref})
 	if st.Type != schema.TypeError || st.Auth != schema.AuthMissing {
 		t.Fatalf("got type=%s auth=%s, want error/missing", st.Type, st.Auth)
 	}
@@ -1273,10 +1340,10 @@ func TestDetachedExpiredTokenKeepsStaleCacheAndAuthExpired(t *testing.T) {
 		claimResult: true,
 		has:         true,
 	}
-	expired := &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}}}}
+	expired := &fakeCreds{results: []credResult{{c: &provider.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}}}}
 	ref := &fakeRefresher{}
 
-	st := resolveDetached(t, engine.Options{Creds: expired, Fetcher: &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}, Cache: cache, Refresher: ref})
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: expired, Fetcher: &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}}, Cache: cache, Refresher: ref})
 	if st.Source != schema.SourceCache || !st.Stale || st.Auth != schema.AuthExpired {
 		t.Fatalf("got source=%s stale=%v auth=%s, want cache/true/expired", st.Source, st.Stale, st.Auth)
 	}
@@ -1293,7 +1360,7 @@ func TestDetachedNoCacheWithCredsSpawnsAndReportsNoDataYet(t *testing.T) {
 	}}
 	ref := &fakeRefresher{}
 
-	st := resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref})
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Cache: cache, Refresher: ref})
 	if cache.claims != 1 || ref.spawns != 1 {
 		t.Fatalf("claims=%d spawns=%d, want 1/1", cache.claims, ref.spawns)
 	}
@@ -1306,8 +1373,177 @@ func TestDetachedNoCacheWithCredsSpawnsAndReportsNoDataYet(t *testing.T) {
 
 	reset := baseTime.Add(2 * time.Hour)
 	tr := &fakeTranscript{lh: &schema.LimitHit{ResetsAt: &reset, DetectedAt: baseTime}}
-	st = resolveDetached(t, engine.Options{Creds: okCreds("tok"), Fetcher: fetch, Cache: &fakeCache{claimResult: true}, Refresher: ref, Transcript: tr})
-	if st.Source != schema.SourceTranscript || st.LimitHit == nil {
-		t.Fatalf("cold start should still fall back to the transcript probe, got source=%s", st.Source)
+	st = resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch, Transcript: tr}, Cache: &fakeCache{claimResult: true}, Refresher: ref})
+	if tr.calls != 0 || st.Type != schema.TypeError {
+		t.Fatalf("the detached path must never walk the transcripts itself: probes=%d type=%s", tr.calls, st.Type)
+	}
+
+	persisted := &fakeCache{has: true, claimResult: true, limitHit: &schema.LimitHit{ResetsAt: &reset, DetectedAt: baseTime}}
+	st = resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch, Transcript: tr}, Cache: persisted, Refresher: ref})
+	if st.Source != schema.SourceTranscript || st.LimitHit == nil || tr.calls != 0 {
+		t.Fatalf("a persisted limit hit should be served without probing, got source=%s probes=%d", st.Source, tr.calls)
+	}
+}
+
+func TestPersistedLimitHitPastResetIsIgnored(t *testing.T) {
+	past := baseTime.Add(-time.Minute)
+	cache := &fakeCache{has: true, claimResult: true, limitHit: &schema.LimitHit{ResetsAt: &past, DetectedAt: baseTime.Add(-3 * time.Hour)}}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("detached path must not fetch inline")
+		return nil, nil
+	}}
+
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Cache: cache, Refresher: &fakeRefresher{}})
+	if st.Type != schema.TypeError || st.LimitHit != nil {
+		t.Fatalf("an elapsed persisted limit hit must not be served, got type=%s hit=%+v", st.Type, st.LimitHit)
+	}
+}
+
+func TestInlineLadderRefreshesThePersistedLimitHit(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	old := baseTime.Add(time.Hour)
+	cache := &fakeCache{has: true, limitHit: &schema.LimitHit{ResetsAt: &old, DetectedAt: baseTime.Add(-time.Hour)}}
+	tr := &fakeTranscript{}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, provider.ErrTransient }}
+
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch, Transcript: tr}, Clock: clk, Cache: cache})
+	if tr.calls != 1 {
+		t.Fatalf("the inline ladder must probe once, got %d", tr.calls)
+	}
+	if st.Type != schema.TypeError || cache.limitHit != nil {
+		t.Fatalf("a probe that finds nothing must clear the persisted hit, got type=%s persisted=%+v", st.Type, cache.limitHit)
+	}
+}
+
+func TestUnnamedSpecLeavesProviderEmptyAndHintsCommandless(t *testing.T) {
+	missing := &fakeCreds{results: []credResult{{err: provider.ErrNotFound}}}
+	st := engine.New(engine.Options{Spec: provider.Spec{Creds: missing}, Clock: &fakeClock{t: baseTime}}).Resolve(context.Background())
+	if st.Provider != "" {
+		t.Fatalf("provider = %q, want empty for an unnamed spec", st.Provider)
+	}
+	if st.Error != "no credentials found" {
+		t.Fatalf("error = %q, want a command-less hint", st.Error)
+	}
+}
+
+func TestAuthErrorRetryTransientFailureKeepsAuthOK(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cr := &fakeCreds{results: []credResult{{c: &provider.Credentials{AccessToken: "tok-A"}}, {c: &provider.Credentials{AccessToken: "tok-B"}}}}
+	cache := &fakeCache{
+		payload:  mustMarshal(t, snapWith(60, baseTime.Add(time.Hour))),
+		storedAt: baseTime.Add(-10 * time.Minute),
+		has:      true,
+	}
+	fetch := &fakeFetcher{fn: func(token string) (*schema.Snapshot, error) {
+		if token == "tok-A" {
+			return nil, provider.ErrAuth
+		}
+		return nil, provider.ErrTransient
+	}}
+
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: cr, Fetcher: fetch}, Clock: clk, Cache: cache})
+	if len(fetch.calls) != 2 {
+		t.Fatalf("fetch calls = %d, want the rotated-token retry", len(fetch.calls))
+	}
+	if st.Source != schema.SourceCache || !st.Stale || st.Auth != schema.AuthOK {
+		t.Fatalf("got source=%s stale=%v auth=%s, want the retry's transient failure served as stale cache with auth ok", st.Source, st.Stale, st.Auth)
+	}
+}
+
+func TestDetachedWithoutRefresherFallsBackToSyncRefresh(t *testing.T) {
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(10, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		claimResult: true,
+		has:         true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return snapWith(42, baseTime.Add(time.Hour)), nil }}
+
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Cache: cache})
+	if cache.claims != 1 || len(fetch.calls) != 1 || cache.stores != 1 {
+		t.Fatalf("a missing refresher must behave like a failed spawn: claims=%d fetch=%d stores=%d", cache.claims, len(fetch.calls), cache.stores)
+	}
+	if st.Source != schema.SourceOAuth || st.Snapshot.FiveHour.Utilization != 42 {
+		t.Fatalf("got source=%s util=%v, want oauth/42", st.Source, st.Snapshot.FiveHour.Utilization)
+	}
+}
+
+func TestNoPlanCredentialsAreANoPlanErrorState(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	noPlan := &provider.NoPlanError{Reason: "codex: logged in with an API key; plan limits do not apply"}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("fetch must not be called without plan credentials")
+		return nil, nil
+	}}
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(60, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		claimResult: true,
+		has:         true,
+	}
+	ref := &fakeRefresher{}
+	opts := engine.Options{Spec: provider.Spec{Creds: &fakeCreds{results: []credResult{{err: noPlan}}}, Fetcher: fetch}, Clock: clk, Cache: cache, Refresher: ref}
+
+	for name, st := range map[string]*schema.State{"inline": resolve(t, opts), "detached": resolveDetached(t, opts)} {
+		if st.Type != schema.TypeError || st.Auth != schema.AuthNoPlan || st.Error != noPlan.Reason || st.Snapshot != nil {
+			t.Fatalf("%s: got type=%s auth=%s error=%q hasSnapshot=%v, want a no_plan error carrying the reason and no stale plan data", name, st.Type, st.Auth, st.Error, st.Snapshot != nil)
+		}
+	}
+	if ref.spawns != 0 || cache.claims != 0 {
+		t.Fatalf("no-plan credentials must not claim or spawn a refresh: spawns=%d claims=%d", ref.spawns, cache.claims)
+	}
+}
+
+func TestDetachedSyncFallbackAuthErrorIsExpired(t *testing.T) {
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(10, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		claimResult: true,
+		has:         true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, provider.ErrAuth }}
+	ref := &fakeRefresher{err: errors.New("spawn failed")}
+
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Cache: cache, Refresher: ref})
+	if len(fetch.calls) != 1 || st.Source != schema.SourceCache || !st.Stale || st.Auth != schema.AuthExpired {
+		t.Fatalf("a 401 on the sync fallback must degrade like the inline ladder: fetch=%d source=%s stale=%v auth=%s", len(fetch.calls), st.Source, st.Stale, st.Auth)
+	}
+}
+
+func TestDetachedClaimSkippedWhileAttemptIsRecent(t *testing.T) {
+	cache := &fakeCache{
+		payload:     mustMarshal(t, snapWith(10, baseTime.Add(time.Hour))),
+		storedAt:    baseTime.Add(-10 * time.Minute),
+		attemptedAt: baseTime.Add(-30 * time.Second),
+		claimResult: true,
+		has:         true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("no fetch while an attempt is recent")
+		return nil, nil
+	}}
+	ref := &fakeRefresher{}
+
+	st := resolveDetached(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch}, Cache: cache, Refresher: ref})
+	if cache.claims != 0 || ref.spawns != 0 {
+		t.Fatalf("a recent attempt must pre-empt the locked claim: claims=%d spawns=%d", cache.claims, ref.spawns)
+	}
+	if st.Source != schema.SourceCache || !st.Stale {
+		t.Fatalf("got source=%s stale=%v, want the stale cache served", st.Source, st.Stale)
+	}
+}
+
+func TestInlineLadderSkipsNoOpLimitHitPersist(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	cache := &fakeCache{}
+	tr := &fakeTranscript{}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, provider.ErrTransient }}
+
+	st := resolve(t, engine.Options{Spec: provider.Spec{Creds: okCreds("tok"), Fetcher: fetch, Transcript: tr}, Clock: clk, Cache: cache})
+	if tr.calls != 1 || cache.limitHitStores != 0 {
+		t.Fatalf("nothing found and nothing persisted must not touch the cache: probes=%d stores=%d", tr.calls, cache.limitHitStores)
+	}
+	if st.Type != schema.TypeError {
+		t.Fatalf("type = %s, want error", st.Type)
 	}
 }

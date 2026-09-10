@@ -24,13 +24,13 @@ func newRefreshCmd(ps providers) *cobra.Command {
 			if len(names) != 1 {
 				return errors.New("refresh takes exactly one provider")
 			}
-			resolvers, err := ps.lookup(names)
+			entries, err := ps.lookup(names)
 			if err != nil {
 				return err
 			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), refreshTimeout)
 			defer cancel()
-			_ = resolvers[0].Resolve(ctx)
+			_ = entries[0].resolver.Resolve(ctx)
 			return nil
 		},
 	}

@@ -107,7 +107,9 @@ To see the Codex plan next to it (handy when Codex runs from inside Claude Code)
 ◷ 5h ▮▮▯▯▯ 47% ↻ 3h50m · ◷ 7d ▮▯▯▯▯ 23% ↻ 3d16h │ codex ◷ 7d ▮▯▯▯▯ 18% ↻ 5d2h
 ```
 
-Gauges turn muted yellow at ≥60% and red above 85%. A leading `≈` marks stale cached data; `⚠ login` means credentials need attention (per group). Set `NO_COLOR` to disable ANSI. The Codex group never waits on the network: it is served from its own cache and healed by a detached background refresh.
+A single provider is never tagged, whichever it is: `--provider codex` alone prints the Codex line exactly like the Claude line above. With several providers, the Claude group stays untagged and the others carry a gray name tag.
+
+Gauges turn muted yellow at ≥60% and red above 85%. A leading `≈` marks stale cached data; `⚠ login` means credentials need attention (per group); `no plan` means the login carries no plan limits (a Codex API-key login). Set `NO_COLOR` to disable ANSI. The Codex group never waits on the network: it is served from its own cache and healed by a detached background refresh.
 
 ### `ccx update`
 
@@ -115,10 +117,8 @@ Self-update to the latest GitHub release:
 
 ```
 $ ccx update
-current: v0.1.0
-latest:  v0.2.0
 downloading ccx_darwin_arm64.tar.gz ...
-verifying checksum ... ok
+verifying checksum + signature ... ok
 replacing /Users/you/go/bin/ccx ...
 updated v0.1.0 -> v0.2.0
 ```
@@ -131,11 +131,11 @@ It checks the latest release, downloads the binary for your OS/arch, verifies th
 
 > **⚠ Uses unofficial APIs.** `ccx` depends on `GET https://api.anthropic.com/api/oauth/usage` — the same endpoint Claude Code's `/usage` uses internally — and, for `--provider codex`, on `GET https://chatgpt.com/backend-api/wham/usage`, the call behind Codex CLI's `/status`. Both are undocumented and unsupported and may change or disappear without notice; `now` prints a `drift:` line when a response no longer looks the way ccx expects.
 
-`ccx` reuses the CLI's existing OAuth token — Claude Code's from `~/.claude/.credentials.json` or the macOS Keychain, Codex CLI's from `~/.codex/auth.json` (ChatGPT login; an API-key login has no plan limits and says so). Tokens are never persisted or printed — memory only — and ccx never runs a token refresh of its own, so it cannot break your login.
+`ccx` reuses the CLI's existing OAuth token — Claude Code's from `~/.claude/.credentials.json` or the macOS Keychain, Codex CLI's from `~/.codex/auth.json` (ChatGPT login; an API-key login has no plan limits and says so — `now` prints the reason and the statusline shows `no plan`). Tokens are never persisted or printed — memory only — and ccx never runs a token refresh of its own, so it cannot break your login.
 
-Responses are cached to disk for 120 seconds, so the statusline never hammers the API. The statusline path never blocks on the network either: when the cache needs refreshing it spawns a detached background refresh and renders immediately, so gaps (like a per-model window Claude Code doesn't pipe) heal on the next tick. On any failure the tool degrades gracefully: stale cache → transcript fallback → error state. It never shows a blank screen.
+Responses are cached to disk for 120 seconds, so the statusline never hammers the API. The statusline path never blocks on the network either: when the cache needs refreshing it spawns a detached background refresh and renders immediately, so gaps (like a per-model window Claude Code doesn't pipe) heal on the next tick. On any failure the tool degrades gracefully: stale cache → transcript fallback → error state. It never shows a blank screen. `now` also appends `⚠ no credentials` / `⚠ token expired` to its source line whenever it is showing last-known data because the login is broken.
 
-Cache: `<os.UserCacheDir()>/cc-token-exposer/snapshot.json` (Claude) and `codex.json` (Codex), one file and lock per provider.
+Cache: `<os.UserCacheDir()>/cc-token-exposer/snapshot.json` (Claude) and `codex.json` (Codex), one file and lock per provider. When the user cache directory cannot be resolved (no `HOME`), the files live under the system temp directory instead, so the cache-first rule always holds; a cache directory that is a symlink or owned by another user is refused, so a shared `/tmp` cannot be pre-seeded. A corrupt cache file is simply overwritten by the next fetch.
 
 ---
 

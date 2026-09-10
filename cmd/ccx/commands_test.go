@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/seosd97/cc-token-exposer/internal/engine"
+	"github.com/seosd97/cc-token-exposer/internal/provider"
+	"github.com/seosd97/cc-token-exposer/internal/provider/claude"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
@@ -37,7 +39,17 @@ func (f *fakeResolver) ResolveDetached(context.Context) *schema.State {
 	return f.st
 }
 
-func claudeOnly(r resolver) providers { return providers{schema.ProviderClaude: r} }
+func claudeOnly(r resolver) providers {
+	return providers{schema.ProviderClaude: entryFor(schema.ProviderClaude, r)}
+}
+
+func entryFor(name string, r resolver) providerEntry {
+	spec := provider.Spec{Name: name}
+	if name == schema.ProviderClaude {
+		spec.ParseStdin = claude.ParseStatuslineStdin
+	}
+	return providerEntry{spec: spec, resolver: r}
+}
 
 func snapshotState(fiveHour, sevenDay float64, resetsAt time.Time) *schema.State {
 	return &schema.State{
@@ -326,8 +338,8 @@ func TestNowUnknownProviderFailsLoudly(t *testing.T) {
 func TestNowRendersOneBlockPerProvider(t *testing.T) {
 	reset := time.Now().UTC().Add(2 * time.Hour)
 	ps := providers{
-		schema.ProviderClaude: &fakeResolver{st: taggedState(schema.ProviderClaude, 63, 44, reset)},
-		schema.ProviderCodex:  &fakeResolver{st: taggedState(schema.ProviderCodex, 18, 60, reset)},
+		schema.ProviderClaude: entryFor(schema.ProviderClaude, &fakeResolver{st: taggedState(schema.ProviderClaude, 63, 44, reset)}),
+		schema.ProviderCodex:  entryFor(schema.ProviderCodex, &fakeResolver{st: taggedState(schema.ProviderCodex, 18, 60, reset)}),
 	}
 	cmd := newNowCmd(ps)
 	var out bytes.Buffer
@@ -367,8 +379,8 @@ func TestNowSingleProviderPrintsNoHeader(t *testing.T) {
 func TestNowJSONEmitsOneLinePerProvider(t *testing.T) {
 	reset := time.Now().UTC().Add(2 * time.Hour)
 	ps := providers{
-		schema.ProviderClaude: &fakeResolver{st: taggedState(schema.ProviderClaude, 63, 44, reset)},
-		schema.ProviderCodex:  &fakeResolver{st: taggedState(schema.ProviderCodex, 18, 60, reset)},
+		schema.ProviderClaude: entryFor(schema.ProviderClaude, &fakeResolver{st: taggedState(schema.ProviderClaude, 63, 44, reset)}),
+		schema.ProviderCodex:  entryFor(schema.ProviderCodex, &fakeResolver{st: taggedState(schema.ProviderCodex, 18, 60, reset)}),
 	}
 	cmd := newNowCmd(ps)
 	var out bytes.Buffer
@@ -395,8 +407,8 @@ func TestNowJSONEmitsOneLinePerProvider(t *testing.T) {
 
 func TestNowExitsNonZeroWhenAnyProviderErrors(t *testing.T) {
 	ps := providers{
-		schema.ProviderClaude: &fakeResolver{st: taggedState(schema.ProviderClaude, 63, 44, time.Now().UTC().Add(time.Hour))},
-		schema.ProviderCodex:  &fakeResolver{st: authErrorState()},
+		schema.ProviderClaude: entryFor(schema.ProviderClaude, &fakeResolver{st: taggedState(schema.ProviderClaude, 63, 44, time.Now().UTC().Add(time.Hour))}),
+		schema.ProviderCodex:  entryFor(schema.ProviderCodex, &fakeResolver{st: authErrorState()}),
 	}
 	cmd := newNowCmd(ps)
 	var out bytes.Buffer
@@ -412,17 +424,17 @@ func TestNowExitsNonZeroWhenAnyProviderErrors(t *testing.T) {
 }
 
 func TestRefreshResolvesOnlyTheNamedProvider(t *testing.T) {
-	claude := &fakeResolver{st: snapshotState(1, 2, time.Now().UTC().Add(time.Hour))}
-	codex := &fakeResolver{st: snapshotState(3, 4, time.Now().UTC().Add(time.Hour))}
-	ps := providers{schema.ProviderClaude: claude, schema.ProviderCodex: codex}
+	claudeRes := &fakeResolver{st: snapshotState(1, 2, time.Now().UTC().Add(time.Hour))}
+	codexRes := &fakeResolver{st: snapshotState(3, 4, time.Now().UTC().Add(time.Hour))}
+	ps := providers{schema.ProviderClaude: entryFor(schema.ProviderClaude, claudeRes), schema.ProviderCodex: entryFor(schema.ProviderCodex, codexRes)}
 
 	cmd := newRefreshCmd(ps)
 	cmd.SetArgs([]string{"--provider", "codex"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if codex.resolved != 1 || claude.resolved != 0 {
-		t.Fatalf("resolved claude=%d codex=%d, want 0/1", claude.resolved, codex.resolved)
+	if codexRes.resolved != 1 || claudeRes.resolved != 0 {
+		t.Fatalf("resolved claude=%d codex=%d, want 0/1", claudeRes.resolved, codexRes.resolved)
 	}
 
 	cmd = newRefreshCmd(ps)
@@ -430,8 +442,8 @@ func TestRefreshResolvesOnlyTheNamedProvider(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if claude.resolved != 1 {
-		t.Fatalf("flag-less refresh should default to claude, resolved=%d", claude.resolved)
+	if claudeRes.resolved != 1 {
+		t.Fatalf("flag-less refresh should default to claude, resolved=%d", claudeRes.resolved)
 	}
 
 	cmd = newRefreshCmd(ps)
@@ -444,9 +456,9 @@ func TestRefreshResolvesOnlyTheNamedProvider(t *testing.T) {
 func TestStatuslineRoutesStdinToClaudeAndDetachedToOthers(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	reset := time.Now().UTC().Add(4 * time.Hour)
-	claude := &fakeResolver{st: taggedState(schema.ProviderClaude, 72, 41, reset)}
-	codex := &fakeResolver{st: taggedState(schema.ProviderCodex, 18, 60, reset)}
-	cmd := newStatuslineCmd(providers{schema.ProviderClaude: claude, schema.ProviderCodex: codex})
+	claudeRes := &fakeResolver{st: taggedState(schema.ProviderClaude, 72, 41, reset)}
+	codexRes := &fakeResolver{st: taggedState(schema.ProviderCodex, 18, 60, reset)}
+	cmd := newStatuslineCmd(providers{schema.ProviderClaude: entryFor(schema.ProviderClaude, claudeRes), schema.ProviderCodex: entryFor(schema.ProviderCodex, codexRes)})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetIn(bytes.NewBufferString(`{"rate_limits":{"five_hour":{"used_percentage":72,"resets_at":"2099-01-01T00:00:00Z"}}}`))
@@ -455,11 +467,11 @@ func TestStatuslineRoutesStdinToClaudeAndDetachedToOthers(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if claude.stdinRes != 1 || claude.detached != 0 || claude.stdin == nil {
-		t.Fatalf("claude should be served via ResolveStdin with the piped snapshot: stdin=%d detached=%d snap=%v", claude.stdinRes, claude.detached, claude.stdin)
+	if claudeRes.stdinRes != 1 || claudeRes.detached != 0 || claudeRes.stdin == nil {
+		t.Fatalf("claude should be served via ResolveStdin with the piped snapshot: stdin=%d detached=%d snap=%v", claudeRes.stdinRes, claudeRes.detached, claudeRes.stdin)
 	}
-	if codex.detached != 1 || codex.stdinRes != 0 || codex.resolved != 0 {
-		t.Fatalf("codex should be served via ResolveDetached only: detached=%d stdin=%d resolved=%d", codex.detached, codex.stdinRes, codex.resolved)
+	if codexRes.detached != 1 || codexRes.stdinRes != 0 || codexRes.resolved != 0 {
+		t.Fatalf("codex should be served via ResolveDetached only: detached=%d stdin=%d resolved=%d", codexRes.detached, codexRes.stdinRes, codexRes.resolved)
 	}
 	line := strings.TrimSpace(out.String())
 	if !strings.Contains(line, "5h ▮▮▮▮▯ 72%") || !strings.Contains(line, "│ codex ◷ 5h ▮▯▯▯▯ 18%") {
