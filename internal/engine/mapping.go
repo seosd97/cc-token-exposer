@@ -6,17 +6,29 @@ import (
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
-func snapshotState(snap *schema.Snapshot, source string, stale bool, staleAge time.Duration, auth schema.AuthStatus) *schema.State {
+func freshState(snap *schema.Snapshot, source string, drift []string) *schema.State {
+	return &schema.State{
+		SchemaVersion: schema.Version,
+		Type:          schema.TypeSnapshot,
+		Source:        source,
+		Auth:          schema.AuthOK,
+		Snapshot:      snap,
+		Drift:         drift,
+	}
+}
+
+func staleState(snap *schema.Snapshot, source string, age time.Duration, auth schema.AuthStatus, drift []string) *schema.State {
 	st := &schema.State{
 		SchemaVersion: schema.Version,
 		Type:          schema.TypeSnapshot,
 		Source:        source,
-		Stale:         stale,
+		Stale:         true,
 		Auth:          auth,
 		Snapshot:      snap,
+		Drift:         drift,
 	}
-	if stale && staleAge > 0 {
-		st.StaleAge = schema.NewDuration(staleAge)
+	if age > 0 {
+		st.StaleAge = schema.NewDuration(age)
 	}
 	return st
 }

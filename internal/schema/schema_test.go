@@ -166,3 +166,49 @@ func TestStateProviderOnTheWire(t *testing.T) {
 		t.Fatalf("unset provider must be omitted, not emitted empty: %s", b)
 	}
 }
+
+func TestWindowOmitsUnknownReset(t *testing.T) {
+	b, err := json.Marshal(&Window{Utilization: 18})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "resets_at") {
+		t.Fatalf("zero reset must be omitted, not serialized as a sentinel date: %s", b)
+	}
+	var got Window
+	if err := json.Unmarshal(b, &got); err != nil || !got.ResetsAt.IsZero() || got.Utilization != 18 {
+		t.Fatalf("round trip = %+v (err %v), want zero reset preserved", got, err)
+	}
+}
+
+func TestSnapshotValueMarshalsAliases(t *testing.T) {
+	snap := Snapshot{ScopedLimits: map[string]*Window{"Opus": {Utilization: 12}}}
+	b, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"seven_day_opus"`) {
+		t.Fatalf("marshaling a Snapshot value must still emit the compat aliases: %s", b)
+	}
+}
+
+func TestAuthNoPlanOnTheWire(t *testing.T) {
+	b, err := json.Marshal(&State{SchemaVersion: Version, Type: TypeError, Auth: AuthNoPlan, Error: "no plan"})
+	if err != nil || !strings.Contains(string(b), `"auth":"no_plan"`) {
+		t.Fatalf("no-plan state = %s, %v; want auth serialized as no_plan", b, err)
+	}
+}
+
+func TestLimitHitActive(t *testing.T) {
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	future, past := now.Add(time.Hour), now.Add(-time.Hour)
+	if (*LimitHit)(nil).Active(now) {
+		t.Fatal("nil hit must not be active")
+	}
+	if !(&LimitHit{}).Active(now) {
+		t.Fatal("a hit without a reset stays active")
+	}
+	if !(&LimitHit{ResetsAt: &future}).Active(now) || (&LimitHit{ResetsAt: &past}).Active(now) {
+		t.Fatal("liveness must follow the reset time")
+	}
+}

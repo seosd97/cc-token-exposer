@@ -28,14 +28,14 @@ func newNowCmd(ps providers) *cobra.Command {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			names := parseProviderList(providerFlag)
-			resolvers, err := ps.lookup(names)
+			entries, err := ps.lookup(names)
 			if err != nil {
 				return err
 			}
 
 			ctx, cancel := context.WithTimeout(cmd.Context(), nowTimeout)
 			defer cancel()
-			states := resolveAll(ctx, resolvers)
+			states := resolveEach(entries, func(e providerEntry) *schema.State { return e.resolver.Resolve(ctx) })
 
 			out := cmd.OutOrStdout()
 			now := time.Now().UTC()
@@ -69,15 +69,15 @@ func newNowCmd(ps providers) *cobra.Command {
 	return cmd
 }
 
-func resolveAll(ctx context.Context, resolvers []resolver) []*schema.State {
-	states := make([]*schema.State, len(resolvers))
+func resolveEach(entries []providerEntry, fn func(providerEntry) *schema.State) []*schema.State {
+	states := make([]*schema.State, len(entries))
 	var wg sync.WaitGroup
-	for i, r := range resolvers {
+	for i, entry := range entries {
 		wg.Add(1)
-		go func(i int, r resolver) {
+		go func(i int, entry providerEntry) {
 			defer wg.Done()
-			states[i] = r.Resolve(ctx)
-		}(i, r)
+			states[i] = fn(entry)
+		}(i, entry)
 	}
 	wg.Wait()
 	return states

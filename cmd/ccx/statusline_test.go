@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -134,12 +133,12 @@ func TestFormatStatusline(t *testing.T) {
 			want: "◷ 5h ▮▮▮▯▯ 50%",
 		},
 		{
-			name: "limit hit with already-elapsed reset shows generic",
+			name: "limit hit with already-elapsed reset renders nothing",
 			st: func() *schema.State {
 				r := now.Add(-time.Hour)
 				return &schema.State{Auth: schema.AuthOK, LimitHit: &schema.LimitHit{ResetsAt: &r}}
 			}(),
-			want: "⛔ limit",
+			want: "⚠ ccx",
 		},
 		{
 			name: "no windows but limit hit with reset",
@@ -171,44 +170,6 @@ func TestFormatStatusline(t *testing.T) {
 	}
 }
 
-func TestReadStatuslineInput(t *testing.T) {
-	t.Run("empty stdin", func(t *testing.T) {
-		in, err := readStatuslineInput(strings.NewReader(""))
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if len(in.RateLimits) != 0 {
-			t.Errorf("expected no rate_limits, got %s", in.RateLimits)
-		}
-	})
-
-	t.Run("malformed JSON is tolerated", func(t *testing.T) {
-		in, err := readStatuslineInput(strings.NewReader("{not json"))
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if len(in.RateLimits) != 0 {
-			t.Errorf("expected no rate_limits from malformed input")
-		}
-	})
-
-	t.Run("captures rate_limits", func(t *testing.T) {
-		in, err := readStatuslineInput(strings.NewReader(`{"session_id":"x","rate_limits":{"five_hour":{"utilization":12}}}`))
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if len(in.RateLimits) == 0 {
-			t.Fatalf("expected rate_limits captured")
-		}
-	})
-
-	t.Run("nil reader", func(t *testing.T) {
-		if _, err := readStatuslineInput(nil); err != nil {
-			t.Fatalf("nil reader should not error: %v", err)
-		}
-	})
-}
-
 func TestIsTerminal(t *testing.T) {
 	if isTerminal(strings.NewReader("{}")) {
 		t.Error("strings.Reader should not be reported as a terminal")
@@ -221,127 +182,6 @@ func TestIsTerminal(t *testing.T) {
 	if isTerminal(f) {
 		t.Error("regular file should not be reported as a terminal")
 	}
-}
-
-func TestSnapshotFromRateLimits(t *testing.T) {
-	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-
-	t.Run("absent", func(t *testing.T) {
-		if _, ok := snapshotFromRateLimits(nil, now); ok {
-			t.Error("nil rate_limits should not yield a snapshot")
-		}
-	})
-
-	t.Run("unrelated shape falls through", func(t *testing.T) {
-		if _, ok := snapshotFromRateLimits([]byte(`{"something_else":1}`), now); ok {
-			t.Error("unknown shape should yield no snapshot")
-		}
-	})
-
-	t.Run("parses windows with float utilization", func(t *testing.T) {
-		raw := []byte(`{"five_hour":{"utilization":23.0,"resets_at":"2026-06-12T16:00:00Z"},"seven_day":{"utilization":40.6,"resets_at":"2026-06-18T00:00:00Z"}}`)
-		snap, ok := snapshotFromRateLimits(raw, now)
-		if !ok {
-			t.Fatal("expected a snapshot")
-		}
-		if snap.FiveHour == nil || snap.FiveHour.Utilization != 23 {
-			t.Errorf("five_hour = %+v, want 23", snap.FiveHour)
-		}
-		if snap.SevenDay == nil || snap.SevenDay.Utilization != 40.6 {
-			t.Errorf("seven_day = %+v, want 40.6 preserved", snap.SevenDay)
-		}
-		if !snap.FetchedAt.Equal(now) {
-			t.Errorf("fetched_at = %v, want %v", snap.FetchedAt, now)
-		}
-	})
-
-	t.Run("used_percentage field name with epoch resets_at", func(t *testing.T) {
-		epoch := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC).Unix()
-		raw := []byte(`{"five_hour":{"used_percentage":33,"resets_at":` + strconv.FormatInt(epoch, 10) + `}}`)
-		snap, ok := snapshotFromRateLimits(raw, now)
-		if !ok {
-			t.Fatal("expected a snapshot from used_percentage")
-		}
-		if snap.FiveHour == nil || snap.FiveHour.Utilization != 33 {
-			t.Errorf("five_hour = %+v, want 33", snap.FiveHour)
-		}
-		if want := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC); !snap.FiveHour.ResetsAt.Equal(want) {
-			t.Errorf("resets_at = %v, want %v (epoch decoded)", snap.FiveHour.ResetsAt, want)
-		}
-	})
-
-	t.Run("used_percentage takes priority over utilization", func(t *testing.T) {
-		raw := []byte(`{"five_hour":{"used_percentage":70,"utilization":10}}`)
-		snap, ok := snapshotFromRateLimits(raw, now)
-		if !ok || snap.FiveHour.Utilization != 70 {
-			t.Errorf("got %+v, want used_percentage 70 to win", snap)
-		}
-	})
-
-	t.Run("window without resets_at keeps its percentage", func(t *testing.T) {
-		raw := []byte(`{"five_hour":{"used_percentage":47},"seven_day":{"used_percentage":20,"resets_at":null}}`)
-		snap, ok := snapshotFromRateLimits(raw, now)
-		if !ok {
-			t.Fatal("expected a snapshot")
-		}
-		if snap.FiveHour == nil || snap.FiveHour.Utilization != 47 || !snap.FiveHour.ResetsAt.IsZero() {
-			t.Errorf("five_hour = %+v, want 47%% with zero reset", snap.FiveHour)
-		}
-		if snap.SevenDay == nil || snap.SevenDay.Utilization != 20 || !snap.SevenDay.ResetsAt.IsZero() {
-			t.Errorf("seven_day = %+v, want 20%% with zero reset", snap.SevenDay)
-		}
-	})
-
-	t.Run("window without a percentage is ignored", func(t *testing.T) {
-		raw := []byte(`{"five_hour":{"resets_at":"2026-06-12T16:00:00Z"}}`)
-		if _, ok := snapshotFromRateLimits(raw, now); ok {
-			t.Error("window without a percentage should not yield a snapshot")
-		}
-	})
-
-	t.Run("model_scoped keyed by display_name", func(t *testing.T) {
-		raw := []byte(`{"model_scoped":[` +
-			`{"display_name":"Fable","utilization":55.0,"resets_at":"2026-06-18T00:00:00Z"},` +
-			`{"display_name":"Opus","utilization":12.5,"resets_at":"2026-06-18T00:00:00Z"}]}`)
-		snap, ok := snapshotFromRateLimits(raw, now)
-		if !ok {
-			t.Fatal("expected a snapshot from model_scoped")
-		}
-		fable := snap.ScopedLimits["Fable"]
-		if fable == nil || fable.Utilization != 55 {
-			t.Errorf("Fable = %+v, want 55", fable)
-		}
-		if want := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC); !fable.ResetsAt.Equal(want) {
-			t.Errorf("Fable resets_at = %v, want %v", fable.ResetsAt, want)
-		}
-		if opus := snap.ScopedLimits["Opus"]; opus == nil || opus.Utilization != 12.5 {
-			t.Errorf("Opus = %+v, want 12.5", opus)
-		}
-	})
-
-	t.Run("model_scoped skips entries without a usable value", func(t *testing.T) {
-		raw := []byte(`{"model_scoped":[` +
-			`{"display_name":"Fable","utilization":null,"resets_at":"2026-06-18T00:00:00Z"},` +
-			`{"display_name":"","utilization":5,"resets_at":null}]}`)
-		if _, ok := snapshotFromRateLimits(raw, now); ok {
-			t.Error("entries with null utilization or empty name should not yield a snapshot")
-		}
-	})
-
-	t.Run("seven_day_opus backfills only when model_scoped lacks Opus", func(t *testing.T) {
-		raw := []byte(`{"seven_day_opus":{"used_percentage":30,"resets_at":"2026-06-18T00:00:00Z"}}`)
-		snap, ok := snapshotFromRateLimits(raw, now)
-		if !ok || snap.ScopedLimits["Opus"] == nil || snap.ScopedLimits["Opus"].Utilization != 30 {
-			t.Fatalf("seven_day_opus should backfill ScopedLimits[Opus]: %+v", snap)
-		}
-
-		raw = []byte(`{"seven_day_opus":{"used_percentage":30},` +
-			`"model_scoped":[{"display_name":"Opus","utilization":7,"resets_at":null}]}`)
-		snap, ok = snapshotFromRateLimits(raw, now)
-		if !ok || snap.ScopedLimits["Opus"].Utilization != 7 {
-			t.Fatalf("model_scoped Opus should win over seven_day_opus: %+v", snap)
-		}
-	})
 }
 
 func TestFormatStatuslineGroups(t *testing.T) {
@@ -367,9 +207,17 @@ func TestFormatStatuslineGroups(t *testing.T) {
 			want:   "◷ 5h ▮▯▯▯▯ 23% ↻ 4h12m · ◷ 7d ▮▮▯▯▯ 41% ↻ 3d0h │ codex ◷ 5h ▮▯▯▯▯ 18% ↻ 4h12m · ◷ 7d ▮▮▮▯▯ 60% ↻ 3d0h",
 		},
 		{
-			name:   "codex alone keeps its tag",
+			name:   "codex alone is untagged",
 			groups: []providerLine{{schema.ProviderCodex, codexOK}},
-			want:   "codex ◷ 5h ▮▯▯▯▯ 18% ↻ 4h12m · ◷ 7d ▮▮▮▯▯ 60% ↻ 3d0h",
+			want:   "◷ 5h ▮▯▯▯▯ 18% ↻ 4h12m · ◷ 7d ▮▮▮▯▯ 60% ↻ 3d0h",
+		},
+		{
+			name: "the tag keys off configured providers, not rendered groups",
+			groups: []providerLine{
+				{schema.ProviderClaude, &schema.State{Auth: schema.AuthOK, Type: schema.TypeError, Error: "usage refresh in progress; no cache yet"}},
+				{schema.ProviderCodex, codexOK},
+			},
+			want: "codex ◷ 5h ▮▯▯▯▯ 18% ↻ 4h12m · ◷ 7d ▮▮▮▯▯ 60% ↻ 3d0h",
 		},
 		{
 			name: "stale and login markers stay per group",
@@ -386,6 +234,19 @@ func TestFormatStatuslineGroups(t *testing.T) {
 				{schema.ProviderCodex, &schema.State{Auth: schema.AuthOK, Type: schema.TypeError, Error: "usage refresh in progress; no cache yet"}},
 			},
 			want: "◷ 5h ▮▯▯▯▯ 23% ↻ 4h12m · ◷ 7d ▮▮▯▯▯ 41% ↻ 3d0h",
+		},
+		{
+			name: "an account without plan limits renders the no-plan marker",
+			groups: []providerLine{
+				{schema.ProviderClaude, claudeOK},
+				{schema.ProviderCodex, &schema.State{Auth: schema.AuthNoPlan, Type: schema.TypeError, Error: "codex: logged in with an API key; plan limits do not apply"}},
+			},
+			want: "◷ 5h ▮▯▯▯▯ 23% ↻ 4h12m · ◷ 7d ▮▮▯▯▯ 41% ↻ 3d0h │ codex no plan",
+		},
+		{
+			name:   "codex alone without plan limits is not the generic marker",
+			groups: []providerLine{{schema.ProviderCodex, &schema.State{Auth: schema.AuthNoPlan, Type: schema.TypeError, Error: "codex: logged in with an API key; plan limits do not apply"}}},
+			want:   "no plan",
 		},
 		{
 			name:   "all groups empty falls back to the generic marker",
@@ -409,9 +270,38 @@ func TestFormatStatuslineGroups(t *testing.T) {
 
 func TestFormatStatuslineGroupsPaintsTheTagGray(t *testing.T) {
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	st := &schema.State{Auth: schema.AuthOK, Snapshot: &schema.Snapshot{FiveHour: win(18, now.Add(time.Hour))}}
-	line := formatStatuslineGroups([]providerLine{{schema.ProviderCodex, st}}, now, true)
-	if !strings.HasPrefix(line, ansiGray+"codex"+ansiReset+" ") {
+	claude := &schema.State{Auth: schema.AuthOK, Snapshot: &schema.Snapshot{FiveHour: win(23, now.Add(time.Hour))}}
+	codex := &schema.State{Auth: schema.AuthOK, Snapshot: &schema.Snapshot{FiveHour: win(18, now.Add(time.Hour))}}
+	line := formatStatuslineGroups([]providerLine{{schema.ProviderClaude, claude}, {schema.ProviderCodex, codex}}, now, true)
+	if !strings.Contains(line, " │ "+ansiGray+"codex"+ansiReset+" ") {
 		t.Fatalf("tag should be gray chrome: %q", line)
 	}
+	if single := formatStatuslineGroups([]providerLine{{schema.ProviderCodex, codex}}, now, true); strings.Contains(single, "codex") {
+		t.Fatalf("a single provider must not be tagged: %q", single)
+	}
+}
+
+func TestReadStdinDocument(t *testing.T) {
+	t.Run("nil reader", func(t *testing.T) {
+		if doc := readStdinDocument(nil); doc != nil {
+			t.Fatalf("nil reader should yield no document, got %q", doc)
+		}
+	})
+
+	t.Run("blank stdin", func(t *testing.T) {
+		if doc := readStdinDocument(strings.NewReader("  \n")); doc != nil {
+			t.Fatalf("blank stdin should yield no document, got %q", doc)
+		}
+	})
+
+	t.Run("content is passed through untouched", func(t *testing.T) {
+		const raw = `{"session_id":"x","rate_limits":{"five_hour":{"utilization":12}}}`
+		if doc := readStdinDocument(strings.NewReader(raw)); string(doc) != raw {
+			t.Fatalf("document = %q, want the raw stdin", doc)
+		}
+	})
+}
+
+func formatStatusline(st *schema.State, now time.Time, colored bool) string {
+	return formatStatuslineGroups([]providerLine{{name: schema.ProviderClaude, state: st}}, now, colored)
 }

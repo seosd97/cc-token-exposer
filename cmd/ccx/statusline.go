@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/seosd97/cc-token-exposer/internal/schema"
-	"github.com/seosd97/cc-token-exposer/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -40,9 +38,11 @@ window the cache knows but stdin lacks or carries reset-less triggers at most
 one bounded usage API refresh per cache TTL, so it still tracks the real value.
 
 --provider claude,codex appends a second group for the Codex plan, separated by
-"│" and tagged with the provider name. Providers other than claude are served
-from their own cache and healed by a detached background refresh, so the line
-never waits on the network.
+"│" and tagged with the provider name; a single provider, whichever it is, is
+never tagged. Providers other than claude are served from their own cache and
+healed by a detached background refresh, so the line never waits on the
+network. A login without plan limits (a Codex API-key login) renders as
+"no plan" instead of a login warning.
 
 Install: add to ~/.claude/settings.json
 
@@ -61,33 +61,21 @@ func newStatuslineCmd(ps providers) *cobra.Command {
 			now := time.Now().UTC()
 			out := cmd.OutOrStdout()
 			colored := os.Getenv("NO_COLOR") == ""
-
-			var stdinSnap *schema.Snapshot
-			stdin := cmd.InOrStdin()
-			if !isTerminal(stdin) {
-				if in, err := readStatuslineInput(stdin); err == nil {
-					if snap, ok := snapshotFromRateLimits(in.RateLimits, now); ok {
-						stdinSnap = snap
-					}
-				}
-			}
+			stdinDoc := readStdinDocument(cmd.InOrStdin())
 
 			ctx, cancel := context.WithTimeout(cmd.Context(), statuslineTimeout)
 			defer cancel()
 
-			var groups []providerLine
+			var entries []providerEntry
 			for _, name := range parseProviderList(providerFlag) {
-				r, ok := ps[name]
-				if !ok {
-					continue
+				if entry, ok := ps[name]; ok {
+					entries = append(entries, entry)
 				}
-				var st *schema.State
-				if name == schema.ProviderClaude {
-					st = r.ResolveStdin(ctx, stdinSnap)
-				} else {
-					st = r.ResolveDetached(ctx)
-				}
-				groups = append(groups, providerLine{name: name, state: st})
+			}
+			states := resolveEach(entries, func(e providerEntry) *schema.State { return e.resolveStatusline(ctx, stdinDoc, now) })
+			groups := make([]providerLine, len(entries))
+			for i, e := range entries {
+				groups[i] = providerLine{name: e.spec.Name, state: states[i]}
 			}
 
 			fmt.Fprintln(out, formatStatuslineGroups(groups, now, colored))
@@ -103,18 +91,15 @@ type providerLine struct {
 	state *schema.State
 }
 
-func formatStatusline(st *schema.State, now time.Time, colored bool) string {
-	return formatStatuslineGroups([]providerLine{{name: schema.ProviderClaude, state: st}}, now, colored)
-}
-
 func formatStatuslineGroups(groups []providerLine, now time.Time, colored bool) string {
+	tagged := len(groups) > 1
 	var rendered []string
 	for _, g := range groups {
 		line, ok := statuslineGroup(g.state, now, colored)
 		if !ok {
 			continue
 		}
-		if g.name != schema.ProviderClaude {
+		if tagged && g.name != schema.ProviderClaude {
 			line = paint(g.name, ansiGray, colored) + " " + line
 		}
 		rendered = append(rendered, line)
@@ -154,11 +139,14 @@ func statuslineGroup(st *schema.State, now time.Time, colored bool) (string, boo
 	}
 
 	if len(parts) == 0 {
+		if st.Auth == schema.AuthNoPlan {
+			return paint("no plan", ansiGray, colored), true
+		}
 		if authBroken {
 			return paint("⚠ login", ansiYellow, colored), true
 		}
-		if lh := st.LimitHit; lh != nil {
-			if lh.ResetsAt != nil && lh.ResetsAt.After(now) {
+		if lh := st.LimitHit; lh.Active(now) {
+			if lh.ResetsAt != nil {
 				return paint("⛔ ↻ "+humanizeDuration(lh.ResetsAt.Sub(now)), ansiRed, colored), true
 			}
 			return paint("⛔ limit", ansiRed, colored), true
@@ -190,10 +178,6 @@ func statusSegment(icon, label string, w *schema.Window, now time.Time, colored 
 	return head + " " + seg
 }
 
-type statuslineInput struct {
-	RateLimits json.RawMessage `json:"rate_limits"`
-}
-
 func isTerminal(r io.Reader) bool {
 	f, ok := r.(*os.File)
 	if !ok {
@@ -206,113 +190,13 @@ func isTerminal(r io.Reader) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-func readStatuslineInput(r io.Reader) (statuslineInput, error) {
-	var in statuslineInput
-	if r == nil {
-		return in, nil
-	}
-	data, err := io.ReadAll(io.LimitReader(r, maxStdinBytes))
-	if err != nil {
-		return in, err
-	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return in, nil
-	}
-	_ = json.Unmarshal(data, &in)
-	return in, nil
-}
-
-type rlWindow struct {
-	used     float64
-	hasUsed  bool
-	resetsAt time.Time
-}
-
-func (w *rlWindow) UnmarshalJSON(b []byte) error {
-	var raw struct {
-		UsedPercentage *float64        `json:"used_percentage"`
-		Utilization    *float64        `json:"utilization"`
-		ResetsAt       json.RawMessage `json:"resets_at"`
-	}
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return err
-	}
-	switch {
-	case raw.UsedPercentage != nil:
-		w.used, w.hasUsed = *raw.UsedPercentage, true
-	case raw.Utilization != nil:
-		w.used, w.hasUsed = *raw.Utilization, true
-	}
-	w.resetsAt = usage.ParseTolerantTime(raw.ResetsAt)
-	return nil
-}
-
-func (w *rlWindow) toUsage() *schema.Window {
-	if w == nil || !w.hasUsed {
+func readStdinDocument(r io.Reader) []byte {
+	if r == nil || isTerminal(r) {
 		return nil
 	}
-	return &schema.Window{
-		Utilization: w.used,
-		ResetsAt:    w.resetsAt,
+	data, err := io.ReadAll(io.LimitReader(r, maxStdinBytes))
+	if err != nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil
 	}
-}
-
-type rlScoped struct {
-	DisplayName string          `json:"display_name"`
-	Utilization *float64        `json:"utilization"`
-	ResetsAt    json.RawMessage `json:"resets_at"`
-}
-
-func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*schema.Snapshot, bool) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, false
-	}
-	var obj struct {
-		FiveHour     *rlWindow  `json:"five_hour"`
-		SevenDay     *rlWindow  `json:"seven_day"`
-		SevenDayOpus *rlWindow  `json:"seven_day_opus"`
-		ModelScoped  []rlScoped `json:"model_scoped"`
-	}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, false
-	}
-
-	snap := &schema.Snapshot{FetchedAt: now}
-	n := 0
-	if w := obj.FiveHour.toUsage(); w != nil {
-		snap.FiveHour = w
-		n++
-	}
-	if w := obj.SevenDay.toUsage(); w != nil {
-		snap.SevenDay = w
-		n++
-	}
-	var scoped map[string]*schema.Window
-	for _, ms := range obj.ModelScoped {
-		if ms.DisplayName == "" || ms.Utilization == nil {
-			continue
-		}
-		if scoped == nil {
-			scoped = make(map[string]*schema.Window, len(obj.ModelScoped))
-		}
-		scoped[ms.DisplayName] = &schema.Window{
-			Utilization: *ms.Utilization,
-			ResetsAt:    usage.ParseTolerantTime(ms.ResetsAt),
-		}
-		n++
-	}
-	if w := obj.SevenDayOpus.toUsage(); w != nil {
-		if _, ok := scoped["Opus"]; !ok {
-			if scoped == nil {
-				scoped = make(map[string]*schema.Window, 1)
-			}
-			scoped["Opus"] = w
-			n++
-		}
-	}
-	snap.ScopedLimits = scoped
-	if n == 0 {
-		return nil, false
-	}
-	return snap, true
+	return data
 }

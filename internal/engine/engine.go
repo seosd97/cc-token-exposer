@@ -7,16 +7,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/seosd97/cc-token-exposer/internal/creds"
+	"github.com/seosd97/cc-token-exposer/internal/provider"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
-	"github.com/seosd97/cc-token-exposer/internal/usage"
 )
 
 const DefaultTTL = 120 * time.Second
 
-const stdinRefreshTimeout = 5 * time.Second
-
-var ErrNoCache = errors.New("engine: no cached snapshot")
+const syncFallbackTimeout = 5 * time.Second
 
 type Clock interface{ Now() time.Time }
 
@@ -24,277 +21,248 @@ type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now().UTC() }
 
-type Provider struct {
-	Name         string
-	LoginCommand string
-}
-
-var ClaudeProvider = Provider{Name: schema.ProviderClaude, LoginCommand: "claude"}
-
-type CredResolver interface {
-	Resolve() (*creds.Credentials, error)
-}
-
-type Fetcher interface {
-	Fetch(ctx context.Context, cr *creds.Credentials) (*usage.FetchedSnapshot, error)
-}
-
 type CacheEntry struct {
 	Payload      []byte
 	StoredAt     time.Time
 	AttemptedAt  time.Time
 	ScopedProbed bool
 	Drift        []string
+	LimitHit     *schema.LimitHit
 }
 
 type Cache interface {
 	Load() (*CacheEntry, error)
 	Store(e CacheEntry) error
 	ClaimRefresh(now time.Time, backoff time.Duration) (bool, error)
+	StoreLimitHit(lh *schema.LimitHit) error
 }
 
 type Refresher interface {
 	Spawn(ctx context.Context) error
 }
 
-type TranscriptProbe interface {
-	Probe(now time.Time) (*schema.LimitHit, error)
-}
-
 type Options struct {
-	Provider   Provider
-	Creds      CredResolver
-	Fetcher    Fetcher
-	Cache      Cache
-	Transcript TranscriptProbe
-	Refresher  Refresher
-	Clock      Clock
-	TTL        time.Duration
+	Spec      provider.Spec
+	Cache     Cache
+	Refresher Refresher
+	Clock     Clock
+	TTL       time.Duration
 }
 
 type Engine struct {
-	provider   Provider
-	creds      CredResolver
-	fetcher    Fetcher
-	cache      Cache
-	transcript TranscriptProbe
-	refresher  Refresher
-	clock      Clock
-	ttl        time.Duration
+	spec      provider.Spec
+	cache     Cache
+	refresher Refresher
+	clock     Clock
+	ttl       time.Duration
 }
 
 func New(o Options) *Engine {
-	clock := o.Clock
-	if clock == nil {
-		clock = realClock{}
+	e := &Engine{spec: o.Spec, cache: o.Cache, refresher: o.Refresher, clock: o.Clock, ttl: o.TTL}
+	if e.clock == nil {
+		e.clock = realClock{}
 	}
-	ttl := o.TTL
-	if ttl <= 0 {
-		ttl = DefaultTTL
+	if e.ttl <= 0 {
+		e.ttl = DefaultTTL
 	}
-	provider := o.Provider
-	if provider.Name == "" {
-		provider = ClaudeProvider
-	}
-	if provider.LoginCommand == "" {
-		provider.LoginCommand = provider.Name
-	}
-	return &Engine{
-		provider:   provider,
-		creds:      o.Creds,
-		fetcher:    o.Fetcher,
-		cache:      o.Cache,
-		transcript: o.Transcript,
-		refresher:  o.Refresher,
-		clock:      clock,
-		ttl:        ttl,
-	}
+	return e
 }
 
 func (e *Engine) Resolve(ctx context.Context) *schema.State {
-	return e.tag(e.resolve(ctx))
+	return e.tag(e.resolve(ctx, inlineRefresh))
+}
+
+func (e *Engine) ResolveDetached(ctx context.Context) *schema.State {
+	return e.tag(e.resolve(ctx, detachedRefresh))
 }
 
 func (e *Engine) ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State {
 	return e.tag(e.resolveStdin(ctx, stdin))
 }
 
-func (e *Engine) ResolveDetached(ctx context.Context) *schema.State {
-	return e.tag(e.resolveDetached(ctx))
-}
-
 func (e *Engine) tag(st *schema.State) *schema.State {
-	st.Provider = e.provider.Name
+	st.Provider = e.spec.Name
 	return st
 }
 
-func (e *Engine) resolve(ctx context.Context) *schema.State {
-	now := e.clock.Now()
-	cachedSnap, meta, haveCache := e.loadCache()
+type refreshMode int
 
-	if st := e.freshCacheState(now, cachedSnap, meta, haveCache); st != nil {
-		return st
-	}
+const (
+	inlineRefresh refreshMode = iota
+	detachedRefresh
+)
 
-	cr, auth, cerr := e.resolveToken(now)
-	if cr == nil {
-		return e.degradeAuth(now, auth, credsReason(cerr), cachedSnap, meta, haveCache)
+func (m refreshMode) noDataMessage() string {
+	if m == detachedRefresh {
+		return "usage refresh in progress; no cache yet"
 	}
-
-	snap, ferr := e.fetchWithToken(ctx, cr, now)
-	if ferr == nil {
-		merged := usage.Reconcile(cachedSnap, snap.Snapshot, now)
-		e.storeCache(merged, snap.ScopedProbed, snap.Drift)
-		st := snapshotState(merged, schema.SourceOAuth, false, 0, schema.AuthOK)
-		st.Drift = snap.Drift
-		return st
-	}
-
-	if errors.Is(ferr, usage.ErrAuth) {
-		return e.degradeAuth(now, schema.AuthExpired, "", cachedSnap, meta, haveCache)
-	}
-
-	if haveCache {
-		return staleCacheState(now, cachedSnap, meta, schema.AuthOK)
-	}
-	return e.degradeNoData(now, schema.AuthOK, "usage fetch failed and no cache is available")
+	return "usage fetch failed and no cache is available"
 }
 
-func (e *Engine) resolveDetached(ctx context.Context) *schema.State {
+func (e *Engine) resolve(ctx context.Context, mode refreshMode) *schema.State {
 	now := e.clock.Now()
-	cachedSnap, meta, haveCache := e.loadCache()
-
-	if st := e.freshCacheState(now, cachedSnap, meta, haveCache); st != nil {
+	cached, meta, haveCache := e.loadCache()
+	if st := e.freshCacheState(now, cached, meta, haveCache); st != nil {
 		return st
 	}
 
 	cr, auth, cerr := e.resolveToken(now)
 	if cr == nil {
-		return e.degradeAuth(now, auth, credsReason(cerr), cachedSnap, meta, haveCache)
+		if reason, ok := noPlanReason(cerr); ok {
+			return errorState(schema.AuthNoPlan, reason)
+		}
+		return e.degradeAuth(now, mode, auth, credsReason(cerr), cached, meta, haveCache)
 	}
 
-	if e.cache != nil && e.refresher != nil {
-		if claimed, err := e.cache.ClaimRefresh(now, e.ttl); err == nil && claimed {
-			if serr := e.refresher.Spawn(ctx); serr != nil {
-				if fresh, drift := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
-					st := snapshotState(fresh, schema.SourceOAuth, false, 0, schema.AuthOK)
-					st.Drift = drift
-					return st
-				}
-			}
+	fresh, drift, ferr := e.refresh(ctx, mode, now, cr, cached, meta)
+	if fresh != nil {
+		return freshState(fresh, schema.SourceOAuth, drift)
+	}
+	if errors.Is(ferr, provider.ErrAuth) {
+		return e.degradeAuth(now, mode, schema.AuthExpired, "", cached, meta, haveCache)
+	}
+	if haveCache {
+		return staleCacheState(now, cached, meta, schema.AuthOK)
+	}
+	return e.degradeNoData(now, mode, meta, mode.noDataMessage())
+}
+
+func (e *Engine) resolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State {
+	if stdin == nil {
+		return e.resolve(ctx, detachedRefresh)
+	}
+	now := e.clock.Now()
+	cached, meta, haveCache := e.loadCache()
+	dataStale := !haveCache || now.Sub(meta.StoredAt) >= e.ttl
+	if !stdinComplete(stdin, cached, meta.ScopedProbed, now) {
+		if fresh, _, _ := e.detachedRefresh(ctx, now, nil, cached, meta); fresh != nil {
+			cached, dataStale = fresh, false
 		}
 	}
-
-	if haveCache {
-		return staleCacheState(now, cachedSnap, meta, schema.AuthOK)
+	merged, usedCache := overlay(stdin, cached, now)
+	if usedCache && dataStale {
+		return staleState(merged, schema.SourceStdin, now.Sub(meta.StoredAt), schema.AuthOK, nil)
 	}
-	return e.degradeNoData(now, schema.AuthOK, "usage refresh in progress; no cache yet")
+	return freshState(merged, schema.SourceStdin, nil)
 }
 
-func (e *Engine) freshCacheState(now time.Time, cachedSnap *schema.Snapshot, meta CacheEntry, haveCache bool) *schema.State {
+func (e *Engine) refresh(ctx context.Context, mode refreshMode, now time.Time, cr *provider.Credentials, cached *schema.Snapshot, meta CacheEntry) (*schema.Snapshot, []string, error) {
+	if mode == inlineRefresh {
+		return e.fetchAndStore(ctx, now, cr, cached)
+	}
+	return e.detachedRefresh(ctx, now, cr, cached, meta)
+}
+
+func (e *Engine) detachedRefresh(ctx context.Context, now time.Time, cr *provider.Credentials, cached *schema.Snapshot, meta CacheEntry) (*schema.Snapshot, []string, error) {
+	if e.cache == nil || !e.refreshDue(now, meta) {
+		return nil, nil, nil
+	}
+	claimed, err := e.cache.ClaimRefresh(now, e.ttl)
+	if err != nil || !claimed {
+		return nil, nil, nil
+	}
+	if e.refresher != nil && e.refresher.Spawn(ctx) == nil {
+		return nil, nil, nil
+	}
+	return e.boundedRefresh(ctx, now, cr, cached)
+}
+
+func (e *Engine) refreshDue(now time.Time, meta CacheEntry) bool {
+	last := meta.StoredAt
+	if meta.AttemptedAt.After(last) {
+		last = meta.AttemptedAt
+	}
+	return last.IsZero() || now.Sub(last) >= e.ttl
+}
+
+func (e *Engine) boundedRefresh(ctx context.Context, now time.Time, cr *provider.Credentials, cached *schema.Snapshot) (*schema.Snapshot, []string, error) {
+	if cr == nil {
+		if cr, _, _ = e.resolveToken(now); cr == nil {
+			return nil, nil, nil
+		}
+	}
+	rctx, cancel := context.WithTimeout(ctx, syncFallbackTimeout)
+	defer cancel()
+	return e.fetchAndStore(rctx, now, cr, cached)
+}
+
+func (e *Engine) fetchAndStore(ctx context.Context, now time.Time, cr *provider.Credentials, cached *schema.Snapshot) (*schema.Snapshot, []string, error) {
+	snap, err := e.fetchWithToken(ctx, cr, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	merged := reconcile(cached, snap.Snapshot, now)
+	e.storeCache(merged, snap.ScopedProbed, snap.Drift)
+	return merged, snap.Drift, nil
+}
+
+func (e *Engine) freshCacheState(now time.Time, cached *schema.Snapshot, meta CacheEntry, haveCache bool) *schema.State {
 	if !haveCache {
 		return nil
 	}
 	if age := now.Sub(meta.StoredAt); age < 0 || age >= e.ttl {
 		return nil
 	}
-	st := snapshotState(cachedSnap, schema.SourceCache, false, 0, schema.AuthOK)
-	st.Drift = meta.Drift
-	return st
+	return freshState(cached, schema.SourceCache, meta.Drift)
 }
 
-func staleCacheState(now time.Time, cachedSnap *schema.Snapshot, meta CacheEntry, auth schema.AuthStatus) *schema.State {
-	st := snapshotState(cachedSnap, schema.SourceCache, true, now.Sub(meta.StoredAt), auth)
-	st.Drift = meta.Drift
-	return st
+func staleCacheState(now time.Time, cached *schema.Snapshot, meta CacheEntry, auth schema.AuthStatus) *schema.State {
+	return staleState(cached, schema.SourceCache, now.Sub(meta.StoredAt), auth, meta.Drift)
 }
 
-func (e *Engine) resolveToken(now time.Time) (*creds.Credentials, schema.AuthStatus, error) {
-	if e.creds == nil {
+func (e *Engine) resolveToken(now time.Time) (*provider.Credentials, schema.AuthStatus, error) {
+	if e.spec.Creds == nil {
 		return nil, schema.AuthMissing, nil
 	}
-	cr, err := e.creds.Resolve()
+	cr, err := e.spec.Creds.Resolve()
 	if err != nil || cr == nil || cr.AccessToken == "" {
 		return nil, schema.AuthMissing, err
 	}
 	if cr.Expired(now) {
-		if cr2, err := e.creds.Resolve(); err == nil && cr2 != nil && cr2.AccessToken != "" && !cr2.Expired(now) {
-			return cr2, schema.AuthOK, nil
-		}
 		return nil, schema.AuthExpired, nil
 	}
 	return cr, schema.AuthOK, nil
 }
 
 func credsReason(err error) string {
-	if err == nil || errors.Is(err, creds.ErrNotFound) || errors.Is(err, creds.ErrNotAvailable) {
+	if err == nil || errors.Is(err, provider.ErrNotFound) || errors.Is(err, provider.ErrNotAvailable) {
 		return ""
 	}
 	return err.Error()
 }
 
-func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now time.Time) (*usage.FetchedSnapshot, error) {
-	if e.fetcher == nil {
-		return nil, fmt.Errorf("%w: no fetcher configured", usage.ErrTransient)
+func noPlanReason(err error) (string, bool) {
+	var np *provider.NoPlanError
+	if errors.As(err, &np) {
+		return np.Reason, true
 	}
-	snap, err := e.fetcher.Fetch(ctx, cr)
-	if err == nil || !errors.Is(err, usage.ErrAuth) {
+	return "", false
+}
+
+func (e *Engine) fetchWithToken(ctx context.Context, cr *provider.Credentials, now time.Time) (*provider.FetchedSnapshot, error) {
+	if e.spec.Fetcher == nil {
+		return nil, fmt.Errorf("%w: no fetcher configured", provider.ErrTransient)
+	}
+	snap, err := e.spec.Fetcher.Fetch(ctx, cr)
+	if err == nil || !errors.Is(err, provider.ErrAuth) {
 		return snap, err
 	}
-	if cr2, err := e.creds.Resolve(); err == nil && cr2 != nil &&
-		cr2.AccessToken != "" && cr2.AccessToken != cr.AccessToken && !cr2.Expired(now) {
-		if snap2, err := e.fetcher.Fetch(ctx, cr2); err == nil {
-			return snap2, nil
-		}
+	rotated := e.rotatedCredentials(cr, now)
+	if rotated == nil {
+		return nil, err
 	}
-	return snap, err
+	return e.spec.Fetcher.Fetch(ctx, rotated)
 }
 
-func (e *Engine) resolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State {
-	if stdin == nil {
-		return e.resolve(ctx)
+func (e *Engine) rotatedCredentials(cr *provider.Credentials, now time.Time) *provider.Credentials {
+	if e.spec.Creds == nil {
+		return nil
 	}
-	now := e.clock.Now()
-	cachedSnap, meta, haveCache := e.loadCache()
-	dataStale := !haveCache || now.Sub(meta.StoredAt) >= e.ttl
-	if !stdinComplete(stdin, cachedSnap, meta.ScopedProbed, now) {
-		if e.cache != nil && e.refresher != nil {
-			if claimed, err := e.cache.ClaimRefresh(now, e.ttl); err == nil && claimed {
-				if serr := e.refresher.Spawn(ctx); serr != nil {
-					if fresh, _ := e.refreshSnapshot(ctx, now, cachedSnap); fresh != nil {
-						cachedSnap = fresh
-						dataStale = false
-					}
-				}
-			}
-		}
+	cr2, err := e.spec.Creds.Resolve()
+	if err != nil || cr2 == nil || cr2.AccessToken == "" || cr2.AccessToken == cr.AccessToken || cr2.Expired(now) {
+		return nil
 	}
-	merged, usedCache := usage.Overlay(stdin, cachedSnap)
-	stale := usedCache && dataStale
-	var age time.Duration
-	if stale {
-		age = now.Sub(meta.StoredAt)
-	}
-	return snapshotState(merged, schema.SourceStdin, stale, age, schema.AuthOK)
-}
-
-func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap *schema.Snapshot) (*schema.Snapshot, []string) {
-	if e.creds == nil || e.fetcher == nil {
-		return nil, nil
-	}
-	cr, _, _ := e.resolveToken(now)
-	if cr == nil {
-		return nil, nil
-	}
-	rctx, cancel := context.WithTimeout(ctx, stdinRefreshTimeout)
-	defer cancel()
-	snap, err := e.fetchWithToken(rctx, cr, now)
-	if err != nil {
-		return nil, nil
-	}
-	merged := usage.Reconcile(cachedSnap, snap.Snapshot, now)
-	e.storeCache(merged, snap.ScopedProbed, snap.Drift)
-	return merged, snap.Drift
+	return cr2
 }
 
 func stdinComplete(s, base *schema.Snapshot, probed bool, now time.Time) bool {
@@ -328,11 +296,11 @@ func coversWindow(stdinW, baseW *schema.Window, now time.Time) bool {
 	return stdinW != nil && stdinW.ResetsAt.After(now)
 }
 
-func (e *Engine) degradeAuth(now time.Time, auth schema.AuthStatus, reason string, cachedSnap *schema.Snapshot, meta CacheEntry, haveCache bool) *schema.State {
+func (e *Engine) degradeAuth(now time.Time, mode refreshMode, auth schema.AuthStatus, reason string, cached *schema.Snapshot, meta CacheEntry, haveCache bool) *schema.State {
 	if haveCache {
-		return staleCacheState(now, cachedSnap, meta, auth)
+		return staleCacheState(now, cached, meta, auth)
 	}
-	if lh := e.probeTranscript(now); lh != nil {
+	if lh := e.limitHit(now, mode, meta); lh != nil {
 		return transcriptState(lh, auth)
 	}
 	if reason == "" {
@@ -342,24 +310,46 @@ func (e *Engine) degradeAuth(now time.Time, auth schema.AuthStatus, reason strin
 }
 
 func (e *Engine) authMessage(auth schema.AuthStatus) string {
+	msg, verb := "no credentials found", "log in"
 	if auth == schema.AuthExpired {
-		return fmt.Sprintf("token expired; run `%s` to refresh it", e.provider.LoginCommand)
+		msg, verb = "token expired", "refresh it"
 	}
-	return fmt.Sprintf("no credentials found; run `%s` to log in", e.provider.LoginCommand)
+	if e.spec.LoginCommand == "" {
+		return msg
+	}
+	return fmt.Sprintf("%s; run `%s` to %s", msg, e.spec.LoginCommand, verb)
 }
 
-func (e *Engine) degradeNoData(now time.Time, auth schema.AuthStatus, msg string) *schema.State {
-	if lh := e.probeTranscript(now); lh != nil {
-		return transcriptState(lh, auth)
+func (e *Engine) degradeNoData(now time.Time, mode refreshMode, meta CacheEntry, msg string) *schema.State {
+	if lh := e.limitHit(now, mode, meta); lh != nil {
+		return transcriptState(lh, schema.AuthOK)
 	}
-	return errorState(auth, msg)
+	return errorState(schema.AuthOK, msg)
+}
+
+func (e *Engine) limitHit(now time.Time, mode refreshMode, meta CacheEntry) *schema.LimitHit {
+	if mode == detachedRefresh {
+		return activeLimitHit(meta.LimitHit, now)
+	}
+	lh := activeLimitHit(e.probeTranscript(now), now)
+	if e.cache != nil && (lh != nil || meta.LimitHit != nil) {
+		_ = e.cache.StoreLimitHit(lh)
+	}
+	return lh
+}
+
+func activeLimitHit(lh *schema.LimitHit, now time.Time) *schema.LimitHit {
+	if !lh.Active(now) {
+		return nil
+	}
+	return lh
 }
 
 func (e *Engine) probeTranscript(now time.Time) *schema.LimitHit {
-	if e.transcript == nil {
+	if e.spec.Transcript == nil {
 		return nil
 	}
-	lh, err := e.transcript.Probe(now)
+	lh, err := e.spec.Transcript.Probe(now)
 	if err != nil {
 		return nil
 	}
@@ -371,7 +361,7 @@ func (e *Engine) loadCache() (*schema.Snapshot, CacheEntry, bool) {
 		return nil, CacheEntry{}, false
 	}
 	entry, err := e.cache.Load()
-	if err != nil {
+	if err != nil || entry == nil {
 		return nil, CacheEntry{}, false
 	}
 	if len(entry.Payload) == 0 {

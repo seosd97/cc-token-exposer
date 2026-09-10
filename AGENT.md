@@ -37,9 +37,9 @@ housekeeping.**
   JSON line per provider (NDJSON) with `--json`.
 - `ccx statusline [--provider claude|codex|claude,codex]` — one-line output for
   the Claude Code statusline (registered via `~/.claude/settings.json` →
-  `statusLine.command`). One group per provider, joined by ` │ `; the claude
-  group is untagged (byte-identical to the single-provider output), other
-  groups carry a gray provider tag.
+  `statusLine.command`). One group per provider, joined by ` │ `. A single
+  configured provider renders untagged whichever it is; with several, the
+  claude group stays untagged and the others carry a gray provider tag.
 - `ccx refresh --provider <name>` (hidden) — the detached refresher entry
   point; flag-less `refresh` means claude.
 - `ccx version` — print the injected build version
@@ -61,35 +61,189 @@ threshold notifications (`internal/notify`), history logging
 
 ```
 cmd/ccx/main.go      composition root: builds ONE production engine per
-                     provider (claude, codex) and hands commands a
-                     `providers` map (name -> `resolver` interface: Resolve /
-                     ResolveStdin / ResolveDetached); also composes the
-                     processRefresher (detached `ccx refresh --provider <name>`
-                     spawner) and the embedded release-signature public key
+                     provider from the provider Specs (claude.Spec(),
+                     codex.Spec()) and hands commands a `providers` registry
+                     (name -> providerEntry{spec, resolver}); the `resolver`
+                     interface is Resolve / ResolveStdin / ResolveDetached.
+                     Adding a provider is one more Spec in that list. Also
+                     hosts the embedded release-signature public key
+                     (signkey.go)
 cmd/ccx/providers.go the registry type, comma-list parsing (`--provider`,
-                     lower-cased, deduped, empty -> claude) and lookup errors
+                     lower-cased, deduped, empty -> claude), lookup errors and
+                     the statusline routing rule: a Spec with ParseStdin is
+                     served via ResolveStdin (with the parsed snapshot, or nil
+                     when stdin carried nothing usable), any other Spec via
+                     ResolveDetached
+cmd/ccx/cacheadapter.go  adapts internal/cache to the engine's Cache port
+                     (a cache miss is a nil entry, not an error) and names
+                     the per-provider cache file (`snapshot.json` stays
+                     claude's for backward compat, `<name>.json` otherwise)
 cmd/ccx/now.go       rendering + exit-code policy; resolves the selected
                      providers in parallel, prints blocks or NDJSON
-cmd/ccx/statusline.go  statusline formatting + stdin rate_limits parsing
-                     (rate_limits -> schema.Snapshot -> engine.ResolveStdin).
-                     Stdin is read only when it is not a terminal, so a manual
-                     run never blocks. Colors are alert-only: none below 60%,
-                     muted yellow from 60%, muted red above 85%; a stale line
-                     renders all gray; NO_COLOR yields plain text. Provider
-                     groups: stdin rate_limits describe the Claude plan, so
-                     only the claude group goes through ResolveStdin; every
-                     other provider is served via ResolveDetached. Groups are
-                     joined by " │ ", non-claude groups get a gray name tag,
-                     ≈ / ⚠ login markers are per group, empty groups are
-                     dropped, unknown names are skipped (never non-zero), and
-                     "⚠ ccx" appears only when every group is empty.
+cmd/ccx/statusline.go  statusline formatting + raw stdin read. Stdin is read
+                     only when it is not a terminal, so a manual run never
+                     blocks; the raw document is handed to each Spec's
+                     ParseStdin (Claude wire knowledge lives in the provider
+                     package, not here). Providers are resolved concurrently,
+                     as `now` does, so a worst-case pair of sync fallbacks
+                     costs one 5s budget. Colors are alert-only: none below
+                     60%, muted yellow from 60%, muted red above 85%; a stale
+                     line renders all gray; NO_COLOR yields plain text.
+                     Groups are joined by " │ "; when more than one provider
+                     is configured the non-claude groups get a gray name tag
+                     (keyed off the configured list, not the rendered
+                     groups, so a group that drops out for a tick never makes
+                     the tag flicker), a single provider is never tagged,
+                     ≈ / ⚠ login markers are per group, a no-plan group
+                     (`auth: "no_plan"`) renders as a gray "no plan" marker
+                     so `--provider codex` alone stays meaningful on an
+                     API-key account, empty groups are dropped, unknown names
+                     are skipped (never non-zero), and "⚠ ccx" appears only
+                     when every group is empty.
 cmd/ccx/refresh.go   hidden `ccx refresh --provider <name>` (internal): runs
                      that provider's ladder once, discards the State — the
-                     detached statusline refresher
+                     detached statusline refresher. refresh_unix.go holds
+                     processRefresher, the detached child spawner (an empty
+                     provider name is a spawn error, never a silent Claude
+                     refresh)
 cmd/ccx/update.go    self-update command (thin) over internal/selfupdate
 cmd/ccx-sign/        release-time checksums signer (stdlib ed25519); never
                      shipped (goreleaser builds only ./cmd/ccx)
 internal/
+  schema/      The wire contract (State, schema_version=1). Leaf package,
+               imports nothing internal. The PUBLIC CONTRACT is the JSON
+               emitted by `now --json`, not the Go types (internal/ blocks
+               external import by design). Snapshot is the ONE snapshot type
+               end-to-end: the provider decoders produce it and engine
+               carries it unmodified. The legacy seven_day_opus/fable compat
+               aliases are NOT struct fields — Snapshot.MarshalJSON injects
+               them from ScopedLimits at serialize time (new models stay
+               under scoped_limits only).
+  provider/    The contract between a provider and the engine; imports only
+               schema. Holds every type a provider produces or consumes:
+               Credentials (AccessToken, AccountID, ExpiresAt; String()
+               redacts) + Source + Resolver (the credential chain: a
+               source's own error other than ErrNotFound/ErrNotAvailable
+               surfaces verbatim as the auth-missing reason) + NoPlanError
+               (a source's verdict that the account has no plan windows,
+               e.g. a Codex API-key login: the engine serves it as an
+               `auth: "no_plan"` error State carrying the reason, never as
+               a login hint),
+               FetchedSnapshot{Snapshot, ScopedProbed, Drift}, the error
+               family every client returns (ErrAuth / RateLimitError /
+               ErrTransient), the shared wire helpers ParseTolerantTime
+               (RFC3339 | epoch s | epoch ms) and ParseRetryAfter, the
+               provider-side ports (CredResolver / Fetcher /
+               TranscriptProbe / StdinParser) and Spec{Name, LoginCommand,
+               Creds, Fetcher, Transcript, ParseStdin} — one value per
+               provider, built by the provider package, consumed by
+               engine.New (name stamp + login hints + ports) and by the CLI
+               (ParseStdin routing).
+  provider/claude/  Everything Claude-specific, exported as Spec(). The
+               oauth/usage HTTP Client: Fetch returns
+               provider.FetchedSnapshot; decode is the only Claude producer
+               that sets ScopedProbed=true (marks "the API answered about
+               scoped limits"), which the engine uses to judge stdin
+               completeness. decode also records wire-drift indicators in
+               Drift when the response shape deviates from what the
+               pipeline expects (empty payload; a top-level window or active
+               scoped entry missing resets_at; a top-level window or a
+               model-scoped entry whose utilization/percent is null, which
+               is dropped as unknown rather than read as 0 — a null percent
+               on an entry marked is_active: false is dropped without an
+               indicator; a model-scoped entry missing display_name; a model-scoped entry under an
+               unknown kind, which still surfaces but never overrides a
+               weekly_scoped entry of the same display_name). Indicators
+               never block decoding — data whose meaning is known still
+               surfaces — and the engine carries them onto State.drift and persists
+               them in the cache entry, so a silent endpoint format change is
+               detectable in `now` output and `--json` instead of degrading
+               into wrong numbers. The statusline deliberately does NOT
+               render drift markers (it mirrors Claude Code's own values,
+               same rule as the suspect guard). The credential sources:
+               file > macOS keychain shell-out, chained by
+               DefaultCredentials(). The statusline stdin parser
+               ParseStatuslineStdin (rate_limits -> schema.Snapshot; the
+               Spec's ParseStdin) — tolerant: `used_percentage` or
+               `utilization`; resets_at as ISO or epoch; `model_scoped`
+               keyed by `display_name`; `utilization: null` entries dropped
+               (unknown ≠ 0); `seven_day_opus` backfills Opus only.
+               live_test.go is the env-gated smoke (`CCX_LIVE_TOKEN`).
+  provider/codex/  The Codex provider, exported as Spec() (no Transcript, no
+               ParseStdin — stdin rate_limits describe the Claude plan):
+               AuthSource (provider.Source over `~/.codex/auth.json`,
+               CODEX_HOME honored; an API-key login yields NoPlanError)
+               and Client (provider.Fetcher over
+               `/wham/usage`). Decode maps windows by length, lifts
+               per-model buckets into ScopedLimits and records drift
+               indicators; testdata/ holds a redacted live capture that pins
+               the decode as a golden test; live_test.go is the env-gated
+               smoke (`CCX_LIVE_CODEX_TOKEN` + `CCX_LIVE_CODEX_ACCOUNT`).
+  engine/      THE BRAIN. Resolve(ctx), ResolveStdin(ctx, snap) and
+               ResolveDetached(ctx) -> *schema.State. One `resolve(ctx,
+               mode)` runs the degrade ladder with its refresh step in one of
+               two modes: inline (fetch on this call — `now` and the refresh
+               child) or detached (`detachedRefresh`: claim a slot, spawn the
+               refresher, and only if the spawn fails — a nil Refresher
+               counts as a failed spawn — fall back to one bounded
+               synchronous fetch whose own error, a 401 included, feeds the
+               ladder exactly like an inline fetch; the claim is skipped
+               outright when the entry just loaded shows a fetch or attempt
+               within the TTL, so denied ticks take no lock). ResolveStdin
+               is overlay plus the
+               same detachedRefresh when stdin is incomplete; a nil stdin
+               delegates to the detached ladder, so a statusline tick never
+               fetches inline. The snapshot policies live
+               here too: reconcile (the ≥30pt-drop suspect guard) and
+               overlay (stdin-over-cache merge), both unexported — the
+               engine is their only consumer. Consumes a provider.Spec for
+               the provider-side ports (an unnamed Spec leaves `provider`
+               empty and makes login hints command-less; production always
+               passes a named Spec) and defines its own runtime ports: Cache
+               (Load returns a nil entry on a miss; StoreLimitHit persists
+               the transcript probe result) / Refresher / Clock. The
+               transcript probe runs ONLY on the inline ladder (`now`, the
+               refresh child); the detached ladder serves the persisted
+               `limit_hit` instead, so a statusline tick never walks the
+               transcript tree. Imports only provider and schema.
+  cache/       flock-protected, atomic-write disk cache of opaque JSON, one
+               file per provider (`snapshot.json` stays claude's for
+               backward compat; NewNamed(name) adds `<name>.json` beside it,
+               each with its own lock).
+               Entry = {fetched_at, attempted_at?, scoped_probed, drift?,
+               limit_hit?, payload}. DefaultPathFor falls back to
+               `os.TempDir()/cc-token-exposer-<uid>/` when the user cache
+               dir cannot be resolved, so cache-first holds even without
+               HOME.
+               Update(fn) is the locked read-modify-write primitive: it
+               takes the write flock, hands fn the current Entry (zero on a
+               miss or on an undecodable file), and writes it back only when
+               fn says so; ClaimRefresh and the limit-hit merge are thin
+               callers. Store replaces the entry wholesale under the same
+               lock without reading first, so it also repairs a corrupt
+               file. Every lock and load first Lstat's the cache directory
+               and refuses a symlink or a directory owned by another user
+               (ErrUnsafeDir), which closes the pre-created-/tmp attack on
+               the TempDir fallback. ClaimRefresh(now, backoff)
+               atomically claims a refresh slot (check-and-set of
+               attempted_at, keyed off the later of fetched_at/attempted_at),
+               returning whether the caller may spawn a refresher; a denied
+               claim costs no write. Load stat-checks the file before taking
+               the flock, so a cold start with no cache file is a miss
+               without locking; readEntryLocked/writeEntryLocked run only
+               under a held flock (the Locked suffix is the contract). An
+               entry that fails to decode is reported by Load as ErrCorrupt
+               and treated by Update as a miss, so the next Store or
+               ClaimRefresh rewrites the file instead of leaving the cache
+               broken; genuine read errors (permissions) still surface.
+  transcript/  last-resort fallback: parses limit-hit messages from
+               ~/.claude/projects/**/*.jsonl (read-only, best-effort).
+               FindTranscripts keeps only the k newest files via a bounded
+               heap; ScanLatest scans newest-first and stops once a file's
+               mtime can no longer hold a newer hit; ScanFile reads the last
+               512KB first, falling back to a full scan. Hits whose reset has
+               already passed are discarded. Wired in as claude.Spec()'s
+               Transcript.
   selfupdate/  GitHub-release self-update: Latest (releases/latest) ->
                FetchAsset -> VerifySignedChecksums (checksums.txt.sig is an
                ed25519 signature over checksums.txt by the embedded public
@@ -98,90 +252,21 @@ internal/
                only; injectable http client + apiBase + platform for tests.
                Archive names follow goreleaser's `ccx_<os>_<arch>.tar.gz`
                template; checksums.txt lines are `<sha256>  <name>`.
-  engine/      THE BRAIN. Resolve(ctx), ResolveStdin(ctx, snap) and
-               ResolveDetached(ctx) -> *schema.State, runs the degrade ladder.
-               Depends only on 6 consumer-side interfaces it defines:
-               CredResolver / Fetcher / Cache / TranscriptProbe / Clock /
-               Refresher. Fetcher receives the whole *creds.Credentials
-               (token + optional AccountID) so a provider can send tenant
-               headers. Options.Provider{Name, LoginCommand} (default:
-               ClaudeProvider) stamps every emitted State with `provider`
-               and builds the login hints ("run `codex login` to log in").
-  schema/      The wire contract (State, schema_version=1). Leaf package,
-               imports nothing internal. The PUBLIC CONTRACT is the JSON
-               emitted by `now --json`, not the Go types (internal/ blocks
-               external import by design). Snapshot is the ONE snapshot type
-               end-to-end: usage decodes straight into it and engine carries
-               it unmodified. The legacy seven_day_opus/fable compat aliases
-               are NOT struct fields — Snapshot.MarshalJSON injects them from
-               ScopedLimits at serialize time (new models stay under
-               scoped_limits only).
-  usage/       oauth/usage HTTP client (Claude) + Reconcile consistency
-               guard + Overlay gap-fill merge + the shared wire helpers
-               ParseTolerantTime (RFC3339 | epoch s | epoch ms) and
-               ParseRetryAfter, plus the error types (ErrAuth /
-               RateLimitError / ErrTransient) every provider client returns.
-               Produces/operates on schema.Snapshot
-               directly (no duplicated window types). Fetch returns
-               usage.FetchedSnapshot{Snapshot, ScopedProbed, Drift}; decode is
-               the only producer that sets ScopedProbed=true (marks "the API
-               answered about scoped limits"), which the engine uses to judge
-               stdin completeness. decode also records wire-drift indicators
-               in Drift when the response shape deviates from what the
-               pipeline expects (empty payload; a top-level window or active
-               scoped entry missing resets_at; a model-scoped entry missing
-               display_name; a model-scoped entry under an unknown kind).
-               Indicators never block decoding — usable data still surfaces —
-               and the engine carries them onto State.drift and persists them
-               in the cache entry, so a silent endpoint format change is
-               detectable in `now` output and `--json` instead of degrading
-               into wrong numbers. The statusline deliberately does NOT
-               render drift markers (it mirrors Claude Code's own values,
-               same rule as the suspect guard); the marker is visible on the
-               ladder path.
-  codex/       the Codex provider: AuthSource (creds.Source over
-               `~/.codex/auth.json`, CODEX_HOME honored) and Client
-               (engine.Fetcher over `/wham/usage`). Decode maps windows by
-               length, lifts per-model buckets into ScopedLimits and records
-               drift indicators; testdata/ holds a redacted live capture that
-               pins the decode as a golden test; live_test.go is the env-gated
-               smoke (`CCX_LIVE_CODEX_TOKEN` + `CCX_LIVE_CODEX_ACCOUNT`).
-  creds/       credential acquisition for Claude: file > macOS keychain
-               shell-out. Also the shared Credentials type (AccessToken,
-               AccountID, ExpiresAt) and Resolver chain every provider uses;
-               a source's own error (other than ErrNotFound/ErrNotAvailable)
-               surfaces verbatim as the auth-missing reason.
-  cache/       flock-protected, atomic-write disk cache of opaque JSON, one
-               file per provider (`snapshot.json` stays claude's for
-               backward compat; NewNamed(name) adds `<name>.json` beside it,
-               each with its own lock).
-               Entry = {fetched_at, attempted_at?, scoped_probed, drift?,
-               payload}.
-               ClaimRefresh(now, backoff) atomically claims a refresh slot
-               (check-and-set of attempted_at under the write lock, keyed off
-               the later of fetched_at/attempted_at), returning whether the
-               caller may spawn a refresher. Load stat-checks the file before
-               taking the flock, so a cold start with no cache file is a miss
-               without locking; readEntryLocked/writeEntryLocked run only
-               under a held flock (the Locked suffix is the contract).
-  transcript/  last-resort fallback: parses limit-hit messages from
-               ~/.claude/projects/**/*.jsonl (read-only, best-effort).
-               FindTranscripts keeps only the k newest files via a bounded
-               heap; ScanLatest scans newest-first and stops once a file's
-               mtime can no longer hold a newer hit; ScanFile reads the last
-               512KB first, falling back to a full scan. Hits whose reset has
-               already passed are discarded.
 ```
 
 Engine's degrade ladder (Resolve never fails — it always returns a State
 carrying the best known truth plus its freshness):
 
 1. Cache fresh (within TTL 120s) → serve from disk, zero API calls.
-2. Live fetch OK → `usage.Reconcile(prev, fresh)` → store cache → serve.
+2. Live fetch OK → `engine.reconcile(prev, fresh)` → store cache → serve.
 3. 429 / 5xx / network → serve stale cache (`stale: true`, `stale_age`).
-4. 401 → re-read credentials once, retry once if the token changed;
-   otherwise `auth: "expired"` (still with stale data if available).
-5. No cache at all → transcript limit-hit probe → else error State.
+4. 401 → re-read credentials once, retry once if the token changed and
+   serve the retry's own outcome (a transient failure on the retry is
+   step 3, not an expired token); otherwise `auth: "expired"` (still with
+   stale data if available).
+5. No cache at all → transcript limit-hit probe (inline ladder only; the
+   detached ladder reads the persisted `limit_hit` instead) → else error
+   State.
 
 ResolveDetached (statusline, providers without a stdin projection) is the
 ladder with the synchronous fetch replaced by the detached refresh: a fresh
@@ -200,11 +285,11 @@ refresh exists to HEAL GAPS in what is served, never to keep the cache warm —
 a cached window refreshes only when the served line depends on it and stdin
 does not carry it.
 
-1. parse   `rate_limits` → `usage.Snapshot` (tolerant: `used_percentage` or
+1. parse   `rate_limits` → `schema.Snapshot` (tolerant: `used_percentage` or
            `utilization`; resets_at as ISO or epoch; `model_scoped` keyed by
            `display_name`; `utilization: null` entries dropped — unknown ≠ 0;
            `seven_day_opus` backfills Opus only). No usable window → nil → the
-           ladder handles the tick.
+           detached ladder handles the tick (never an inline fetch).
  2. gate    a refresh runs only when BOTH hold: (a) no attempt within the TTL —
             keyed off the *later* of the cache's `fetched_at` and
             `attempted_at`, NOT data staleness; and (b) stdin is incomplete.
@@ -217,7 +302,7 @@ does not carry it.
             from stdin — or any cached window whose reset stdin doesn't carry
             forward — is a gap that re-opens the ≤1/TTL refresh. No
             cache at all, or only a snapshot never produced by an API decode
-            (`usage.Snapshot.ScopedProbed` — set only by `usage.decode`), is
+            (`provider.FetchedSnapshot.ScopedProbed` — set only by the provider decoders), is
             also incomplete: the first tick bootstraps one seeded refresh that
             establishes the reference set. A plan proven scoped-less
             (`ScopedProbed`, no scoped keys) — or proven without a given
@@ -228,7 +313,7 @@ does not carry it.
             flock, keyed off the later of fetched_at/attempted_at). On success
             `Refresher.Spawn` starts a detached `ccx refresh` subprocess
             (Setsid, stdio to /dev/null) that runs the ladder
-            (resolveToken → fetchWithToken → Reconcile → storeCache) and exits;
+            (resolveToken → fetchWithToken → reconcile → storeCache) and exits;
             the parent serves the overlay immediately — the statusline path
             never blocks on the network. A spawn failure falls back to one
             bounded synchronous refresh (5s budget). Because the claim is atomic,
@@ -236,12 +321,21 @@ does not carry it.
             refresh inside the child still counts as an attempt (the claim
             already stamped attempted_at), so a persistently failing endpoint
             yields ≤1 spawn per TTL instead of one per tick.
- 4. serve   `usage.Overlay(stdin, cache)` — per window stdin's utilization
-            wins, gaps fill from cache; within one window the LATER reset time
-            wins (reset boundaries only move forward between cycles), so a
-            stdin window with a zero/missing or elapsed `resets_at` borrows
-            the cache's still-future reset and keeps its countdown. Borrowed
-            data counts as a cache contribution for the `stale`/≈ marker.
+ 4. serve   `engine.overlay(stdin, cache, now)` — per window stdin's
+            utilization wins and gaps fill from cache, with two reset rules:
+            a stdin window with a zero/missing `resets_at` borrows the
+            cache's later, still-live reset and keeps its countdown, while a
+            stdin window whose `resets_at` has already ELAPSED belongs to a
+            closed cycle and yields wholesale (utilization included) to a
+            cache window whose reset is still in the future AND later by
+            more than the one-minute jitter tolerance — the healed value,
+            never a hybrid of old utilization and new countdown. Within the
+            tolerance the two resets describe the same boundary seen through
+            server-side jitter, so only the reset is borrowed. A later cache
+            reset against a still-live stdin reset is borrowed only, and a
+            cache reset that has itself elapsed is never borrowed. Borrowed
+            or substituted data counts as a cache contribution for the
+            `stale`/≈ marker.
             `ExtraUsage` always comes from the fresh side — served with
             `source: "stdin"`. The `stale`/≈ marker keys off data age
             (`fetched_at`), not attempt recency: while a detached refresh is in
@@ -259,8 +353,9 @@ does not carry it.
    Breaking this gets the user rate-limited (the endpoint 429s aggressively).
    The stdin rate_limits path keeps that cap: it does at most one bounded
    refresh per TTL, gated on the *later* of the cache's `fetched_at` and
-`attempted_at`. A failed refresh records its attempt (`Cache.Touch`) so a
-failing/429ing endpoint does NOT re-fetch on every statusline tick; a stdin
+`attempted_at`. The attempt is recorded by the atomic `Cache.ClaimRefresh`
+claim before the fetch runs, so a failing/429ing endpoint does NOT re-fetch
+on every statusline tick; a stdin
 snapshot covering every cache-known window means zero calls, while a
 cache-known scoped model missing from stdin (e.g. Fable) costs ≤1 call per
 TTL. A plan proven to have no scoped limits (`ScopedProbed`, no scoped keys)
@@ -281,10 +376,11 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
    e-mail (present in `auth.json` and in the `/wham/usage` response) are
    treated the same way: `Credentials.String()` omits AccountID, the golden
    fixture is redacted, and neither reaches the cache. The cache stores only
-   `{fetched_at, attempted_at?, scoped_probed, drift?, payload}` where
-   payload is a token-free usage snapshot, `attempted_at` is an optional
-   refresh-attempt timestamp, and `drift` is an optional list of wire-shape
-   anomaly indicators (never token material).
+   `{fetched_at, attempted_at?, scoped_probed, drift?, limit_hit?, payload}`
+   where payload is a token-free usage snapshot, `attempted_at` is an
+   optional refresh-attempt timestamp, `drift` is an optional list of
+   wire-shape anomaly indicators and `limit_hit` is the transcript probe's
+   last verdict (a reset time and a fixed message; never token material).
 3. **No self refresh.** Never run an OAuth refresh grant. Refresh tokens may
    rotate; consuming one can invalidate Claude Code's stored refresh token and
    break the user's login. On expiry: re-read `~/.claude/.credentials.json`
@@ -295,7 +391,10 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
 4. **Required request headers.** Claude: `Authorization: Bearer <token>`,
    `anthropic-beta: oauth-2025-04-20`, and `User-Agent: claude-code/<ver>`.
    Without the claude-code User-Agent the endpoint applies a far stricter
-   429 bucket. Codex: `Authorization: Bearer <access_token>`,
+   429 bucket. The `<ver>` constants (claude-code, codex_cli_rs) track the
+   last CLI version whose response shape was confirmed live; bump them
+   when recapturing. claude-code/2.1.217 was confirmed live on 2026-09-10
+   (`TestLiveSmoke`, no drift). Codex: `Authorization: Bearer <access_token>`,
    `ChatGPT-Account-Id: <account_id>`, `originator: codex_cli_rs`,
    `User-Agent: codex_cli_rs/<ver>`. The live check on 2026-09-10 returned
    200 without originator/User-Agent, so those two mirror Codex by
@@ -303,16 +402,22 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
    indistinguishable from the CLI it piggybacks on.
 5. **Never blank-screen.** Every failure degrades to "last known truth +
    freshness marker" (`≈` prefix for stale, `⚠ login` for auth, `⛔` for
-   limit-hit). statusline must never exit non-zero or print nothing.
+   limit-hit, `no plan` for a login without plan limits). statusline must
+   never exit non-zero or print nothing.
 6. **Wire stability.** `schema.State` (schema_version=1) is the public
    contract. Changes must be additive (new optional fields); breaking changes
    bump the version. `utilization` is float64 on the wire (the real API sends
    fractionals); round only at display time. `scoped_limits`
    (map[string]*Window) was added additively; `seven_day_opus` /
    `seven_day_fable` remain as aliases for backward compat. `source` gained
-   the additive value `"stdin"` (statusline rate_limits path). `drift`
+   the additive value `"stdin"` (statusline rate_limits path). `auth` gained
+   the additive value `"no_plan"` (credentials present, but the account has
+   no plan windows; the reason travels in `error`). `drift`
    (an optional `[]string` of wire-shape anomaly indicators) was added
    additively; it is omitted when the last live fetch matched expectations.
+   A window's `resets_at` is omitted (`omitzero`) when the reset time is
+   unknown instead of serializing a zero-date sentinel; consumers must
+   treat an absent `resets_at` as unknown.
 7. **Transcript files are read-only.** Never write under `~/.claude/` or
    `~/.codex/`.
 
@@ -325,7 +430,7 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
 - **Per-model weekly limits live in a newer `limits[]` array**, not in
   top-level fields. Each entry is `{kind, group, percent, resets_at, scope,
   is_active}`; scoped-model limits are `kind: "weekly_scoped"` keyed by
-  `scope.model.display_name` (e.g. "Opus", "Fable", "Sonnet"). `usage.decode`
+  `scope.model.display_name` (e.g. "Opus", "Fable", "Sonnet"). `claude.decode`
   lifts **all** `weekly_scoped` entries into `Snapshot.ScopedLimits`
   (`map[string]*Window`) dynamically — no model name is hardcoded. The legacy
   top-level `seven_day_opus` is used as a fallback when `limits[]` is absent
@@ -335,18 +440,21 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
   existing `--json` consumers; new models appear only in `scoped_limits`.
   As of 2026-07 the live response also sends `seven_day_sonnet`,
   `seven_day_cowork`, `seven_day_omelette` (all null) and several codename
-  fields (`tangelo`, `iguana_necktie`, etc.) — all ignored.
+  fields (`tangelo`, `iguana_necktie`, etc.) — all ignored. As of
+  2026-09-10 `limits[]` carried only the active scoped model (Fable):
+  inactive models are absent from the array, not null-percent entries, and
+  `extra_usage` was an empty object.
 - Token location: `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`,
   `expiresAt` epoch-ms); some machines store it in the macOS Keychain item
   "Claude Code-credentials" instead (creds falls back to `security` CLI).
 - Known server bug (anthropic/claude-code#52497): the weekly counter can drop
-  implausibly mid-cycle. `usage.Reconcile` keeps the previous value and sets
+  implausibly mid-cycle. `engine.reconcile` keeps the previous value and sets
   `suspect: true` when utilization falls ≥30 points within an unchanged
   reset cycle.
 - statusline stdin: Claude Code pipes session JSON. A `rate_limits` field
   appears intermittently across versions (#40094); when present it is parsed
   tolerantly (`used_percentage` or `utilization`; resets_at as ISO string or
-  epoch seconds, or milliseconds when large) into a usage.Snapshot and fed
+  epoch seconds, or milliseconds when large) into a schema.Snapshot and fed
   to `engine.ResolveStdin`. Never depend on it. Confirmed shape (CC
   2.1.217): `five_hour` / `seven_day` /
   `seven_day_oauth_apps` / `seven_day_opus` / `seven_day_sonnet` windows,
@@ -363,7 +471,7 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
   **unofficial**, the call behind Codex CLI's `/status` and `/usage` (the
   base URL is Codex's `chatgpt_base_url` default; ccx hardcodes it). Shape
   confirmed live on 2026-09-10 (codex-cli 0.153.4, pro plan) and pinned by
-  `internal/codex/testdata/usage_2026-09-10.json`:
+  `internal/provider/codex/testdata/usage_2026-09-10.json`:
   `rate_limit: {allowed, limit_reached, primary_window, secondary_window}`
   where a window is `{used_percent, limit_window_seconds,
   reset_after_seconds, reset_at (epoch s)}`; `additional_rate_limits[]` of
@@ -393,9 +501,11 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
   whose `https://api.openai.com/auth.chatgpt_account_id` claim backs up a
   missing `tokens.account_id`; the id_token expires hourly and is ignored.
   `auth_mode: "apikey"` (or an API key without tokens) means Codex is on
-  usage-based billing with no plan windows — surfaced verbatim as the
-  auth-missing reason ("codex: logged in with an API key; plan limits do not
-  apply") instead of a misleading login hint.
+  usage-based billing with no plan windows — surfaced as a
+  `provider.NoPlanError` ("codex: logged in with an API key; plan limits do
+  not apply"): `now` prints it as an error State with `auth: "no_plan"`
+  (exit 1) and the statusline renders a gray `codex no plan` marker, instead
+  of a misleading login hint.
 - Codex TUI: its own `tui.status_line` has `five-hour-limit` /
   `weekly-limit` items and no external-command hook, so ccx's Codex value is
   in Claude Code's statusline (Codex driven from inside Claude Code via the
@@ -438,18 +548,18 @@ go vet ./... && gofmt -l .
 
 - **Never call the real API from tests or casual verification.** Live checks
   are manual, rare, and deliberate (protect the 429 budget). The one
-  sanctioned live path is `TestLiveSmoke` (`internal/usage/live_test.go`): it
+  sanctioned live path is `TestLiveSmoke` (`internal/provider/claude/live_test.go`): it
   is skipped unless `CCX_LIVE_TOKEN` is set, makes exactly one API call, and
   logs the decoded windows plus any drift indicators, so regular CI and local
   `go test ./...` never touch the endpoint. Run it deliberately with the
   access token from `~/.claude/.credentials.json`:
-  `CCX_LIVE_TOKEN=<token> go test -run TestLiveSmoke -v ./internal/usage/`.
-  The Codex counterpart is `TestLiveSmokeCodex` (`internal/codex/live_test.go`,
+  `CCX_LIVE_TOKEN=<token> go test -run TestLiveSmoke -v ./internal/provider/claude/`.
+  The Codex counterpart is `TestLiveSmokeCodex` (`internal/provider/codex/live_test.go`,
   skipped unless both `CCX_LIVE_CODEX_TOKEN` and `CCX_LIVE_CODEX_ACCOUNT` are
   set — `tokens.access_token` / `tokens.account_id` from `~/.codex/auth.json`):
   `CCX_LIVE_CODEX_TOKEN=<token> CCX_LIVE_CODEX_ACCOUNT=<id> go test -run
-  TestLiveSmokeCodex -v ./internal/codex/`. Codex also has a redacted golden
-  fixture (`internal/codex/testdata/`) pinned by a decode test; when the live
+  TestLiveSmokeCodex -v ./internal/provider/codex/`. Codex also has a redacted golden
+  fixture (`internal/provider/codex/testdata/`) pinned by a decode test; when the live
   shape changes, recapture with the curl in the Codex data-source notes,
   redact `user_id` / `account_id` / `email`, and update the golden test.
   A dispatch-only GitHub workflow and Claude golden fixtures are deferred
@@ -457,8 +567,12 @@ go vet ./... && gofmt -l .
 - Commands take a `resolver` interface; test command behavior (rendering,
   exit codes, flag handling) with a fake resolver returning canned States —
   see `cmd/ccx/commands_test.go`.
-- Interfaces are defined at the consumer (engine defines its ports; usage
-  does not export an interface). Keep it that way.
+- Ports live where the contract is: the engine defines its runtime ports
+  (Cache / Refresher / Clock) and consumes the provider-side ports
+  (CredResolver / Fetcher / TranscriptProbe / StdinParser) from
+  `internal/provider`, the contract package every provider implements.
+  Provider packages export a `Spec()` and no interfaces of their own.
+  Keep it that way.
 - Dependencies are minimal by policy: cobra + gofrs/flock + stdlib. Adding a
   dependency needs a strong reason.
 - Local install for dogfooding: `go install ./cmd/ccx` → `~/go/bin/ccx`; the
@@ -467,12 +581,15 @@ go vet ./... && gofmt -l .
 ## Exit codes
 
 - `now`: 0 on a snapshot State; 1 on an error State (message already printed
-  to stdout, `errSilentExit` suppresses duplicate stderr output). With several
+  to stdout, `errSilentExit` suppresses duplicate stderr output). A
+  data-bearing State with broken auth still exits 0, but its footer carries
+  `⚠ no credentials` / `⚠ token expired`. With several
   providers every block prints and the exit code is 1 if ANY of them is an
   error State. An unknown `--provider` name is a usage error (1, message on
   stderr, nothing on stdout).
 - `statusline`: always 0 — it must never break the statusline. Unknown
-  provider names are skipped, not reported.
+  provider names are skipped, not reported. An account without plan limits
+  (Codex API-key login) renders a `no plan` marker, not `⚠ login`.
 - `refresh`: exactly one provider; unknown name or a list is an error (only
   the detached child ever sees it).
 
@@ -502,19 +619,33 @@ go vet ./... && gofmt -l .
   goreleaser uploads it and uploads `checksums.txt.sig`. To rotate: generate a
   new keypair, update `signkey.go`, cut a release that users install manually,
   and document that old binaries stop self-updating until reinstalled.
+- **Persisted auth verdict (deferred, from the 2026-09 review):** the
+  detached ladder still resolves credentials in the parent on every stale
+  tick (a `security` shell-out on keychain-only Macs while a refresh is in
+  flight or the endpoint is failing), and the stdin ladder never reads them
+  and so can never render `⚠ login`, spawning one failing child per TTL
+  instead. The general fix mirrors the transcript probe: the refresh child
+  persists its auth verdict (ok / missing / expired + reason) into the cache
+  entry, both statusline ladders render `⚠ login` from that, and the parent
+  takes the claim before any credential IO. Not done yet because it widens
+  the cache contract (invariant #2) and the ≤1/TTL child cost is bounded.
+- **Statusline routing inside the engine (deferred):** an
+  `engine.ResolveStatusline(ctx, doc)` applying its own Spec.ParseStdin
+  would let the CLI registry go back to `map[string]resolver`, drop
+  `providerEntry`, and put the routing rule beside the ladders it selects.
+- **Shared HTTP client skeleton + drift vocabulary (deferred):** the two
+  provider clients duplicate ~80 lines (options, Do, drain, status switch)
+  and spell the same drift condition differently (`five_hour missing
+  resets_at` vs `primary_window missing reset`); a `provider.Do` helper and
+  shared indicator constructors are the natural home when the Backoff
+  feature lands.
 - **Live-smoke workflow + golden fixtures (deferred):** a GitHub workflow
   (`workflow_dispatch` only, never scheduled) that runs `TestLiveSmoke` with a
   `CCX_LIVE_TOKEN` repo secret, plus golden fixtures of the captured live shape
-  under `internal/usage/testdata/` pinned by a golden test, so the
+  under `internal/provider/claude/testdata/` pinned by a golden test, so the
   decode/reconcile/overlay pipeline stays tied to reality. Deliberately split
   out of the drift-indicator change (PR #10); until they land, the live check
   is the local, env-gated `TestLiveSmoke` only.
-- **Decode-failure drift (issue #11):** a response that fails to decode at
-  all (e.g. `resets_at` arriving as an epoch number) surfaces as a transient
-  error and a stale serve with no `drift` entry — the one silent-degrade
-  path the indicators cannot see. Plan: tolerant decode first (accept epoch
-  resets like the stdin parser does and flag the fallback as drift), and
-  surface decode errors as drift only if that proves insufficient.
 
 ## Decision log (abridged)
 
@@ -562,7 +693,7 @@ go vet ./... && gofmt -l .
 - ScopedProbed is cache metadata, not snapshot data: the flag that "the API (as
   opposed to a stdin projection) answered about scoped limits" is provenance,
   and it now lives on the cache Entry (`scoped_probed`) instead of inside the
-  snapshot payload. The snapshot stays pure data; `usage.FetchedSnapshot`
+  snapshot payload. The snapshot stays pure data; `provider.FetchedSnapshot`
   carries the flag out of decode at fetch time, and the cache carries it across
   the disk.
 - one Snapshot type end-to-end: `usage.Snapshot`/`usage.Window`/`Usage`
@@ -598,8 +729,8 @@ go vet ./... && gofmt -l .
 - cache is a pure opaque store; its vestigial TTL machinery (`WithTTL`,
   `Fresh`, `TTL()`, `DefaultTTL`, `Entry.Age`) had zero production consumers —
   TTL judgment lives solely in the engine (`engine.DefaultTTL`) — and was
-  removed along with a duplicate 120s constant. `usage.RateLimitError` /
-  `parseRetryAfter` deliberately remain despite having no v1 behavioral
+  removed along with a duplicate 120s constant. `provider.RateLimitError` /
+  `ParseRetryAfter` deliberately remain despite having no v1 behavioral
   consumer (the ladder treats 429 like any transient failure): they are the
   tested seeds for the deferred Backoff feature and carry no complexity the
   429 budget story doesn't already assume.
@@ -636,7 +767,7 @@ go vet ./... && gofmt -l .
   endpoint is unofficial and its shape evolves (new codename fields, null
   windows, new limits[] kinds), and a silent format change used to degrade
   the pipeline into serving plausible-but-wrong numbers with every layer
-  "working fine". `usage.decode` now records drift indicators on
+  "working fine". `claude.decode` now records drift indicators on
   `FetchedSnapshot.Drift` — empty payload; a top-level window or an active
   scoped entry missing `resets_at`; a model-scoped entry missing
   `display_name`; a model-scoped entry under an unknown `kind`. Indicators
@@ -655,7 +786,7 @@ go vet ./... && gofmt -l .
   Visibility follows the suspect-guard rule: `now` (human `drift:` line +
   `--json` field) shows the markers; the statusline deliberately does not,
   because it mirrors Claude Code's own values. `TestLiveSmoke`
-  (`internal/usage/live_test.go`, skipped unless `CCX_LIVE_TOKEN` is set, one
+  (`internal/provider/claude/live_test.go`, skipped unless `CCX_LIVE_TOKEN` is set, one
   API call per run) is the sanctioned way to check the real shape; a
   dispatch-only workflow and golden fixtures are deferred (see Roadmap).
 - provider abstraction is bounded and lives at the seams, not in a new layer:
@@ -687,7 +818,11 @@ go vet ./... && gofmt -l .
   labels is an open display decision that would also touch Claude's rows.
 - statusline groups: the claude group is untagged so the default output stays
   byte-identical (regression tests unchanged), other groups get a gray name
-  tag, and stdin rate_limits are routed only to claude because they describe
+  tag only when more than one provider is configured — a lone provider is
+  self-evident, so `--provider codex` alone renders exactly like claude
+  alone; the tag keys off the configured list rather than the rendered
+  groups so a cold-start or transient empty group never makes it flicker —
+  and stdin rate_limits are routed only to claude because they describe
   the Claude plan. Non-claude providers use ResolveDetached so a second
   provider never adds network latency to a tick — the same "detached, never
   synchronous" rule the stdin path follows.
@@ -698,7 +833,8 @@ go vet ./... && gofmt -l .
   response carries the account's e-mail/ids, which is why redaction is part
   of the recapture procedure, and that `originator`/`User-Agent` are not
   enforced (200 without them) — mirrored anyway.
-- ParseTolerantTime / ParseRetryAfter moved into `usage` because the Codex
+- ParseTolerantTime / ParseRetryAfter moved into the shared package (then
+  `usage`, now `provider`) because the Codex
   decoder needed the same epoch-or-RFC3339 tolerance the stdin parser had;
   one implementation, tested once, used by both providers.
 - comments are gone entirely, not merely discouraged: the policy's exceptions
@@ -711,3 +847,213 @@ go vet ./... && gofmt -l .
   thresholds, stdin terminal skip, cache stat pre-check, goreleaser naming,
   dev-build update rule, transcript content shapes). Tests express their
   scenario through names and failure messages.
+- the provider contract is its own package and Claude no longer hosts the
+  shared types (layout refactor, 2026-09): `internal/usage` and
+  `internal/creds` had become a grab-bag — the Claude HTTP client, the
+  credential chain, the provider-neutral error/snapshot types and the
+  engine's merge policies all lived under Claude's names, so `internal/codex`
+  imported Claude's packages to reach the shared contract; the stdin
+  `rate_limits` parser (Claude wire knowledge) lived in `cmd/ccx` and
+  duplicated the Opus-backfill rule of the API decoder; the cache adapter
+  lived inside `engine`, which therefore imported `internal/cache` against
+  the "engine depends only on its ports" rule; and `main.go` hand-wired each
+  provider. Now `internal/provider` holds the contract (Credentials / Source
+  / Resolver, FetchedSnapshot, ErrAuth / RateLimitError / ErrTransient,
+  ParseTolerantTime / ParseRetryAfter, the provider-side ports and `Spec`),
+  `provider/claude` and `provider/codex` hold only what differs and each
+  exports `Spec()`, the stdin parser moved into `provider/claude` as the
+  Spec's ParseStdin so the statusline routes by `ParseStdin != nil` instead
+  of by provider name, `reconcile`/`overlay` moved into `engine` as
+  unexported policies (the engine is their only consumer), the three engine
+  entry points share one `resolve(ctx, mode)` plus one `detachedRefresh`
+  helper instead of three copies of the ladder prefix and the
+  claim→spawn→fallback block, the engine's Cache port reports a miss as a
+  nil entry (the never-consumed ErrNoCache sentinel is gone), the cache
+  adapter moved to the composition root, `cache.Update(fn)` became the
+  single locked read-modify-write primitive behind Store and ClaimRefresh,
+  and `main.go` builds every engine from a `[]provider.Spec`. Behavior is
+  unchanged: every pre-existing test passes with only package and
+  constructor renames. This supersedes the "Claude's packages keep their
+  names and also hold the shared types" note above.
+- overlay treats an ELAPSED stdin reset as a closed cycle: the stdin-over-cache
+  merge used to let stdin's utilization always win and only borrow the LATER
+  reset, so after a window boundary a lagging Claude Code projection (80%,
+  reset ten minutes ago) glued its old utilization onto the cache's new
+  countdown (3%, reset in 4h50m) and rendered "80% ↻ 4h50m" — while the
+  heal fetch that had just retrieved the 3% was thrown away. `overlay` now
+  takes `now`: a stdin window whose reset has elapsed yields wholesale to a
+  cache window whose reset is still in the future; a zero/missing stdin reset
+  still only borrows the reset (the utilization is current, CC just did not
+  project the boundary); a later cache reset against a still-live stdin
+  reset is borrowed only, because server-side reset jitter must not let an
+  older cache value override a live projection.
+- nil stdin is served by the detached ladder: when Claude Code pipes no usable
+  `rate_limits`, `ResolveStdin(nil)` used to fall back to the inline ladder,
+  the one remaining place a statusline tick could block on the network for
+  up to the client timeout. It now delegates to the detached ladder, so the
+  statusline never fetches inline in any state; the cost is one tick of
+  "⚠ ccx" on a cold start, the same trade-off the stdin path already
+  accepted.
+- the transcript probe is a throttled, persisted data source, not a per-tick
+  fallback: the probe walked `~/.claude/projects` (216 jsonl files / 168MB on
+  the dev machine, 22MB of tail reads per probe) on every degraded
+  statusline tick, and on the auth-broken statusline its result was never
+  even rendered (`⚠ login` wins). Now only the inline ladder (`now`, the
+  refresh child) probes, and it persists the result — nil included, to clear
+  a stale hit — through the engine's `StoreLimitHit` port into the cache
+  entry's `limit_hit` (opaque JSON in `cache.Entry`, decoded by the adapter
+  in cmd/ccx). The detached ladder serves the persisted hit when its reset is
+  still in the future and otherwise ignores it; a successful fetch replaces
+  the entry and so clears it. The probe therefore runs at most once per
+  refresh claim on the statusline path.
+- the Claude decoder no longer decodes into the public schema types (closes
+  issue #11): `apiResponse` decoded straight into `schema.Window` with a
+  `time.Time` reset, so a single `resets_at` arriving as an epoch number or
+  an unexpected string failed the whole response — the one silent-degrade
+  path the drift indicators could not see. The decoder now uses local wire
+  structs with `json.RawMessage` resets parsed by `ParseTolerantTime` (the
+  shape codex already had) and adds two indicators, `<label> resets_at is
+  numeric` and `<label> resets_at unparseable`, next to the existing
+  `missing resets_at`; usable data always surfaces and the public schema is
+  decoupled from the endpoint shape.
+- `resets_at` is omitted when unknown: `schema.Window.ResetsAt` carried
+  `json:"resets_at"` on a non-pointer `time.Time`, so a reset-less stdin
+  window reached `now --json` as `"0001-01-01T00:00:00Z"`. The tag is now
+  `omitzero`; absent means unknown. Additive, schema_version stays 1.
+- no in-process credential re-read on expiry: `resolveToken` used to call
+  `Resolve()` a second time microseconds after the first when the token was
+  expired, which could only return the same bytes (and doubled the keychain
+  shell-out on macOS). The re-read that matters is the one after a 401 in
+  `fetchWithToken`, which stays; across runs every invocation reads the
+  credential file afresh, which is how Claude Code's own refresh is picked
+  up.
+- `now` names a broken login even while showing last-known data: a
+  transcript or stale-cache State with `auth: missing/expired` rendered only
+  the data and `source:` line, so a user whose token had vanished saw a
+  plausible screen and exit 0. The footer now appends `⚠ no credentials` /
+  `⚠ token expired`; the exit code stays 0 because the State does carry
+  data.
+- the cache never silently disappears: when `os.UserCacheDir()` failed (no
+  HOME / XDG_CACHE_HOME) the composition root wired a nil cache, so `now`
+  fetched on every call and the codex statusline group stayed empty with no
+  diagnostic. `cache.DefaultPathFor` now falls back to
+  `os.TempDir()/cc-token-exposer-<uid>/` and `NewNamed` cannot fail.
+- the engine has no default provider: `New` used to substitute the Claude
+  name and login command for an unnamed Spec, the one place the engine knew
+  a provider name. It no longer does; an unnamed Spec yields an empty
+  `provider` and command-less login hints, production always passes a named
+  Spec, and the engine tests set the name in their helpers.
+- the cache repairs itself instead of staying broken: routing `Store` through
+  `cache.Update` (layout refactor) made `Store`, `ClaimRefresh` and
+  `StoreLimitHit` return the decode error of an undecodable entry, so a
+  0-byte file (crash during a rename without fsync), a foreign-shape entry
+  (downgrade) or a hand edit left `now` fetching live on every call — the
+  store error is deliberately discarded, so nothing said so — and the
+  statusline never claiming, never spawning and never falling back. Before
+  the refactor `Store` overwrote blindly, so the first successful fetch
+  repaired the file. `Update` now treats `ErrCorrupt` like a miss (an empty
+  Entry) while genuine read errors still surface; `Load` reports
+  `ErrCorrupt` so callers can tell corruption from a miss. Pinned by
+  `TestUpdateRepairsCorruptEntry` / `TestClaimRefreshRepairsCorruptEntry`.
+- the rotated-token retry's outcome is what gets served: after a 401,
+  `fetchWithToken` used to return the ORIGINAL 401 whenever the retry with a
+  rotated token failed, so a network blip on the retry rendered
+  `auth: "expired"` and `⚠ token expired` although the new token was fine.
+  The retry's own error is returned now; a transient failure degrades to
+  stale cache with `auth: "ok"` like any other transient failure.
+- a nil Refresher is a failed spawn: the detached ladder returned early when
+  no Refresher was wired, so such an engine never refreshed and never fell
+  back — silently. The claim is now taken regardless and a missing Refresher
+  takes the same bounded synchronous fallback a failed spawn does;
+  production always wires `processRefresher`, so this only hardens the port
+  contract.
+- null is unknown on the API path too: `apiWindow.Utilization` and
+  `limitEntry.Percent` were plain float64, so a `null` decoded as 0 with no
+  drift indicator — the last silent-degrade path after issue #11 — while
+  the stdin parser had always dropped `utilization: null` as unknown. Both
+  are pointers now: a null top-level window (or legacy `seven_day_opus`) is
+  dropped and flagged `<label> utilization is null`, a null-percent scoped
+  entry is never lifted and is flagged `scoped limits "<name>" percent is
+  null` unless it carries `is_active: false` — an inactive model has nothing
+  to heal, so a null there is a plausible steady state rather than drift,
+  the same reading the reset check applies to inactive entries. A null on an
+  active or unmarked entry stays an indicator. The live smoke on 2026-09-10
+  decoded the current shape with no indicator at all: `limits[]` carried
+  only the active scoped model (Fable 15%), so inactive models are absent
+  from the array rather than null-percent entries.
+- a known scoped kind wins a display_name collision: `decodeScopedLimits`
+  keyed the map by display_name only, so an entry of an unknown kind (e.g. a
+  future `daily_scoped`) for a model that also has a `weekly_scoped` entry
+  overwrote it or not depending on array order. `weekly_scoped` now wins
+  regardless of order; unknown kinds still surface (with their drift
+  indicator) when no weekly entry exists for the name, so a kind rename
+  degrades to a marked value rather than a vanished model.
+- no-plan credentials are their own auth status: a Codex API-key login was
+  surfaced as `auth: "missing"` with the reason in `error`, which `now`
+  rendered honestly but the statusline rendered as `codex ⚠ login` forever —
+  the user IS logged in. Serving it as an auth-ok error State was tried
+  first, but then the statusline could not tell "no plan" from "refresh in
+  progress; no cache yet" and dropped the group, so `--provider codex` alone
+  on an API-key account collapsed into the generic `⚠ ccx`. The credential
+  source now returns `provider.NoPlanError`, the engine short-circuits to
+  `errorState(AuthNoPlan, reason)` before any cache or spawn (a fresh cache
+  from an earlier plan login is still served until its TTL elapses — the
+  same ≤TTL lag every credential change has, and checking credentials
+  before a fresh serve would cost a file read plus a keychain shell-out on
+  every tick), the statusline renders a gray `<name> no plan` marker in
+  every configuration, and `now` prints the reason with exit 1.
+  `auth: "no_plan"` is an additive enum value, the same kind of change as
+  `source: "stdin"`.
+- overlay tolerates reset jitter and never borrows a dead reset: the
+  elapsed-cycle rule (stdin reset in the past, cache reset in the future →
+  cache window wholesale) fired even when the two resets were the same
+  boundary seen through sub-second server jitter (observed: 133 ms between
+  two fetches), so for the seconds between them the line showed the older
+  cache utilization instead of the live projection — exactly the override
+  the jitter rationale forbids. The wholesale rule now requires the cache
+  reset to be later by more than a one-minute tolerance (real cycles are
+  hours apart); inside it only the reset is borrowed. A cache reset that has
+  itself elapsed is never borrowed anymore either: it produced a ≈ marker
+  and a past `resets_at` on the wire for nothing.
+- the detached sync fallback reports its own 401: `boundedRefresh` swallowed
+  the fetch error, so when the spawn failed and the fallback got a 401 the
+  detached ladder served stale data with `auth: "ok"` (or "refresh in
+  progress") while `now` on the same machine said expired. The error now
+  flows back through `refresh` and the ladder's ErrAuth branch applies to
+  both modes.
+- the refresh claim is pre-gated by the entry already in hand: on every tick
+  where stdin is incomplete (the common case: CC's projection omits Fable)
+  `detachedRefresh` took the exclusive flock and re-read the file only to be
+  denied. `refreshDue` now checks the loaded `fetched_at`/`attempted_at`
+  against the TTL first; the locked check-and-set stays the authority for
+  the race, so the ≤1/TTL bound is unchanged and denied ticks are IO free.
+- `Store` writes blind again: routing it through `Update` made every fetch
+  read and decode the entry it was about to discard, under the write flock.
+  `Update` stays the primitive for the two real read-modify-writes
+  (ClaimRefresh, the limit-hit merge); a wholesale replace does not need it,
+  and a blind write is also what repairs a corrupt file.
+- the cache directory must be ours: `os.TempDir()` on Linux is the shared
+  `/tmp`, and `MkdirAll` accepts a pre-existing directory or symlink owned by
+  someone else, so another local user could pre-create
+  `/tmp/cc-token-exposer-<uid>` and read the (token-free) usage numbers or
+  plant a snapshot ccx would render. Every lock and load now `Lstat`s the
+  directory and refuses a symlink or a foreign owner (`ErrUnsafeDir`); mode
+  bits are deliberately not checked so a user who relaxed their own cache
+  dir keeps a working cache.
+- one liveness predicate for a limit hit: engine, statusline and adapter
+  each decided whether a persisted hit still counts; `schema.LimitHit.Active`
+  is that rule now (a hit without a reset stays active, an elapsed one is
+  not rendered anywhere), and the adapter ignores a degenerate `limit_hit`
+  (`null`, `{}`) without a `detected_at`, which used to render `⛔ limit`
+  until the next successful fetch.
+- no-op persistence takes no lock: `StoreLimitHit(nil)` with nothing
+  persisted used to create the cache directory and a `<name>.json.lock` for
+  a provider that was never set up (`ccx now --provider codex` without
+  Codex); the engine skips the call when neither side has a hit.
+- the statusline resolves providers concurrently, like `now`: the claude and
+  codex groups share nothing but the process, and two sync fallbacks in
+  series (10s) sat uncomfortably close to the 12s tick budget.
+- processRefresher has no default provider: an empty name used to spawn
+  `ccx refresh --provider claude`, i.e. an unnamed engine claimed its own
+  slot and refreshed Claude's cache. It is a spawn error now, which the
+  engine treats like any failed spawn (bounded inline refresh).

@@ -31,11 +31,12 @@ const (
 	AuthOK      AuthStatus = "ok"
 	AuthExpired AuthStatus = "expired"
 	AuthMissing AuthStatus = "missing"
+	AuthNoPlan  AuthStatus = "no_plan"
 )
 
 type Window struct {
 	Utilization float64   `json:"utilization"`
-	ResetsAt    time.Time `json:"resets_at"`
+	ResetsAt    time.Time `json:"resets_at,omitzero"`
 	Suspect     bool      `json:"suspect,omitempty"`
 }
 
@@ -61,7 +62,7 @@ type snapshotWire struct {
 	ExtraUsage    *ExtraUsage        `json:"extra_usage,omitempty"`
 }
 
-func (s *Snapshot) MarshalJSON() ([]byte, error) {
+func (s Snapshot) MarshalJSON() ([]byte, error) {
 	w := snapshotWire{
 		FetchedAt:    s.FetchedAt,
 		FiveHour:     s.FiveHour,
@@ -82,6 +83,10 @@ type LimitHit struct {
 	ResetsAt   *time.Time `json:"resets_at,omitempty"`
 	Message    string     `json:"message,omitempty"`
 	DetectedAt time.Time  `json:"detected_at"`
+}
+
+func (lh *LimitHit) Active(now time.Time) bool {
+	return lh != nil && (lh.ResetsAt == nil || lh.ResetsAt.After(now))
 }
 
 type State struct {

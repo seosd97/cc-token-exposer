@@ -2,6 +2,7 @@ package cache
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,7 +23,7 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"type":"snapshot","five_hour":{"utilization":23}}`)
 
-	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
+	if err := c.Store(Entry{Payload: payload, FetchedAt: fetchedAt}); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -56,7 +57,7 @@ func TestClaimRefreshRecordsAttemptPreservingData(t *testing.T) {
 	c := tempCache(t)
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
+	if err := c.Store(Entry{Payload: payload, FetchedAt: fetchedAt}); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -111,7 +112,7 @@ func TestClaimRefreshThrottlesWithinBackoff(t *testing.T) {
 	if got, err := c.ClaimRefresh(t0.Add(backoff), backoff); err != nil || !got {
 		t.Fatalf("claim after backoff = %v, %v; want true", got, err)
 	}
-	if err := c.Store(json.RawMessage(`{"v":1}`), t0.Add(2*backoff-20*time.Second), false, nil); err != nil {
+	if err := c.Store(Entry{Payload: json.RawMessage(`{"v":1}`), FetchedAt: t0.Add(2*backoff - 20*time.Second)}); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	if got, err := c.ClaimRefresh(t0.Add(2*backoff), backoff); err != nil || got {
@@ -151,7 +152,7 @@ func TestClaimRefreshConcurrent(t *testing.T) {
 
 func TestStoreRejectsInvalidJSON(t *testing.T) {
 	c := tempCache(t)
-	if err := c.Store(json.RawMessage(`{not json`), time.Now(), false, nil); err == nil {
+	if err := c.Store(Entry{Payload: json.RawMessage(`{not json`), FetchedAt: time.Now()}); err == nil {
 		t.Fatalf("Store accepted invalid JSON, want error")
 	}
 	if _, err := c.Load(); err != ErrMiss {
@@ -163,7 +164,7 @@ func TestNoTokenInCacheFile(t *testing.T) {
 	c := tempCache(t)
 	const token = "sk-ant-oat-SUPER-SECRET-TOKEN"
 	payload := json.RawMessage(`{"schema_version":1,"type":"snapshot","auth":"ok","five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, time.Now(), false, nil); err != nil {
+	if err := c.Store(Entry{Payload: payload, FetchedAt: time.Now()}); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -195,7 +196,7 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
 
-	if err := c.Store(payload, fetchedAt, true, nil); err != nil {
+	if err := c.Store(Entry{Payload: payload, FetchedAt: fetchedAt, ScopedProbed: true}); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	e, err := c.Load()
@@ -209,7 +210,7 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 		t.Errorf("scoped_probed leaked into the payload: %s", e.Payload)
 	}
 
-	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
+	if err := c.Store(Entry{Payload: payload, FetchedAt: fetchedAt}); err != nil {
 		t.Fatalf("Store(false): %v", err)
 	}
 	e, err = c.Load()
@@ -224,11 +225,11 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 func TestStoreOverwrites(t *testing.T) {
 	c := tempCache(t)
 	t0 := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	if err := c.Store(json.RawMessage(`{"v":1}`), t0, false, nil); err != nil {
+	if err := c.Store(Entry{Payload: json.RawMessage(`{"v":1}`), FetchedAt: t0}); err != nil {
 		t.Fatalf("Store1: %v", err)
 	}
 	t1 := t0.Add(time.Minute)
-	if err := c.Store(json.RawMessage(`{"v":2}`), t1, false, nil); err != nil {
+	if err := c.Store(Entry{Payload: json.RawMessage(`{"v":2}`), FetchedAt: t1}); err != nil {
 		t.Fatalf("Store2: %v", err)
 	}
 	e, err := c.Load()
@@ -246,7 +247,7 @@ func TestStoreOverwrites(t *testing.T) {
 func TestConcurrentAccess(t *testing.T) {
 	c := tempCache(t)
 	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	if err := c.Store(json.RawMessage(`{"writer":0,"i":0}`), base, false, nil); err != nil {
+	if err := c.Store(Entry{Payload: json.RawMessage(`{"writer":0,"i":0}`), FetchedAt: base}); err != nil {
 		t.Fatalf("seed Store: %v", err)
 	}
 
@@ -259,7 +260,7 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				p := json.RawMessage(`{"writer":` + strconv.Itoa(w) + `,"i":` + strconv.Itoa(i) + `}`)
-				if err := c.Store(p, base.Add(time.Duration(i)*time.Second), false, nil); err != nil {
+				if err := c.Store(Entry{Payload: p, FetchedAt: base.Add(time.Duration(i) * time.Second)}); err != nil {
 					t.Errorf("writer %d Store: %v", w, err)
 					return
 				}
@@ -312,18 +313,97 @@ func keys(m map[string]json.RawMessage) []string {
 }
 
 func TestDefaultPathForKeepsProvidersInSeparateFiles(t *testing.T) {
-	legacy, err := DefaultPath()
-	if err != nil {
-		t.Fatalf("DefaultPath: %v", err)
-	}
+	legacy := DefaultPathFor(DefaultName)
 	if filepath.Base(legacy) != "snapshot.json" {
 		t.Fatalf("legacy cache file = %s, want snapshot.json", legacy)
 	}
-	codex, err := DefaultPathFor("codex")
-	if err != nil {
-		t.Fatalf("DefaultPathFor: %v", err)
-	}
+	codex := DefaultPathFor("codex")
 	if filepath.Base(codex) != "codex.json" || filepath.Dir(codex) != filepath.Dir(legacy) {
 		t.Fatalf("named cache = %s, want codex.json beside %s", codex, legacy)
+	}
+}
+
+func TestDefaultPathForFallsBackToTempDirWithoutHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+	got := DefaultPathFor("codex")
+	if !strings.HasPrefix(got, os.TempDir()) || filepath.Base(got) != "codex.json" {
+		t.Fatalf("fallback path = %s, want codex.json under %s", got, os.TempDir())
+	}
+	if NewNamed("codex").Path() != got {
+		t.Fatalf("NewNamed must open the same fallback path")
+	}
+}
+
+func TestUpdateRepairsCorruptEntry(t *testing.T) {
+	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
+	for _, corrupt := range []string{"", "{garbage", `{"payload": 1, "fetched_at": "nope"}`} {
+		t.Run(strconv.Quote(corrupt), func(t *testing.T) {
+			c := tempCache(t)
+			if err := os.WriteFile(c.Path(), []byte(corrupt), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Load(); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Load on a corrupt entry = %v, want ErrCorrupt", err)
+			}
+			if err := c.Store(Entry{Payload: payload, FetchedAt: fetchedAt}); err != nil {
+				t.Fatalf("Store must repair a corrupt entry, got %v", err)
+			}
+			e, err := c.Load()
+			if err != nil || !e.FetchedAt.Equal(fetchedAt) || !jsonEqual(t, e.Payload, payload) {
+				t.Fatalf("Load after repair = %+v, %v; want the stored entry", e, err)
+			}
+		})
+	}
+}
+
+func TestClaimRefreshRepairsCorruptEntry(t *testing.T) {
+	c := tempCache(t)
+	if err := os.WriteFile(c.Path(), []byte("{garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	got, err := c.ClaimRefresh(now, time.Hour)
+	if err != nil || !got {
+		t.Fatalf("ClaimRefresh on a corrupt entry = %v, %v; want true, nil", got, err)
+	}
+	e, err := c.Load()
+	if err != nil || e.AttemptedAt == nil || !e.AttemptedAt.Equal(now) {
+		t.Fatalf("Load after the claim = %+v, %v; want the claim persisted in a repaired entry", e, err)
+	}
+}
+
+func TestUpdateKeepsReadErrorsThatAreNotCorruption(t *testing.T) {
+	c := Open(filepath.Join(t.TempDir(), "snapshot.json"))
+	if err := os.Mkdir(c.Path(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := c.Store(Entry{Payload: json.RawMessage(`{}`), FetchedAt: time.Now()})
+	if err == nil || errors.Is(err, ErrCorrupt) || errors.Is(err, ErrMiss) {
+		t.Fatalf("Store over an unreadable path = %v, want a read error that is neither a miss nor corruption", err)
+	}
+}
+
+func TestUnsafeCacheDirIsRefused(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{Payload: json.RawMessage(`{}`), FetchedAt: time.Now()}
+	if err := Open(filepath.Join(real, "snapshot.json")).Store(entry); err != nil {
+		t.Fatalf("Store through the real dir: %v", err)
+	}
+	c := Open(filepath.Join(link, "snapshot.json"))
+	if err := c.Store(entry); !errors.Is(err, ErrUnsafeDir) {
+		t.Fatalf("Store through a symlinked dir = %v, want ErrUnsafeDir", err)
+	}
+	if _, err := c.Load(); !errors.Is(err, ErrUnsafeDir) {
+		t.Fatalf("Load through a symlinked dir = %v, want ErrUnsafeDir", err)
 	}
 }

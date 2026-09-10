@@ -4,25 +4,23 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
-
-	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
 type processRefresher struct{ provider string }
 
 func (p processRefresher) Spawn(ctx context.Context) error {
+	if p.provider == "" {
+		return errors.New("processRefresher: provider name is empty")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	name := p.provider
-	if name == "" {
-		name = schema.ProviderClaude
-	}
-	cmd := exec.Command(exe, "refresh", "--provider", name)
+	cmd := exec.Command(exe, "refresh", "--provider", p.provider)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = nil
 	cmd.Stdout = nil

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,11 +13,16 @@ import (
 
 var ErrMiss = errors.New("cache: no entry")
 
+var ErrCorrupt = errors.New("cache: entry is not decodable")
+
+var ErrUnsafeDir = errors.New("cache: unsafe cache directory")
+
 type Entry struct {
 	FetchedAt    time.Time       `json:"fetched_at"`
 	AttemptedAt  *time.Time      `json:"attempted_at,omitempty"`
 	ScopedProbed bool            `json:"scoped_probed,omitempty"`
 	Drift        []string        `json:"drift,omitempty"`
+	LimitHit     json.RawMessage `json:"limit_hit,omitempty"`
 	Payload      json.RawMessage `json:"payload"`
 }
 
@@ -28,24 +32,18 @@ type Cache struct {
 
 const DefaultName = "snapshot"
 
-func DefaultPath() (string, error) { return DefaultPathFor(DefaultName) }
+const dirName = "cc-token-exposer"
 
-func DefaultPathFor(name string) (string, error) {
+func DefaultPathFor(name string) string {
 	dir, err := os.UserCacheDir()
 	if err != nil {
-		return "", fmt.Errorf("cache: resolve cache dir: %w", err)
+		return filepath.Join(os.TempDir(), fmt.Sprintf("%s-%d", dirName, os.Getuid()), name+".json")
 	}
-	return filepath.Join(dir, "cc-token-exposer", name+".json"), nil
+	return filepath.Join(dir, dirName, name+".json")
 }
 
-func New() (*Cache, error) { return NewNamed(DefaultName) }
-
-func NewNamed(name string) (*Cache, error) {
-	path, err := DefaultPathFor(name)
-	if err != nil {
-		return nil, err
-	}
-	return Open(path), nil
+func NewNamed(name string) *Cache {
+	return Open(DefaultPathFor(name))
 }
 
 func Open(path string) *Cache {
@@ -56,40 +54,46 @@ func (c *Cache) Path() string { return c.path }
 
 func (c *Cache) lockPath() string { return c.path + ".lock" }
 
-func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time, scopedProbed bool, drift []string) error {
-	if !json.Valid(payload) {
+func (c *Cache) Store(e Entry) error {
+	if !json.Valid(e.Payload) {
 		return errors.New("cache: payload is not valid JSON")
 	}
-	return c.withWriteLock(func() error {
-		return c.writeEntryLocked(Entry{FetchedAt: fetchedAt, ScopedProbed: scopedProbed, Drift: drift, Payload: payload})
-	})
+	return c.withWriteLock(func() error { return c.writeEntryLocked(e) })
 }
 
 func (c *Cache) ClaimRefresh(now time.Time, backoff time.Duration) (bool, error) {
-	var claimed bool
-	err := c.withWriteLock(func() error {
-		e, err := c.readEntryLocked()
-		if err != nil {
-			if !errors.Is(err, ErrMiss) {
-				return err
-			}
-			claimed = true
-			at := now
-			return c.writeEntryLocked(Entry{AttemptedAt: &at, Payload: json.RawMessage("null")})
-		}
+	claimed := false
+	err := c.Update(func(e *Entry) (bool, error) {
 		last := e.FetchedAt
 		if e.AttemptedAt != nil && e.AttemptedAt.After(last) {
 			last = *e.AttemptedAt
 		}
 		if !last.IsZero() && now.Sub(last) < backoff {
-			return nil
+			return false, nil
 		}
-		claimed = true
 		at := now
 		e.AttemptedAt = &at
-		return c.writeEntryLocked(*e)
+		claimed = true
+		return true, nil
 	})
 	return claimed, err
+}
+
+func (c *Cache) Update(fn func(e *Entry) (write bool, err error)) error {
+	return c.withWriteLock(func() error {
+		e, err := c.readEntryLocked()
+		if err != nil {
+			if !errors.Is(err, ErrMiss) && !errors.Is(err, ErrCorrupt) {
+				return err
+			}
+			e = &Entry{}
+		}
+		write, err := fn(e)
+		if err != nil || !write {
+			return err
+		}
+		return c.writeEntryLocked(*e)
+	})
 }
 
 func (c *Cache) Load() (*Entry, error) {
@@ -98,6 +102,9 @@ func (c *Cache) Load() (*Entry, error) {
 			return nil, ErrMiss
 		}
 		return nil, fmt.Errorf("cache: stat: %w", err)
+	}
+	if err := c.checkDir(); err != nil {
+		return nil, err
 	}
 
 	lock := flock.New(c.lockPath())
@@ -113,6 +120,9 @@ func (c *Cache) withWriteLock(fn func() error) error {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
 		return fmt.Errorf("cache: create dir: %w", err)
 	}
+	if err := c.checkDir(); err != nil {
+		return err
+	}
 	lock := flock.New(c.lockPath())
 	if err := lock.Lock(); err != nil {
 		return fmt.Errorf("cache: acquire write lock: %w", err)
@@ -121,24 +131,32 @@ func (c *Cache) withWriteLock(fn func() error) error {
 	return fn()
 }
 
+func (c *Cache) checkDir() error {
+	dir := filepath.Dir(c.path)
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("cache: stat dir: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%w: %s is not a directory", ErrUnsafeDir, dir)
+	}
+	if !ownedByCaller(info) {
+		return fmt.Errorf("%w: %s is owned by another user", ErrUnsafeDir, dir)
+	}
+	return nil
+}
+
 func (c *Cache) readEntryLocked() (*Entry, error) {
-	f, err := os.Open(c.path)
+	data, err := os.ReadFile(c.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrMiss
 		}
-		return nil, fmt.Errorf("cache: open: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
 		return nil, fmt.Errorf("cache: read: %w", err)
 	}
-
 	var e Entry
 	if err := json.Unmarshal(data, &e); err != nil {
-		return nil, fmt.Errorf("cache: decode entry: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrCorrupt, err)
 	}
 	return &e, nil
 }

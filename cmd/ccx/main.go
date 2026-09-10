@@ -7,13 +7,11 @@ import (
 	"os"
 	"runtime/debug"
 
-	"github.com/seosd97/cc-token-exposer/internal/cache"
-	"github.com/seosd97/cc-token-exposer/internal/codex"
-	"github.com/seosd97/cc-token-exposer/internal/creds"
 	"github.com/seosd97/cc-token-exposer/internal/engine"
+	"github.com/seosd97/cc-token-exposer/internal/provider"
+	"github.com/seosd97/cc-token-exposer/internal/provider/claude"
+	"github.com/seosd97/cc-token-exposer/internal/provider/codex"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
-	"github.com/seosd97/cc-token-exposer/internal/transcript"
-	"github.com/seosd97/cc-token-exposer/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -39,32 +37,19 @@ func versionString() string {
 	return version
 }
 
-func openCache(name string) *cache.Cache {
-	c, err := cache.NewNamed(name)
-	if err != nil {
-		return nil
-	}
-	return c
-}
-
 func productionProviders() providers {
-	return providers{
-		schema.ProviderClaude: engine.New(engine.Options{
-			Provider:   engine.ClaudeProvider,
-			Creds:      creds.Default(),
-			Fetcher:    usage.New(),
-			Cache:      engine.CacheFrom(openCache(cache.DefaultName)),
-			Transcript: transcript.NewProbe(),
-			Refresher:  processRefresher{provider: schema.ProviderClaude},
-		}),
-		schema.ProviderCodex: engine.New(engine.Options{
-			Provider:  engine.Provider{Name: schema.ProviderCodex, LoginCommand: "codex login"},
-			Creds:     creds.NewResolver(&codex.AuthSource{}),
-			Fetcher:   codex.New(),
-			Cache:     engine.CacheFrom(openCache(schema.ProviderCodex)),
-			Refresher: processRefresher{provider: schema.ProviderCodex},
-		}),
+	ps := providers{}
+	for _, spec := range []provider.Spec{claude.Spec(), codex.Spec()} {
+		ps[spec.Name] = providerEntry{
+			spec: spec,
+			resolver: engine.New(engine.Options{
+				Spec:      spec,
+				Cache:     cacheFor(spec.Name),
+				Refresher: processRefresher{provider: spec.Name},
+			}),
+		}
 	}
+	return ps
 }
 
 func main() {
