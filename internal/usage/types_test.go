@@ -7,17 +7,14 @@ import (
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
-// TestWindowUnmarshalNumberForms verifies utilization decodes from both int and
-// float JSON numbers into float64, preserving fractional precision (the live
-// endpoint sends floats; the field is float64 to preserve them).
 func TestWindowUnmarshalNumberForms(t *testing.T) {
 	cases := []struct {
 		in   string
 		want float64
 	}{
-		{`{"utilization": 18}`, 18},     // int form
-		{`{"utilization": 18.0}`, 18},   // float, whole
-		{`{"utilization": 18.5}`, 18.5}, // fractional preserved (exactly representable)
+		{`{"utilization": 18}`, 18},
+		{`{"utilization": 18.0}`, 18},
+		{`{"utilization": 18.5}`, 18.5},
 		{`{"utilization": 0}`, 0},
 		{`{"utilization": 100}`, 100},
 	}

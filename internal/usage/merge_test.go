@@ -103,8 +103,6 @@ func TestOverlaySkipsNilBaseWindows(t *testing.T) {
 }
 
 func TestOverlayBackfillsMissingResetFromBase(t *testing.T) {
-	// stdin can carry utilization without a usable resets_at (null/missing);
-	// the cached reset must fill in instead of dropping the countdown.
 	fresh := &schema.Snapshot{FiveHour: &schema.Window{Utilization: 20}, SevenDay: owin(30)}
 	base := &schema.Snapshot{FiveHour: owin(99), SevenDay: owin(99)}
 	got, used := Overlay(fresh, base)
@@ -123,8 +121,6 @@ func TestOverlayBackfillsMissingResetFromBase(t *testing.T) {
 }
 
 func TestOverlayPrefersLaterResetFromBase(t *testing.T) {
-	// A stdin reset already elapsed (CC projection lagging across a window
-	// reset) must yield to the cache's still-future one.
 	fresh := &schema.Snapshot{FiveHour: &schema.Window{Utilization: 20, ResetsAt: mergeBase.Add(-time.Hour)}}
 	base := &schema.Snapshot{FiveHour: owin(99)}
 	got, used := Overlay(fresh, base)

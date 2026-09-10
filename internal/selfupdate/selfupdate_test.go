@@ -17,7 +17,6 @@ import (
 	"testing"
 )
 
-// makeTarGz builds a gzip-compressed tar containing the named files.
 func makeTarGz(t *testing.T, files map[string][]byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -45,8 +44,6 @@ func sha256hex(b []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
-// releaseServer serves a GitHub-style latest-release endpoint plus asset
-// downloads, with asset URLs pointing back at itself.
 func releaseServer(t *testing.T, tag string, assets map[string][]byte) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()

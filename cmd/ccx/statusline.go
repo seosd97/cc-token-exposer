@@ -141,8 +141,6 @@ type statuslineInput struct {
 	RateLimits json.RawMessage `json:"rate_limits"`
 }
 
-// isTerminal reports whether r is an interactive terminal, so reads of an
-// unpiped stdin can be skipped instead of blocking.
 func isTerminal(r io.Reader) bool {
 	f, ok := r.(*os.File)
 	if !ok {
@@ -206,8 +204,6 @@ func (w *rlWindow) toUsage() *schema.Window {
 	}
 }
 
-// parseTolerantTime parses an ISO-8601 string or an epoch number (seconds, or
-// milliseconds when large); returns the zero time on any failure.
 func parseTolerantTime(raw json.RawMessage) time.Time {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return time.Time{}
@@ -235,10 +231,6 @@ type rlScoped struct {
 	ResetsAt    json.RawMessage `json:"resets_at"`
 }
 
-// snapshotFromRateLimits converts the stdin rate_limits object into a usage
-// snapshot; ok is false when it carries no usable window. model_scoped entries
-// keyed by display_name are the canonical scoped limits; seven_day_opus only
-// backfills Opus when model_scoped lacks it.
 func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*schema.Snapshot, bool) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, false

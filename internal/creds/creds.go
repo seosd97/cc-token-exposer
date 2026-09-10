@@ -1,4 +1,3 @@
-// Package creds resolves Claude Code OAuth credentials for the usage API.
 package creds
 
 import (

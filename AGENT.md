@@ -29,8 +29,9 @@ housekeeping.**
   (download the matching release archive, verify its SHA-256 against
   `checksums.txt`, atomically replace the running binary). `--check` only
   reports whether a newer version exists. Homebrew installs defer to
-  `brew upgrade`. This is a *binary* update; it never touches OAuth
-  credentials (unrelated to invariant #3's "no self refresh").
+  `brew upgrade`. A dev build (unparseable version) counts as older than
+  any release, so it always updates. This is a *binary* update; it never
+  touches OAuth credentials (unrelated to invariant #3's "no self refresh").
 
 Removed from v1 after working implementations existed (preserved in git
 history, planned to return in v2): `ccx watch` (NDJSON polling stream),
@@ -47,7 +48,11 @@ cmd/ccx/main.go      composition root: builds the ONE production engine and
                      spawner) and the embedded release-signature public key
 cmd/ccx/now.go       rendering + exit-code policy
 cmd/ccx/statusline.go  statusline formatting + stdin rate_limits parsing
-                     (rate_limits -> schema.Snapshot -> engine.ResolveStdin)
+                     (rate_limits -> schema.Snapshot -> engine.ResolveStdin).
+                     Stdin is read only when it is not a terminal, so a manual
+                     run never blocks. Colors are alert-only: none below 60%,
+                     muted yellow from 60%, muted red above 85%; a stale line
+                     renders all gray; NO_COLOR yields plain text.
 cmd/ccx/refresh.go   hidden `ccx refresh` (internal): runs the ladder once,
                      discards the State — the detached statusline refresher
 cmd/ccx/update.go    self-update command (thin) over internal/selfupdate
@@ -60,6 +65,8 @@ internal/
                key) -> VerifyChecksum (checksums.txt) -> ExtractBinary
                (tar.gz) -> Apply (atomic rename over os.Executable). Stdlib
                only; injectable http client + apiBase + platform for tests.
+               Archive names follow goreleaser's `ccx_<os>_<arch>.tar.gz`
+               template; checksums.txt lines are `<sha256>  <name>`.
   engine/      THE BRAIN. Resolve(ctx) and ResolveStdin(ctx, snap) ->
                *schema.State, runs the degrade ladder. Depends only on 6
                consumer-side interfaces it defines:
@@ -77,17 +84,33 @@ internal/
   usage/       oauth/usage HTTP client + Reconcile consistency guard +
                Overlay gap-fill merge. Produces/operates on schema.Snapshot
                directly (no duplicated window types). Fetch returns
-               usage.FetchedSnapshot{Snapshot, ScopedProbed}; decode is the
-               only producer that sets ScopedProbed=true (marks "the API
+               usage.FetchedSnapshot{Snapshot, ScopedProbed, Drift}; decode is
+               the only producer that sets ScopedProbed=true (marks "the API
                answered about scoped limits"), which the engine uses to judge
-               stdin completeness.
+               stdin completeness. decode also records wire-drift indicators
+               in Drift when the response shape deviates from what the
+               pipeline expects (empty payload; a top-level window or active
+               scoped entry missing resets_at; a model-scoped entry missing
+               display_name; a model-scoped entry under an unknown kind).
+               Indicators never block decoding — usable data still surfaces —
+               and the engine carries them onto State.drift and persists them
+               in the cache entry, so a silent endpoint format change is
+               detectable in `now` output and `--json` instead of degrading
+               into wrong numbers. The statusline deliberately does NOT
+               render drift markers (it mirrors Claude Code's own values,
+               same rule as the suspect guard); the marker is visible on the
+               ladder path.
   creds/       credential acquisition: file > macOS keychain shell-out.
   cache/       flock-protected, atomic-write disk cache of opaque JSON.
-               Entry = {fetched_at, attempted_at?, scoped_probed, payload}.
+               Entry = {fetched_at, attempted_at?, scoped_probed, drift?,
+               payload}.
                ClaimRefresh(now, backoff) atomically claims a refresh slot
                (check-and-set of attempted_at under the write lock, keyed off
                the later of fetched_at/attempted_at), returning whether the
-               caller may spawn a refresher.
+               caller may spawn a refresher. Load stat-checks the file before
+               taking the flock, so a cold start with no cache file is a miss
+               without locking; readEntryLocked/writeEntryLocked run only
+               under a held flock (the Locked suffix is the contract).
   transcript/  last-resort fallback: parses limit-hit messages from
                ~/.claude/projects/**/*.jsonl (read-only, best-effort).
                FindTranscripts keeps only the k newest files via a bounded
@@ -189,8 +212,10 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
 2. **Token hygiene.** The OAuth token is read-only and in-memory only. It must
    never appear in logs, error messages, the cache file, test fixtures, or
    `String()` output (creds redacts). The cache stores only
-    `{fetched_at, attempted_at?, scoped_probed, payload}` where payload is a token-free usage
-   snapshot and `attempted_at` is an optional refresh-attempt timestamp.
+   `{fetched_at, attempted_at?, scoped_probed, drift?, payload}` where
+   payload is a token-free usage snapshot, `attempted_at` is an optional
+   refresh-attempt timestamp, and `drift` is an optional list of wire-shape
+   anomaly indicators (never token material).
 3. **No self refresh.** Never run an OAuth refresh grant. Refresh tokens may
    rotate; consuming one can invalidate Claude Code's stored refresh token and
    break the user's login. On expiry: re-read `~/.claude/.credentials.json`
@@ -208,7 +233,9 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
    fractionals); round only at display time. `scoped_limits`
    (map[string]*Window) was added additively; `seven_day_opus` /
    `seven_day_fable` remain as aliases for backward compat. `source` gained
-   the additive value `"stdin"` (statusline rate_limits path).
+   the additive value `"stdin"` (statusline rate_limits path). `drift`
+   (an optional `[]string` of wire-shape anomaly indicators) was added
+   additively; it is omitted when the last live fetch matched expectations.
 7. **Transcript files are read-only.** Never write under `~/.claude/`.
 
 ## Data source notes
@@ -241,8 +268,9 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
 - statusline stdin: Claude Code pipes session JSON. A `rate_limits` field
   appears intermittently across versions (#40094); when present it is parsed
   tolerantly (`used_percentage` or `utilization`; resets_at as ISO string or
-  epoch) into a usage.Snapshot and fed to `engine.ResolveStdin`. Never depend
-  on it. Confirmed shape (CC 2.1.217): `five_hour` / `seven_day` /
+  epoch seconds, or milliseconds when large) into a usage.Snapshot and fed
+  to `engine.ResolveStdin`. Never depend on it. Confirmed shape (CC
+  2.1.217): `five_hour` / `seven_day` /
   `seven_day_oauth_apps` / `seven_day_opus` / `seven_day_sonnet` windows,
   `model_scoped: [{display_name, utilization|null, resets_at ISO|null}]`
   (projected by CC from the server limits[] overage-included-models
@@ -254,26 +282,31 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
   backfills Opus); sonnet/oauth_apps/extra_usage are ignored, consistent
   with the API path.
 - Local limit-hit signal: when a limit is hit, Claude Code writes a synthetic
-  transcript message (`isApiErrorMessage: true`, text like
+  transcript message (`isApiErrorMessage: true`; its content is a plain
+  string or an array of typed text blocks; text like
   "You've hit your session limit · resets 4:50pm (Asia/Seoul)"). The
   transcript probe parses the reset time (am/pm, explicit IANA tz honored,
   rolled forward to the future).
 
 ## Comment policy
 
-**Comments are forbidden.** The code must be readable enough to stand alone;
-design rationale, invariants, and external constraints live in this file
-(AGENT.md), not in code.
+**No comments.** The code must stand alone: names, types, structure,
+subtests, and test failure messages carry the meaning; design rationale,
+invariants, contracts, and external constraints live in this file
+(AGENT.md), not in code. A comment that merely describes what code does —
+package docs, godocs, inline notes, section separators, labels on magic
+values, test scenario notes — is deleted on sight, in production code and
+tests alike. The repo is swept clean; keep it that way.
 
-Two narrow exceptions:
+The only `//` lines allowed are compiler and tool directives (`//go:build`,
+`//go:embed`, `//go:generate`, `//nolint`). When something genuinely needs
+explaining, do one of these instead of writing a comment:
 
-- A one-line package comment on each package.
-- A concise godoc (1–2 lines) on shared util/helper functions whose behavior
-  is not fully visible in the signature — parsers, formatters, and the like
-  (e.g. `parseRetryAfter`, `ParseReset`, `humanizeDuration`). Domain and flow
-  functions, types, fields, constants, and errors get no comment.
-
-Test files may keep short scenario notes (they document expected behavior).
+- Encode a contract in the name or the type (`readEntryLocked` for "caller
+  holds the flock").
+- Put a test's scenario in its name, a subtest name, or the failure message.
+- Record the rationale, invariant, or wire fact in the relevant section of
+  this file.
 
 ## Development
 
@@ -285,7 +318,15 @@ go vet ./... && gofmt -l .
 ```
 
 - **Never call the real API from tests or casual verification.** Live checks
-  are manual, rare, and deliberate (protect the 429 budget).
+  are manual, rare, and deliberate (protect the 429 budget). The one
+  sanctioned live path is `TestLiveSmoke` (`internal/usage/live_test.go`): it
+  is skipped unless `CCX_LIVE_TOKEN` is set, makes exactly one API call, and
+  logs the decoded windows plus any drift indicators, so regular CI and local
+  `go test ./...` never touch the endpoint. Run it deliberately with the
+  access token from `~/.claude/.credentials.json`:
+  `CCX_LIVE_TOKEN=<token> go test -run TestLiveSmoke -v ./internal/usage/`.
+  A dispatch-only GitHub workflow and golden fixtures of the captured shape
+  are deferred (see Roadmap).
 - Commands take a `resolver` interface; test command behavior (rendering,
   exit codes, flag handling) with a fake resolver returning canned States —
   see `cmd/ccx/commands_test.go`.
@@ -328,6 +369,19 @@ go vet ./... && gofmt -l .
   goreleaser uploads it and uploads `checksums.txt.sig`. To rotate: generate a
   new keypair, update `signkey.go`, cut a release that users install manually,
   and document that old binaries stop self-updating until reinstalled.
+- **Live-smoke workflow + golden fixtures (deferred):** a GitHub workflow
+  (`workflow_dispatch` only, never scheduled) that runs `TestLiveSmoke` with a
+  `CCX_LIVE_TOKEN` repo secret, plus golden fixtures of the captured live shape
+  under `internal/usage/testdata/` pinned by a golden test, so the
+  decode/reconcile/overlay pipeline stays tied to reality. Deliberately split
+  out of the drift-indicator change (PR #10); until they land, the live check
+  is the local, env-gated `TestLiveSmoke` only.
+- **Decode-failure drift (issue #11):** a response that fails to decode at
+  all (e.g. `resets_at` arriving as an epoch number) surfaces as a transient
+  error and a stale serve with no `drift` entry — the one silent-degrade
+  path the indicators cannot see. Plan: tolerant decode first (accept epoch
+  resets like the stdin parser does and flag the fallback as drift), and
+  surface decode errors as drift only if that proves insufficient.
 
 ## Decision log (abridged)
 
@@ -362,7 +416,10 @@ go vet ./... && gofmt -l .
   seconds; a slow endpoint would stall or kill the tick). When stdin is
   incomplete and a claim succeeds, the engine spawns a detached `ccx refresh`
   (Setsid, stdio /dev/null) that runs the ladder and stores the cache for the
-  NEXT tick; the parent serves the overlay immediately. Consequences:
+  NEXT tick; the parent serves the overlay immediately. The child is started
+  with `exec.Command`, not `exec.CommandContext`: the tick's timeout context
+  is cancelled as soon as the statusline command returns, and a context-bound
+  child would be killed with it mid-fetch. Consequences:
   (a) new installs surface allowlist-filtered scoped models one tick late
   (a one-tick cold-start cost), (b) a failed refresh still leaves an
   `attempted_at` claim so re-spawning stays ≤1/TTL, (c) the old
@@ -442,3 +499,39 @@ go vet ./... && gofmt -l .
   Coverage keyed off the cache also means a window the cache doesn't carry
   (API never reported it, e.g. an idle plan's `five_hour`) needs no healing,
   closing the theoretical ≤1/TTL spawn loop such plans would otherwise open.
+- wire drift is surfaced, not silently absorbed (drift indicators): the
+  endpoint is unofficial and its shape evolves (new codename fields, null
+  windows, new limits[] kinds), and a silent format change used to degrade
+  the pipeline into serving plausible-but-wrong numbers with every layer
+  "working fine". `usage.decode` now records drift indicators on
+  `FetchedSnapshot.Drift` — empty payload; a top-level window or an active
+  scoped entry missing `resets_at`; a model-scoped entry missing
+  `display_name`; a model-scoped entry under an unknown `kind`. Indicators
+  never block decoding (usable data still surfaces), the engine carries them
+  onto `State.drift` (additive, schema_version stays 1) and persists them in
+  the cache entry, so a fresh-cache or stale-cache serve still reports the
+  last-seen drift; a clean fetch stores no drift and so clears it. Two
+  deliberate non-indicators: the empty-payload check keys off usable data,
+  not raw field presence (group-scoped `limits[]` entries and an empty
+  `extra_usage` object carry no window, so a response with only those still
+  counts as empty), and the legacy `seven_day_opus` reset check fires only
+  when the Opus backfill actually consumed the field (an explicit `limits[]`
+  Opus entry shadows it). A scoped entry's missing `resets_at` counts only
+  while its percent is nonzero, since inactive scoped models legitimately
+  carry null resets; the top-level windows are expected to always carry one.
+  Visibility follows the suspect-guard rule: `now` (human `drift:` line +
+  `--json` field) shows the markers; the statusline deliberately does not,
+  because it mirrors Claude Code's own values. `TestLiveSmoke`
+  (`internal/usage/live_test.go`, skipped unless `CCX_LIVE_TOKEN` is set, one
+  API call per run) is the sanctioned way to check the real shape; a
+  dispatch-only workflow and golden fixtures are deferred (see Roadmap).
+- comments are gone entirely, not merely discouraged: the policy's exceptions
+  (package one-liners, short helper godocs, test scenario notes) kept
+  attracting descriptive comments that duplicated names and drifted from the
+  code. The repo was swept with a go/scanner-based strip that keeps only
+  compiler/tool directives, the two flock-precondition helpers became
+  `readEntryLocked`/`writeEntryLocked` so the contract lives in the name, and
+  every rationale the stripped comments carried now lives in this file (color
+  thresholds, stdin terminal skip, cache stat pre-check, goreleaser naming,
+  dev-build update rule, transcript content shapes). Tests express their
+  scenario through names and failure messages.

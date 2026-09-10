@@ -22,7 +22,7 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"type":"snapshot","five_hour":{"utilization":23}}`)
 
-	if err := c.Store(payload, fetchedAt, false); err != nil {
+	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -33,7 +33,6 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	if !e.FetchedAt.Equal(fetchedAt) {
 		t.Errorf("FetchedAt = %v, want %v", e.FetchedAt, fetchedAt)
 	}
-	// Payload must round-trip byte-for-byte (semantically equal JSON).
 	if !jsonEqual(t, e.Payload, payload) {
 		t.Errorf("payload = %s, want %s", e.Payload, payload)
 	}
@@ -47,8 +46,6 @@ func TestLoadMiss(t *testing.T) {
 }
 
 func TestLoadMissWhenParentDirAbsent(t *testing.T) {
-	// Loading a cache whose parent directory does not exist must be a fast
-	// miss, never a lock- or mkdir-induced error (hot path on cold start).
 	c := Open(filepath.Join(t.TempDir(), "missing", "snapshot.json"))
 	if _, err := c.Load(); err != ErrMiss {
 		t.Fatalf("Load with absent parent dir = %v, want ErrMiss", err)
@@ -59,7 +56,7 @@ func TestClaimRefreshRecordsAttemptPreservingData(t *testing.T) {
 	c := tempCache(t)
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, fetchedAt, false); err != nil {
+	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -114,8 +111,7 @@ func TestClaimRefreshThrottlesWithinBackoff(t *testing.T) {
 	if got, err := c.ClaimRefresh(t0.Add(backoff), backoff); err != nil || !got {
 		t.Fatalf("claim after backoff = %v, %v; want true", got, err)
 	}
-	// A fresh data store becomes the later of the two and throttles a claim.
-	if err := c.Store(json.RawMessage(`{"v":1}`), t0.Add(2*backoff-20*time.Second), false); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":1}`), t0.Add(2*backoff-20*time.Second), false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	if got, err := c.ClaimRefresh(t0.Add(2*backoff), backoff); err != nil || got {
@@ -123,9 +119,6 @@ func TestClaimRefreshThrottlesWithinBackoff(t *testing.T) {
 	}
 }
 
-// TestClaimRefreshConcurrent hammers ClaimRefresh from many goroutines at the
-// same instant and asserts exactly one claim wins — the cross-process (here
-// cross-goroutine) dedup that bounds refreshes to ≤1 per backoff.
 func TestClaimRefreshConcurrent(t *testing.T) {
 	c := tempCache(t)
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
@@ -158,25 +151,19 @@ func TestClaimRefreshConcurrent(t *testing.T) {
 
 func TestStoreRejectsInvalidJSON(t *testing.T) {
 	c := tempCache(t)
-	if err := c.Store(json.RawMessage(`{not json`), time.Now(), false); err == nil {
+	if err := c.Store(json.RawMessage(`{not json`), time.Now(), false, nil); err == nil {
 		t.Fatalf("Store accepted invalid JSON, want error")
 	}
-	// Nothing should have been written.
 	if _, err := c.Load(); err != ErrMiss {
 		t.Errorf("Load = %v, want ErrMiss after rejected store", err)
 	}
 }
 
-// TestNoTokenInCacheFile asserts the cache is a transparent passthrough: the
-// on-disk file contains only the caller's payload plus the two wrapper keys,
-// and never any value the caller did not put there. This is the structural
-// guarantee that a token cannot be persisted by the cache layer itself.
 func TestNoTokenInCacheFile(t *testing.T) {
 	c := tempCache(t)
 	const token = "sk-ant-oat-SUPER-SECRET-TOKEN"
-	// A realistic, token-free State payload.
 	payload := json.RawMessage(`{"schema_version":1,"type":"snapshot","auth":"ok","five_hour":{"utilization":23}}`)
-	if err := c.Store(payload, time.Now(), false); err != nil {
+	if err := c.Store(payload, time.Now(), false, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -188,7 +175,6 @@ func TestNoTokenInCacheFile(t *testing.T) {
 		t.Fatalf("token leaked into cache file")
 	}
 
-	// On-disk top-level keys must be exactly {fetched_at, payload}.
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
 		t.Fatalf("decode cache file: %v", err)
@@ -204,15 +190,12 @@ func TestNoTokenInCacheFile(t *testing.T) {
 	}
 }
 
-// TestScopedProbedRoundTrip asserts the provenance flag is persisted at the
-// entry level (never inside the opaque payload) and round-trips through
-// Store/Load.
 func TestScopedProbedRoundTrip(t *testing.T) {
 	c := tempCache(t)
 	fetchedAt := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"five_hour":{"utilization":23}}`)
 
-	if err := c.Store(payload, fetchedAt, true); err != nil {
+	if err := c.Store(payload, fetchedAt, true, nil); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	e, err := c.Load()
@@ -226,7 +209,7 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 		t.Errorf("scoped_probed leaked into the payload: %s", e.Payload)
 	}
 
-	if err := c.Store(payload, fetchedAt, false); err != nil {
+	if err := c.Store(payload, fetchedAt, false, nil); err != nil {
 		t.Fatalf("Store(false): %v", err)
 	}
 	e, err = c.Load()
@@ -241,11 +224,11 @@ func TestScopedProbedRoundTrip(t *testing.T) {
 func TestStoreOverwrites(t *testing.T) {
 	c := tempCache(t)
 	t0 := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	if err := c.Store(json.RawMessage(`{"v":1}`), t0, false); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":1}`), t0, false, nil); err != nil {
 		t.Fatalf("Store1: %v", err)
 	}
 	t1 := t0.Add(time.Minute)
-	if err := c.Store(json.RawMessage(`{"v":2}`), t1, false); err != nil {
+	if err := c.Store(json.RawMessage(`{"v":2}`), t1, false, nil); err != nil {
 		t.Fatalf("Store2: %v", err)
 	}
 	e, err := c.Load()
@@ -260,14 +243,10 @@ func TestStoreOverwrites(t *testing.T) {
 	}
 }
 
-// TestConcurrentAccess hammers the cache from many goroutines. With flock +
-// atomic rename, every Load must see a complete, valid entry whose payload is
-// one of the written values (never a torn write).
 func TestConcurrentAccess(t *testing.T) {
 	c := tempCache(t)
 	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	// Seed so early readers don't all miss.
-	if err := c.Store(json.RawMessage(`{"writer":0,"i":0}`), base, false); err != nil {
+	if err := c.Store(json.RawMessage(`{"writer":0,"i":0}`), base, false, nil); err != nil {
 		t.Fatalf("seed Store: %v", err)
 	}
 
@@ -280,7 +259,7 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				p := json.RawMessage(`{"writer":` + strconv.Itoa(w) + `,"i":` + strconv.Itoa(i) + `}`)
-				if err := c.Store(p, base.Add(time.Duration(i)*time.Second), false); err != nil {
+				if err := c.Store(p, base.Add(time.Duration(i)*time.Second), false, nil); err != nil {
 					t.Errorf("writer %d Store: %v", w, err)
 					return
 				}
@@ -298,7 +277,6 @@ func TestConcurrentAccess(t *testing.T) {
 					t.Errorf("Load: %v", err)
 					return
 				}
-				// Payload must always be valid JSON (no torn writes).
 				var obj map[string]int
 				if err := json.Unmarshal(e.Payload, &obj); err != nil {
 					t.Errorf("torn/invalid payload %q: %v", e.Payload, err)
@@ -310,8 +288,6 @@ func TestConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
-
-// --- helpers ---
 
 func jsonEqual(t *testing.T, a, b json.RawMessage) bool {
 	t.Helper()

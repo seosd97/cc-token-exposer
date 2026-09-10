@@ -10,8 +10,6 @@ import (
 	"time"
 )
 
-// testToken is a synthetic, non-secret value used purely to assert it never
-// leaks into errors. It is not a real credential.
 const testToken = "synthetic-test-token-DO-NOT-LEAK"
 
 func fixedClock(t time.Time) func() time.Time {
@@ -27,9 +25,6 @@ func newTestClient(t *testing.T, srv *httptest.Server, now time.Time) *Client {
 	)
 }
 
-// sampleBody mirrors the live endpoint, which sends utilization as a JSON
-// float (e.g. 23.0) rather than an int (regression guard for the #5
-// live-checkpoint decode bug).
 const sampleBody = `{
   "five_hour":       {"utilization": 23.0, "resets_at": "2026-06-12T18:00:00Z"},
   "seven_day":       {"utilization": 41.0, "resets_at": "2026-06-18T00:00:00Z"},
@@ -56,7 +51,6 @@ func TestFetchOK(t *testing.T) {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
 
-	// Required headers.
 	if got := gotReq.Header.Get("Authorization"); got != "Bearer "+testToken {
 		t.Errorf("Authorization header = %q, want bearer token", got)
 	}
@@ -97,10 +91,6 @@ func TestFetchOK(t *testing.T) {
 	}
 }
 
-// scopedLimitsBody mirrors the current live endpoint, which no longer fills the
-// top-level seven_day_opus (it sends null) and instead carries per-model weekly
-// limits in a limits[] array keyed by scope.model.display_name. Fable has no
-// top-level field at all — limits[] is its only source.
 const scopedLimitsBody = `{
   "five_hour":      {"utilization": 19.0, "resets_at": "2026-07-06T07:19:59Z"},
   "seven_day":      {"utilization": 58.0, "resets_at": "2026-07-08T20:59:59Z"},
@@ -205,6 +195,162 @@ func TestFetchEmptyToken(t *testing.T) {
 	_, err := c.Fetch(context.Background(), "")
 	if !errors.Is(err, ErrAuth) {
 		t.Fatalf("err = %v, want ErrAuth", err)
+	}
+}
+
+const driftBody = `{
+  "five_hour": {"utilization": 23.0},
+  "seven_day": {"utilization": 41.0, "resets_at": "2026-06-18T00:00:00Z"},
+  "limits": [
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 30, "resets_at": "2026-06-18T00:00:00Z", "scope": {"model": {}}},
+    {"kind": "weekly_scoped_v2", "group": "weekly", "percent": 50, "resets_at": "2026-06-18T00:00:00Z", "scope": {"model": {"display_name": "Mystery"}}}
+  ]
+}`
+
+func TestFetchReportsDriftIndicators(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(driftBody))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	want := []string{
+		"five_hour missing resets_at",
+		"limits entry missing model display_name",
+		`unknown scoped limits kind "weekly_scoped_v2"`,
+	}
+	if len(snap.Drift) != len(want) {
+		t.Fatalf("Drift = %v, want %v", snap.Drift, want)
+	}
+	for i, w := range want {
+		if snap.Drift[i] != w {
+			t.Errorf("Drift[%d] = %q, want %q", i, snap.Drift[i], w)
+		}
+	}
+	if snap.Snapshot.FiveHour == nil || snap.Snapshot.FiveHour.Utilization != 23 {
+		t.Errorf("drift must not block decoding: five_hour = %+v", snap.Snapshot.FiveHour)
+	}
+	if w := snap.Snapshot.ScopedLimits["Mystery"]; w == nil || w.Utilization != 50 {
+		t.Errorf("drift must not drop decodable scoped data: Mystery = %+v", w)
+	}
+}
+
+func TestFetchEmptyPayloadFlagsDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"seven_day_opus": null, "limits": []}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "empty usage payload" {
+		t.Fatalf("Drift = %v, want [empty usage payload]", snap.Drift)
+	}
+}
+
+func TestFetchCleanResponseHasNoDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(scopedLimitsBody))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 0 {
+		t.Fatalf("Drift = %v, want none on the documented shape", snap.Drift)
+	}
+}
+
+func TestFetchGroupScopedOnlyPayloadFlagsEmptyDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"limits": [
+			{"kind": "session",    "group": "session", "percent": 19, "resets_at": "2026-07-06T07:19:59Z", "scope": null},
+			{"kind": "weekly_all", "group": "weekly",  "percent": 58, "resets_at": "2026-07-08T20:59:59Z", "scope": null}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Snapshot.ScopedLimits) != 0 {
+		t.Fatalf("scoped_limits = %+v, want none (group-scoped entries are not decodable)", snap.Snapshot.ScopedLimits)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "empty usage payload" {
+		t.Fatalf("Drift = %v, want [empty usage payload]", snap.Drift)
+	}
+}
+
+func TestFetchEmptyExtraUsageFlagsEmptyDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"extra_usage": {}}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "empty usage payload" {
+		t.Fatalf("Drift = %v, want [empty usage payload]", snap.Drift)
+	}
+}
+
+func TestFetchLegacyOpusMissingResetsFlagsDrift(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"seven_day_opus": {"utilization": 10.0}}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 1 || snap.Drift[0] != "seven_day_opus missing resets_at" {
+		t.Fatalf("Drift = %v, want [seven_day_opus missing resets_at]", snap.Drift)
+	}
+	if w := snap.Snapshot.ScopedLimits["Opus"]; w == nil || w.Utilization != 10 {
+		t.Fatalf("drift must not block decoding: scoped_limits[Opus] = %+v, want utilization 10", w)
+	}
+}
+
+func TestFetchShadowedLegacyOpusNotFlagged(t *testing.T) {
+	body := `{
+	  "seven_day_opus": {"utilization": 10.0},
+	  "limits": [
+	    {"kind": "weekly_scoped", "group": "weekly", "percent": 30, "resets_at": "2026-07-08T20:59:59Z", "scope": {"model": {"display_name": "Opus"}}}
+	  ]
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, time.Now())
+	snap, err := c.Fetch(context.Background(), testToken)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(snap.Drift) != 0 {
+		t.Fatalf("Drift = %v, want none (legacy field is shadowed by limits[])", snap.Drift)
+	}
+	if w := snap.Snapshot.ScopedLimits["Opus"]; w == nil || w.Utilization != 30 {
+		t.Fatalf("scoped_limits[Opus] = %+v, want utilization 30 from limits[]", w)
 	}
 }
 
@@ -313,7 +459,7 @@ func TestFetchNetworkErrorTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	url := srv.URL
 	client := srv.Client()
-	srv.Close() // server is down: Do will fail at the transport layer.
+	srv.Close()
 
 	c := New(WithEndpoint(url), WithHTTPClient(client))
 	_, err := c.Fetch(context.Background(), testToken)
@@ -338,7 +484,6 @@ func TestFetchContextCanceled(t *testing.T) {
 	}
 }
 
-// assertNoTokenLeak ensures the token never appears in an error string.
 func assertNoTokenLeak(t *testing.T, err error) {
 	t.Helper()
 	if err != nil && strings.Contains(err.Error(), testToken) {
@@ -360,7 +505,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{" 30 ", 30 * time.Second},
 		{"not-a-number", 0},
 		{now.Add(60 * time.Second).UTC().Format(http.TimeFormat), 60 * time.Second},
-		{now.Add(-60 * time.Second).UTC().Format(http.TimeFormat), 0}, // past date
+		{now.Add(-60 * time.Second).UTC().Format(http.TimeFormat), 0},
 	}
 	for _, tc := range cases {
 		if got := parseRetryAfter(tc.in, now); got != tc.want {

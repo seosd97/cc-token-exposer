@@ -7,7 +7,6 @@ import (
 	"time"
 )
 
-// fakeSource is a test double for Source.
 type fakeSource struct {
 	name string
 	c    *Credentials

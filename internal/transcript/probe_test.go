@@ -9,7 +9,6 @@ import (
 
 func TestProbeFindsLatestHit(t *testing.T) {
 	dir := t.TempDir()
-	// Two project subdirs, each with a transcript; the limit hit is in one.
 	mustWrite(t, filepath.Join(dir, "proj-a", "session.jsonl"),
 		`{"type":"user","timestamp":"2026-06-12T10:00:00Z","message":{"role":"user","content":"hi"}}`+"\n")
 	mustWrite(t, filepath.Join(dir, "proj-b", "session.jsonl"),

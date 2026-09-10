@@ -1,4 +1,3 @@
-// Package schema defines the versioned JSON wire contract emitted by ccx.
 package schema
 
 import (
@@ -47,10 +46,6 @@ type Snapshot struct {
 	ExtraUsage   *ExtraUsage        `json:"extra_usage,omitempty"`
 }
 
-// snapshotWire mirrors Snapshot with the legacy per-model alias fields. The
-// aliases are a wire-compat concern, not internal state: MarshalJSON emits
-// seven_day_opus / seven_day_fable from ScopedLimits so legacy --json consumers
-// keep working while new models appear only under scoped_limits.
 type snapshotWire struct {
 	FetchedAt     time.Time          `json:"fetched_at"`
 	FiveHour      *Window            `json:"five_hour,omitempty"`
@@ -94,6 +89,7 @@ type State struct {
 	Snapshot      *Snapshot  `json:"snapshot,omitempty"`
 	LimitHit      *LimitHit  `json:"limit_hit,omitempty"`
 	Error         string     `json:"error,omitempty"`
+	Drift         []string   `json:"drift,omitempty"`
 }
 
 type Duration time.Duration

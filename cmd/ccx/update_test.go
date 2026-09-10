@@ -10,7 +10,6 @@ import (
 	"github.com/seosd97/cc-token-exposer/internal/selfupdate"
 )
 
-// latestServer serves only the release-metadata endpoint with the given tag.
 func latestServer(t *testing.T, tag string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +52,6 @@ func TestUpdateCheckReportsNewVersion(t *testing.T) {
 }
 
 func TestUpdateCheckAlreadyUpToDate(t *testing.T) {
-	// The test binary's version parses to 0.0.0, so a v0.0.0 latest is equal.
 	out, err := runUpdate(t, updateClient(latestServer(t, "v0.0.0")), "--check")
 	if err != nil {
 		t.Fatalf("Execute: %v", err)

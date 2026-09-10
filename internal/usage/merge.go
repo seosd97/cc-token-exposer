@@ -2,11 +2,6 @@ package usage
 
 import "github.com/seosd97/cc-token-exposer/internal/schema"
 
-// Overlay layers fresh over base per window: the utilization of anything fresh
-// provides wins; anything fresh lacks — the window itself, or a usable reset
-// time — falls back to base, and the later reset always wins (a reset boundary
-// only moves forward between cycles). ExtraUsage always comes from fresh
-// (Reconcile does the same). Reports whether base contributed.
 func Overlay(fresh, base *schema.Snapshot) (*schema.Snapshot, bool) {
 	if fresh == nil {
 		return base, base != nil
@@ -45,8 +40,6 @@ func Overlay(fresh, base *schema.Snapshot) (*schema.Snapshot, bool) {
 	return &out, used
 }
 
-// overlayWindow merges one window: fresh wins; base fills in a missing window
-// or a later (newer-cycle) reset time. ok reports whether base contributed.
 func overlayWindow(fresh, base *schema.Window) (*schema.Window, bool) {
 	if fresh == nil {
 		return base, base != nil

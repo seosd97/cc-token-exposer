@@ -10,7 +10,6 @@ import (
 func TestFindTranscriptsTopKNewestFirst(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	// 5 files with distinct mtimes; only 3 must be kept, newest first.
 	for i := 0; i < 5; i++ {
 		p := filepath.Join(dir, "p", "s"+string(rune('a'+i))+".jsonl")
 		mustWrite(t, p, "x\n")
@@ -18,7 +17,6 @@ func TestFindTranscriptsTopKNewestFirst(t *testing.T) {
 			t.Fatalf("Chtimes %s: %v", p, err)
 		}
 	}
-	// A non-transcript file must be ignored.
 	mustWrite(t, filepath.Join(dir, "p", "notes.md"), "nope")
 
 	files, err := FindTranscripts(dir, 3)
@@ -28,7 +26,6 @@ func TestFindTranscriptsTopKNewestFirst(t *testing.T) {
 	if len(files) != 3 {
 		t.Fatalf("got %d files, want 3", len(files))
 	}
-	// Newest first, and the two oldest are excluded.
 	if !files[0].ModTime.Equal(base.Add(4 * time.Minute)) {
 		t.Errorf("files[0] mtime = %v, want the newest", files[0].ModTime)
 	}

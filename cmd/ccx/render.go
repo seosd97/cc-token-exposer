@@ -57,6 +57,9 @@ func renderHuman(st *schema.State, now time.Time) string {
 	if b.Len() == 0 {
 		b.WriteString("no usage data\n")
 	}
+	if len(st.Drift) > 0 {
+		b.WriteString("drift: " + strings.Join(st.Drift, " · ") + "\n")
+	}
 
 	b.WriteString(freshnessFooter(st))
 	return b.String()
@@ -105,8 +108,6 @@ func staleSuffix(st *schema.State) string {
 	return " (" + humanizeDuration(time.Duration(*st.StaleAge)) + " old)"
 }
 
-// humanizeDuration formats a duration like "4h12m", "3d5h", "45s"; non-positive
-// durations render as "now".
 func humanizeDuration(d time.Duration) string {
 	if d <= 0 {
 		return "now"

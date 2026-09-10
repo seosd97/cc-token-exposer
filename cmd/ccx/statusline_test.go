@@ -210,11 +210,9 @@ func TestReadStatuslineInput(t *testing.T) {
 }
 
 func TestIsTerminal(t *testing.T) {
-	// A non-*os.File reader (pipe/buffer) is never a terminal, so stdin is read.
 	if isTerminal(strings.NewReader("{}")) {
 		t.Error("strings.Reader should not be reported as a terminal")
 	}
-	// A regular file (not a char device) is also not a terminal.
 	f, err := os.CreateTemp(t.TempDir(), "stdin-*")
 	if err != nil {
 		t.Fatalf("temp: %v", err)
@@ -246,7 +244,6 @@ func TestSnapshotFromRateLimits(t *testing.T) {
 		if !ok {
 			t.Fatal("expected a snapshot")
 		}
-		// The wire type is float64: the raw value is preserved, not rounded.
 		if snap.FiveHour == nil || snap.FiveHour.Utilization != 23 {
 			t.Errorf("five_hour = %+v, want 23", snap.FiveHour)
 		}
@@ -259,8 +256,6 @@ func TestSnapshotFromRateLimits(t *testing.T) {
 	})
 
 	t.Run("used_percentage field name with epoch resets_at", func(t *testing.T) {
-		// The observed statusline schema uses used_percentage and may send
-		// resets_at as an epoch (seconds here).
 		epoch := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC).Unix()
 		raw := []byte(`{"five_hour":{"used_percentage":33,"resets_at":` + strconv.FormatInt(epoch, 10) + `}}`)
 		snap, ok := snapshotFromRateLimits(raw, now)
@@ -284,8 +279,6 @@ func TestSnapshotFromRateLimits(t *testing.T) {
 	})
 
 	t.Run("window without resets_at keeps its percentage", func(t *testing.T) {
-		// CC can pipe null/missing resets_at; the window must survive (the
-		// engine backfills the reset from cache or heals it via refresh).
 		raw := []byte(`{"five_hour":{"used_percentage":47},"seven_day":{"used_percentage":20,"resets_at":null}}`)
 		snap, ok := snapshotFromRateLimits(raw, now)
 		if !ok {
@@ -300,7 +293,6 @@ func TestSnapshotFromRateLimits(t *testing.T) {
 	})
 
 	t.Run("window without a percentage is ignored", func(t *testing.T) {
-		// Only resets_at, no used_percentage/utilization -> not a usable window.
 		raw := []byte(`{"five_hour":{"resets_at":"2026-06-12T16:00:00Z"}}`)
 		if _, ok := snapshotFromRateLimits(raw, now); ok {
 			t.Error("window without a percentage should not yield a snapshot")

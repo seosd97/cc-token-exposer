@@ -7,9 +7,6 @@ import (
 	"strings"
 )
 
-// Apply atomically replaces the executable at target with newBinary by writing
-// a sibling temp file and renaming it over the target (the running process
-// keeps its own open inode on Unix).
 func Apply(newBinary []byte, target string) error {
 	dir := filepath.Dir(target)
 	tmp, err := os.CreateTemp(dir, ".ccx-update-*")
@@ -35,8 +32,6 @@ func Apply(newBinary []byte, target string) error {
 	return nil
 }
 
-// IsHomebrew reports whether execPath resolves into a Homebrew Cellar, meaning
-// the install is brew-managed and should be updated with `brew upgrade`.
 func IsHomebrew(execPath string) bool {
 	resolved, err := filepath.EvalSymlinks(execPath)
 	if err != nil {

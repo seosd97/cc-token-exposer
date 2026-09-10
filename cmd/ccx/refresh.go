@@ -9,10 +9,6 @@ import (
 
 const refreshTimeout = 30 * time.Second
 
-// newRefreshCmd runs the full engine ladder once, discarding the result. It is
-// the detached workhorse behind the statusline path: a spawned `ccx refresh`
-// refreshes and stores the shared disk cache without any output, so the next
-// statusline tick serves fresher data.
 func newRefreshCmd(res resolver) *cobra.Command {
 	return &cobra.Command{
 		Use:    "refresh",

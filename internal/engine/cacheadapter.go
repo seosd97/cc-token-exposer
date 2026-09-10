@@ -36,11 +36,12 @@ func (a cacheAdapter) Load() (*CacheEntry, error) {
 		StoredAt:     e.FetchedAt,
 		AttemptedAt:  attemptedAt,
 		ScopedProbed: e.ScopedProbed,
+		Drift:        e.Drift,
 	}, nil
 }
 
 func (a cacheAdapter) Store(e CacheEntry) error {
-	return a.c.Store(json.RawMessage(e.Payload), e.StoredAt, e.ScopedProbed)
+	return a.c.Store(json.RawMessage(e.Payload), e.StoredAt, e.ScopedProbed, e.Drift)
 }
 
 func (a cacheAdapter) ClaimRefresh(now time.Time, backoff time.Duration) (bool, error) {

@@ -33,7 +33,6 @@ func TestApplyReplacesTarget(t *testing.T) {
 		t.Errorf("target not executable: %v", info.Mode())
 	}
 
-	// No leftover temp files in the directory.
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 1 {
 		t.Errorf("directory has stray files: %v", entries)

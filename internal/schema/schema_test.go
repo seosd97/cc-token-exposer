@@ -63,7 +63,6 @@ func TestStateJSONShape(t *testing.T) {
 			t.Fatalf("missing key %q in %s", k, b)
 		}
 	}
-	// Optional fields absent when empty.
 	if _, ok := generic["stale_age"]; ok {
 		t.Fatalf("stale_age should be omitted when nil")
 	}
@@ -79,10 +78,6 @@ func TestSuspectOmittedWhenFalse(t *testing.T) {
 	}
 }
 
-// TestSnapshotMarshalEmitsAliases guards the wire contract: legacy
-// seven_day_opus / seven_day_fable aliases must be emitted from ScopedLimits at
-// marshal time (only for those two models), and must round-trip through the
-// Snapshot type without leaking into internal state.
 func TestSnapshotMarshalEmitsAliases(t *testing.T) {
 	reset := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC)
 	s := &Snapshot{
@@ -130,5 +125,33 @@ func TestSnapshotMarshalOmitsAliasesWithoutScopedModels(t *testing.T) {
 	}
 	if strings.Contains(string(b), "seven_day_opus") || strings.Contains(string(b), "seven_day_fable") {
 		t.Fatalf("aliases should be omitted when no scoped models: %s", b)
+	}
+}
+
+func TestStateDriftOmittedWhenEmpty(t *testing.T) {
+	b, _ := json.Marshal(&State{SchemaVersion: Version, Type: TypeSnapshot, Source: SourceOAuth, Auth: AuthOK})
+	if strings.Contains(string(b), "drift") {
+		t.Fatalf("drift should be omitted when empty: %s", b)
+	}
+}
+
+func TestStateDriftRoundTrip(t *testing.T) {
+	want := []string{"five_hour missing resets_at", `unknown scoped limits kind "x"`}
+	st := &State{SchemaVersion: Version, Type: TypeSnapshot, Source: SourceOAuth, Auth: AuthOK, Drift: want}
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back State
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(back.Drift) != len(want) {
+		t.Fatalf("Drift = %v, want %v", back.Drift, want)
+	}
+	for i := range want {
+		if back.Drift[i] != want[i] {
+			t.Fatalf("Drift[%d] = %q, want %q", i, back.Drift[i], want[i])
+		}
 	}
 }

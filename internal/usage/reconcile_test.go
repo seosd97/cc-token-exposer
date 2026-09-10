@@ -9,8 +9,8 @@ import (
 
 func TestReconcile(t *testing.T) {
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	future := now.Add(2 * time.Hour) // window not yet reset
-	past := now.Add(-1 * time.Hour)  // window already elapsed
+	future := now.Add(2 * time.Hour)
+	past := now.Add(-1 * time.Hour)
 
 	win := func(util float64, reset time.Time) *schema.Window {
 		return &schema.Window{Utilization: util, ResetsAt: reset}
@@ -31,7 +31,7 @@ func TestReconcile(t *testing.T) {
 
 	t.Run("suspect drop within same window keeps prev", func(t *testing.T) {
 		prev := &schema.Snapshot{FiveHour: win(80, future)}
-		next := &schema.Snapshot{FiveHour: win(45, future)} // 35pt drop, > threshold
+		next := &schema.Snapshot{FiveHour: win(45, future)}
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 80 {
 			t.Errorf("utilization = %v, want retained 80", got.FiveHour.Utilization)
@@ -39,7 +39,6 @@ func TestReconcile(t *testing.T) {
 		if !got.FiveHour.Suspect {
 			t.Errorf("expected Suspect=true")
 		}
-		// Inputs must not be mutated.
 		if next.FiveHour.Suspect || next.FiveHour.Utilization != 45 {
 			t.Errorf("next mutated: %+v", next.FiveHour)
 		}
@@ -47,7 +46,7 @@ func TestReconcile(t *testing.T) {
 
 	t.Run("small drop is accepted", func(t *testing.T) {
 		prev := &schema.Snapshot{FiveHour: win(80, future)}
-		next := &schema.Snapshot{FiveHour: win(60, future)} // 20pt drop, < threshold
+		next := &schema.Snapshot{FiveHour: win(60, future)}
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 60 || got.FiveHour.Suspect {
 			t.Errorf("got %+v, want 60 non-suspect", got.FiveHour)
@@ -56,7 +55,7 @@ func TestReconcile(t *testing.T) {
 
 	t.Run("exactly threshold is suspect", func(t *testing.T) {
 		prev := &schema.Snapshot{FiveHour: win(80, future)}
-		next := &schema.Snapshot{FiveHour: win(50, future)} // exactly 30pt
+		next := &schema.Snapshot{FiveHour: win(50, future)}
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 80 || !got.FiveHour.Suspect {
 			t.Errorf("got %+v, want retained 80 suspect", got.FiveHour)
@@ -65,7 +64,7 @@ func TestReconcile(t *testing.T) {
 
 	t.Run("window reset allows legitimate drop", func(t *testing.T) {
 		prev := &schema.Snapshot{FiveHour: win(80, past)}
-		next := &schema.Snapshot{FiveHour: win(5, future)} // boundary advanced
+		next := &schema.Snapshot{FiveHour: win(5, future)}
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 5 || got.FiveHour.Suspect {
 			t.Errorf("got %+v, want fresh 5 non-suspect", got.FiveHour)
@@ -117,8 +116,8 @@ func TestReconcile(t *testing.T) {
 			SevenDay: win(50, future),
 		}
 		next := &schema.Snapshot{
-			FiveHour: win(10, future), // suspect drop
-			SevenDay: win(55, future), // normal increase
+			FiveHour: win(10, future),
+			SevenDay: win(55, future),
 		}
 		got := Reconcile(prev, next, now)
 		if got.FiveHour.Utilization != 90 || !got.FiveHour.Suspect {

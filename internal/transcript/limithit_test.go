@@ -10,7 +10,7 @@ import (
 
 func TestParseReset(t *testing.T) {
 	loc := time.UTC
-	ref := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC) // noon
+	ref := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 
 	cases := []struct {
 		name   string
@@ -39,7 +39,7 @@ func TestParseReset(t *testing.T) {
 		{
 			name:   "noon is 12pm",
 			text:   "resets 12:00pm",
-			want:   time.Date(2026, 6, 12, 12, 0, 0, 0, loc).AddDate(0, 0, 1), // == ref, not after -> rolls
+			want:   time.Date(2026, 6, 12, 12, 0, 0, 0, loc).AddDate(0, 0, 1),
 			wantOK: true,
 		},
 		{
@@ -80,20 +80,18 @@ func TestParseResetHonorsExplicitTimezone(t *testing.T) {
 	if err != nil {
 		t.Skip("Asia/Seoul tzdata unavailable")
 	}
-	// Default loc is UTC, but the message names Asia/Seoul (UTC+9), which must win.
-	ref := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC) // 09:00 KST
+	ref := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
 	got, ok := ParseReset("You've hit your session limit · resets 4:50pm (Asia/Seoul)", ref, time.UTC)
 	if !ok {
 		t.Fatal("expected a parse")
 	}
-	want := time.Date(2026, 6, 12, 16, 50, 0, 0, seoul) // 16:50 KST, after 09:00 KST
+	want := time.Date(2026, 6, 12, 16, 50, 0, 0, seoul)
 	if !got.Equal(want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
 func TestParseResetInvalidTimezoneFallsBack(t *testing.T) {
-	// A bogus IANA name must fall back to the supplied loc, not fail.
 	ref := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	got, ok := ParseReset("resets 2:30pm (Not/AZone)", ref, time.UTC)
 	if !ok {
@@ -147,7 +145,6 @@ func TestScanReaderIgnoresNonLimit(t *testing.T) {
 
 func TestScanReaderStringContent(t *testing.T) {
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	// content as a plain string rather than a block array.
 	const line = `{"type":"assistant","timestamp":"2026-06-12T13:00:00Z","isApiErrorMessage":true,"message":{"role":"assistant","content":"You've hit your session limit · resets 5pm"}}`
 	hit, err := ScanReader(strings.NewReader(line), now, time.UTC)
 	if err != nil {
@@ -176,8 +173,6 @@ func TestScanReaderLimitWithoutReset(t *testing.T) {
 	}
 }
 
-// TestScanLatestGolden uses a synthetic transcript fixture and asserts the most
-// recent limit hit (by transcript timestamp) is selected with the right reset.
 func TestScanLatestGolden(t *testing.T) {
 	loc := time.UTC
 	now := time.Date(2026, 6, 12, 20, 0, 0, 0, time.UTC)
@@ -194,7 +189,6 @@ func TestScanLatestGolden(t *testing.T) {
 	if hit == nil {
 		t.Fatal("expected a limit hit from fixture")
 	}
-	// The later of the two hits is at 18:45Z, "resets 11:50pm" -> 23:50Z same day.
 	wantDetected := time.Date(2026, 6, 12, 18, 45, 0, 0, loc)
 	if !hit.DetectedAt.Equal(wantDetected) {
 		t.Errorf("DetectedAt = %v, want %v (latest hit)", hit.DetectedAt, wantDetected)
@@ -216,28 +210,21 @@ func TestScanLatestNoFiles(t *testing.T) {
 	}
 }
 
-// TestScanLatestCrossesMtimeBoundary proves the early-exit rule still finds the
-// true newest hit even when an older-mtime file holds a newer message: a hit's
-// timestamp never exceeds its file's mtime, so a file with mtime > the found
-// hit is never skipped.
 func TestScanLatestCrossesMtimeBoundary(t *testing.T) {
 	dir := t.TempDir()
 	loc := time.UTC
 	now := time.Date(2026, 6, 12, 13, 0, 0, 0, time.UTC)
 
-	// File A: newest mtime (12:00Z) but only an old hit (10:00Z).
 	pA := filepath.Join(dir, "a.jsonl")
 	mustWrite(t, pA, hitLine("2026-06-12T10:00:00Z", "resets 2:00pm")+"\n")
 	if err := os.Chtimes(pA, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
 		t.Fatalf("chtimes a: %v", err)
 	}
-	// File B: older mtime (11:00Z) but a newer hit (10:55Z) — must be scanned.
 	pB := filepath.Join(dir, "b.jsonl")
 	mustWrite(t, pB, hitLine("2026-06-12T10:55:00Z", "resets 2:30pm")+"\n")
 	if err := os.Chtimes(pB, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
 		t.Fatalf("chtimes b: %v", err)
 	}
-	// File C: mtime (10:30Z) not newer than the found hit — must be skipped.
 	pC := filepath.Join(dir, "c.jsonl")
 	mustWrite(t, pC, hitLine("2026-06-12T10:40:00Z", "resets 2:45pm")+"\n")
 	if err := os.Chtimes(pC, now.Add(-3*time.Hour), now.Add(-3*time.Hour)); err != nil {
@@ -265,9 +252,6 @@ func TestScanLatestCrossesMtimeBoundary(t *testing.T) {
 	}
 }
 
-// TestScanFileReadsTailChunk asserts a hit near the end of a multi-megabyte file
-// is found via the tail scan, and a hit buried at the head is still found via
-// the full-scan fallback.
 func TestScanFileReadsTailChunk(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
@@ -276,7 +260,6 @@ func TestScanFileReadsTailChunk(t *testing.T) {
 		t.Fatalf("fixture too small: %d bytes", len(padding))
 	}
 
-	// Hit at the very end of a large file: found via the tail scan.
 	tail := filepath.Join(dir, "tail.jsonl")
 	mustWrite(t, tail, padding+hitLine("2026-06-12T11:59:00Z", "resets 2:00pm")+"\n")
 	hit, err := ScanFile(tail, now, time.UTC)
@@ -287,7 +270,6 @@ func TestScanFileReadsTailChunk(t *testing.T) {
 		t.Errorf("DetectedAt = %v, want the tail hit", hit.DetectedAt)
 	}
 
-	// Hit buried far before the tail: found via the full-scan fallback.
 	head := filepath.Join(dir, "head.jsonl")
 	body := strings.Repeat(`{"type":"user","timestamp":"2026-06-12T00:00:00Z","message":{"content":"pad"}}`+"\n", 20000) +
 		hitLine("2026-06-12T11:59:00Z", "resets 2:00pm") + "\n"
@@ -305,9 +287,6 @@ func hitLine(ts, reset string) string {
 	return `{"type":"assistant","timestamp":"` + ts + `","isApiErrorMessage":true,"message":{"role":"assistant","content":"You've hit your session limit · ` + reset + `"}}`
 }
 
-// TestProbeDiscardsElapsedReset asserts a limit hit whose reset time has
-// already passed is not surfaced as an active limit (the probe's stale-hit
-// filter).
 func TestProbeDiscardsElapsedReset(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
