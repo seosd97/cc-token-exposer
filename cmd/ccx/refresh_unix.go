@@ -19,7 +19,7 @@ func (processRefresher) Spawn(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, exe, "refresh")
+	cmd := exec.Command(exe, "refresh")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = nil
 	cmd.Stdout = nil

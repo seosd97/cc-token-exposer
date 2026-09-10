@@ -362,7 +362,10 @@ go vet ./... && gofmt -l .
   seconds; a slow endpoint would stall or kill the tick). When stdin is
   incomplete and a claim succeeds, the engine spawns a detached `ccx refresh`
   (Setsid, stdio /dev/null) that runs the ladder and stores the cache for the
-  NEXT tick; the parent serves the overlay immediately. Consequences:
+  NEXT tick; the parent serves the overlay immediately. The child is started
+  with `exec.Command`, not `exec.CommandContext`: the tick's timeout context
+  is cancelled as soon as the statusline command returns, and a context-bound
+  child would be killed with it mid-fetch. Consequences:
   (a) new installs surface allowlist-filtered scoped models one tick late
   (a one-tick cold-start cost), (b) a failed refresh still leaves an
   `attempted_at` claim so re-spawning stays ≤1/TTL, (c) the old
