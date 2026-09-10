@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seosd97/cc-token-exposer/internal/creds"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
@@ -20,7 +21,7 @@ func TestLiveSmoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	fetched, err := New().Fetch(ctx, token)
+	fetched, err := New().Fetch(ctx, &creds.Credentials{AccessToken: token})
 	if err != nil {
 		t.Fatalf("live fetch: %v", err)
 	}

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seosd97/cc-token-exposer/internal/creds"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
@@ -94,10 +95,11 @@ func New(opts ...Option) *Client {
 	return c
 }
 
-func (c *Client) Fetch(ctx context.Context, token string) (*FetchedSnapshot, error) {
-	if token == "" {
+func (c *Client) Fetch(ctx context.Context, cr *creds.Credentials) (*FetchedSnapshot, error) {
+	if cr == nil || cr.AccessToken == "" {
 		return nil, fmt.Errorf("%w: empty token", ErrAuth)
 	}
+	token := cr.AccessToken
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
 	if err != nil {

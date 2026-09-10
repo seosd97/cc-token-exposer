@@ -155,3 +155,14 @@ func TestStateDriftRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestStateProviderOnTheWire(t *testing.T) {
+	b, _ := json.Marshal(&State{SchemaVersion: Version, Provider: ProviderCodex, Type: TypeSnapshot, Source: SourceOAuth, Auth: AuthOK})
+	if !strings.Contains(string(b), `"provider":"codex"`) {
+		t.Fatalf("provider missing from wire: %s", b)
+	}
+	b, _ = json.Marshal(&State{SchemaVersion: Version, Type: TypeSnapshot, Source: SourceOAuth, Auth: AuthOK})
+	if strings.Contains(string(b), "provider") {
+		t.Fatalf("unset provider must be omitted, not emitted empty: %s", b)
+	}
+}

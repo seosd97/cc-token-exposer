@@ -46,7 +46,8 @@ type fakeFetcher struct {
 	calls  []string
 }
 
-func (f *fakeFetcher) Fetch(_ context.Context, token string) (*usage.FetchedSnapshot, error) {
+func (f *fakeFetcher) Fetch(_ context.Context, cr *creds.Credentials) (*usage.FetchedSnapshot, error) {
+	token := cr.AccessToken
 	f.calls = append(f.calls, token)
 	s, err := f.fn(token)
 	if err != nil {
@@ -1066,5 +1067,73 @@ func TestCleanFetchClearsPersistedDrift(t *testing.T) {
 	}
 	if len(cache.drift) != 0 {
 		t.Fatalf("cache still carries drift after a clean fetch: %v", cache.drift)
+	}
+}
+
+var codexProvider = engine.Provider{Name: schema.ProviderCodex, LoginCommand: "codex login"}
+
+func TestStatesCarryTheProviderName(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	fresh := &fakeCache{
+		payload:  mustMarshal(t, snapWith(23, baseTime.Add(time.Hour))),
+		storedAt: baseTime.Add(-30 * time.Second),
+		has:      true,
+	}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
+
+	if st := resolve(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: fresh}); st.Provider != schema.ProviderClaude {
+		t.Fatalf("default provider = %q, want %q", st.Provider, schema.ProviderClaude)
+	}
+
+	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+	st := resolve(t, engine.Options{Provider: codexProvider, Clock: clk, Creds: missing, Fetcher: fetch})
+	if st.Provider != schema.ProviderCodex || st.Type != schema.TypeError {
+		t.Fatalf("error state provider=%q type=%s, want codex/error", st.Provider, st.Type)
+	}
+
+	st = resolveStdin(t, engine.Options{Provider: codexProvider, Clock: clk}, snapWith(18, baseTime.Add(time.Hour)))
+	if st.Provider != schema.ProviderCodex || st.Source != schema.SourceStdin {
+		t.Fatalf("stdin state provider=%q source=%s, want codex/stdin", st.Provider, st.Source)
+	}
+}
+
+func TestLoginHintsUseTheProviderLoginCommand(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) { return nil, nil }}
+
+	missing := &fakeCreds{results: []credResult{{err: creds.ErrNotFound}}}
+	st := resolve(t, engine.Options{Provider: codexProvider, Clock: clk, Creds: missing, Fetcher: fetch})
+	if st.Auth != schema.AuthMissing || !strings.Contains(st.Error, "run `codex login` to log in") {
+		t.Fatalf("missing-creds hint = %q (auth %s), want codex login hint", st.Error, st.Auth)
+	}
+
+	expired := &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: "old", ExpiresAt: baseTime.Add(-time.Minute)}}}}
+	st = resolve(t, engine.Options{Provider: codexProvider, Clock: clk, Creds: expired, Fetcher: fetch})
+	if st.Auth != schema.AuthExpired || !strings.Contains(st.Error, "run `codex login` to refresh it") {
+		t.Fatalf("expired hint = %q (auth %s), want codex login hint", st.Error, st.Auth)
+	}
+
+	st = resolve(t, engine.Options{Clock: clk, Creds: missing, Fetcher: fetch})
+	if !strings.Contains(st.Error, "run `claude` to log in") {
+		t.Fatalf("default hint = %q, want claude login hint", st.Error)
+	}
+}
+
+func TestCredentialSourceErrorBecomesTheAuthMissingReason(t *testing.T) {
+	clk := &fakeClock{t: baseTime}
+	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
+		t.Fatalf("fetch must not be called without creds")
+		return nil, nil
+	}}
+	reason := errors.New("codex: logged in with an API key; plan limits do not apply")
+
+	st := resolve(t, engine.Options{Clock: clk, Creds: &fakeCreds{results: []credResult{{err: reason}}}, Fetcher: fetch})
+	if st.Auth != schema.AuthMissing || st.Error != reason.Error() {
+		t.Fatalf("got auth=%s error=%q, want missing with the source's reason", st.Auth, st.Error)
+	}
+
+	st = resolve(t, engine.Options{Clock: clk, Creds: &fakeCreds{results: []credResult{{err: creds.ErrNotAvailable}}}, Fetcher: fetch})
+	if !strings.Contains(st.Error, "no credentials found") {
+		t.Fatalf("ErrNotAvailable should keep the generic hint, got %q", st.Error)
 	}
 }

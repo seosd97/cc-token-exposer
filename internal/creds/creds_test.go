@@ -118,3 +118,10 @@ func TestResolverRealErrorButLaterSuccess(t *testing.T) {
 		t.Fatalf("token = %q, want recovered", c.AccessToken)
 	}
 }
+
+func TestCredentialsStringOmitsAccountID(t *testing.T) {
+	c := &Credentials{AccessToken: "tok", AccountID: "acct-3f2a9c", SourceName: "codex-auth"}
+	if strings.Contains(c.String(), "acct-3f2a9c") {
+		t.Fatalf("String leaked account id: %q", c.String())
+	}
+}
