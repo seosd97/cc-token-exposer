@@ -13,6 +13,16 @@ source as Claude Code's built-in `/usage`**: the OAuth usage endpoint. It
 reuses Claude Code's existing OAuth token read-only, so if `claude` works on
 the machine, `ccx` works with no setup.
 
+The same story holds for a second provider, Codex CLI's ChatGPT plan:
+`--provider codex` reads `~/.codex/auth.json` read-only and queries the
+endpoint Codex's own `/status` uses (`/wham/usage`), so if `codex` works on
+the machine, `ccx --provider codex` works with no setup. Providers share one
+engine, one wire schema and one rendering; only the credential source and the
+usage client differ. The provider abstraction is deliberately bounded to plans
+that share the rolling-window model (utilization % + reset time per window);
+quota models that do not fit (daily request counts, monthly premium requests)
+are out of scope until a schema_version 2 decision.
+
 Positioning: local-JSONL tools (ccusage, claude-monitor) only *estimate*
 limits and drift from the real lockout; linuxlewis/claude-usage uses
 authoritative values but requires manually extracted browser cookies. `ccx`
@@ -21,9 +31,17 @@ gives authoritative numbers with zero setup.
 **v1 scope (current, deliberately minimal): two usage commands plus
 housekeeping.**
 
-- `ccx now [--json]` — one-shot lookup (human or single-line JSON)
-- `ccx statusline` — one-line output for the Claude Code statusline
-  (registered via `~/.claude/settings.json` → `statusLine.command`)
+- `ccx now [--json] [--provider claude|codex|claude,codex]` — one-shot lookup
+  (human or single-line JSON). With several providers each one prints as its
+  own block (header line = provider name, blank-line separated), or as one
+  JSON line per provider (NDJSON) with `--json`.
+- `ccx statusline [--provider claude|codex|claude,codex]` — one-line output for
+  the Claude Code statusline (registered via `~/.claude/settings.json` →
+  `statusLine.command`). One group per provider, joined by ` │ `; the claude
+  group is untagged (byte-identical to the single-provider output), other
+  groups carry a gray provider tag.
+- `ccx refresh --provider <name>` (hidden) — the detached refresher entry
+  point; flag-less `refresh` means claude.
 - `ccx version` — print the injected build version
 - `ccx update [--check]` — self-update to the latest GitHub release
   (download the matching release archive, verify its SHA-256 against
@@ -42,19 +60,32 @@ threshold notifications (`internal/notify`), history logging
 ## Architecture
 
 ```
-cmd/ccx/main.go      composition root: builds the ONE production engine and
-                     injects it into commands as a `resolver` interface;
-                     also composes the processRefresher (detached `ccx refresh`
+cmd/ccx/main.go      composition root: builds ONE production engine per
+                     provider (claude, codex) and hands commands a
+                     `providers` map (name -> `resolver` interface: Resolve /
+                     ResolveStdin / ResolveDetached); also composes the
+                     processRefresher (detached `ccx refresh --provider <name>`
                      spawner) and the embedded release-signature public key
-cmd/ccx/now.go       rendering + exit-code policy
+cmd/ccx/providers.go the registry type, comma-list parsing (`--provider`,
+                     lower-cased, deduped, empty -> claude) and lookup errors
+cmd/ccx/now.go       rendering + exit-code policy; resolves the selected
+                     providers in parallel, prints blocks or NDJSON
 cmd/ccx/statusline.go  statusline formatting + stdin rate_limits parsing
                      (rate_limits -> schema.Snapshot -> engine.ResolveStdin).
                      Stdin is read only when it is not a terminal, so a manual
                      run never blocks. Colors are alert-only: none below 60%,
                      muted yellow from 60%, muted red above 85%; a stale line
-                     renders all gray; NO_COLOR yields plain text.
-cmd/ccx/refresh.go   hidden `ccx refresh` (internal): runs the ladder once,
-                     discards the State — the detached statusline refresher
+                     renders all gray; NO_COLOR yields plain text. Provider
+                     groups: stdin rate_limits describe the Claude plan, so
+                     only the claude group goes through ResolveStdin; every
+                     other provider is served via ResolveDetached. Groups are
+                     joined by " │ ", non-claude groups get a gray name tag,
+                     ≈ / ⚠ login markers are per group, empty groups are
+                     dropped, unknown names are skipped (never non-zero), and
+                     "⚠ ccx" appears only when every group is empty.
+cmd/ccx/refresh.go   hidden `ccx refresh --provider <name>` (internal): runs
+                     that provider's ladder once, discards the State — the
+                     detached statusline refresher
 cmd/ccx/update.go    self-update command (thin) over internal/selfupdate
 cmd/ccx-sign/        release-time checksums signer (stdlib ed25519); never
                      shipped (goreleaser builds only ./cmd/ccx)
@@ -67,11 +98,15 @@ internal/
                only; injectable http client + apiBase + platform for tests.
                Archive names follow goreleaser's `ccx_<os>_<arch>.tar.gz`
                template; checksums.txt lines are `<sha256>  <name>`.
-  engine/      THE BRAIN. Resolve(ctx) and ResolveStdin(ctx, snap) ->
-               *schema.State, runs the degrade ladder. Depends only on 6
-               consumer-side interfaces it defines:
+  engine/      THE BRAIN. Resolve(ctx), ResolveStdin(ctx, snap) and
+               ResolveDetached(ctx) -> *schema.State, runs the degrade ladder.
+               Depends only on 6 consumer-side interfaces it defines:
                CredResolver / Fetcher / Cache / TranscriptProbe / Clock /
-               Refresher.
+               Refresher. Fetcher receives the whole *creds.Credentials
+               (token + optional AccountID) so a provider can send tenant
+               headers. Options.Provider{Name, LoginCommand} (default:
+               ClaudeProvider) stamps every emitted State with `provider`
+               and builds the login hints ("run `codex login` to log in").
   schema/      The wire contract (State, schema_version=1). Leaf package,
                imports nothing internal. The PUBLIC CONTRACT is the JSON
                emitted by `now --json`, not the Go types (internal/ blocks
@@ -81,8 +116,12 @@ internal/
                are NOT struct fields — Snapshot.MarshalJSON injects them from
                ScopedLimits at serialize time (new models stay under
                scoped_limits only).
-  usage/       oauth/usage HTTP client + Reconcile consistency guard +
-               Overlay gap-fill merge. Produces/operates on schema.Snapshot
+  usage/       oauth/usage HTTP client (Claude) + Reconcile consistency
+               guard + Overlay gap-fill merge + the shared wire helpers
+               ParseTolerantTime (RFC3339 | epoch s | epoch ms) and
+               ParseRetryAfter, plus the error types (ErrAuth /
+               RateLimitError / ErrTransient) every provider client returns.
+               Produces/operates on schema.Snapshot
                directly (no duplicated window types). Fetch returns
                usage.FetchedSnapshot{Snapshot, ScopedProbed, Drift}; decode is
                the only producer that sets ScopedProbed=true (marks "the API
@@ -100,8 +139,22 @@ internal/
                render drift markers (it mirrors Claude Code's own values,
                same rule as the suspect guard); the marker is visible on the
                ladder path.
-  creds/       credential acquisition: file > macOS keychain shell-out.
-  cache/       flock-protected, atomic-write disk cache of opaque JSON.
+  codex/       the Codex provider: AuthSource (creds.Source over
+               `~/.codex/auth.json`, CODEX_HOME honored) and Client
+               (engine.Fetcher over `/wham/usage`). Decode maps windows by
+               length, lifts per-model buckets into ScopedLimits and records
+               drift indicators; testdata/ holds a redacted live capture that
+               pins the decode as a golden test; live_test.go is the env-gated
+               smoke (`CCX_LIVE_CODEX_TOKEN` + `CCX_LIVE_CODEX_ACCOUNT`).
+  creds/       credential acquisition for Claude: file > macOS keychain
+               shell-out. Also the shared Credentials type (AccessToken,
+               AccountID, ExpiresAt) and Resolver chain every provider uses;
+               a source's own error (other than ErrNotFound/ErrNotAvailable)
+               surfaces verbatim as the auth-missing reason.
+  cache/       flock-protected, atomic-write disk cache of opaque JSON, one
+               file per provider (`snapshot.json` stays claude's for
+               backward compat; NewNamed(name) adds `<name>.json` beside it,
+               each with its own lock).
                Entry = {fetched_at, attempted_at?, scoped_probed, drift?,
                payload}.
                ClaimRefresh(now, backoff) atomically claims a refresh slot
@@ -129,6 +182,17 @@ carrying the best known truth plus its freshness):
 4. 401 → re-read credentials once, retry once if the token changed;
    otherwise `auth: "expired"` (still with stale data if available).
 5. No cache at all → transcript limit-hit probe → else error State.
+
+ResolveDetached (statusline, providers without a stdin projection) is the
+ladder with the synchronous fetch replaced by the detached refresh: a fresh
+cache is served as-is (zero IO); otherwise credentials are checked exactly like
+the ladder (missing/expired short-circuit to the same degraded States with no
+spawn), then `Cache.ClaimRefresh` + `Refresher.Spawn` heal the cache for the
+NEXT tick while the stale cache is served (≈), or — on a cold start with no
+cache — an auth-ok error State ("usage refresh in progress; no cache yet")
+that the statusline renders as an empty group. A spawn failure falls back to
+the bounded synchronous refresh. `now` never uses it (the manual ladder may
+fetch inline).
 
 ResolveStdin (statusline only) is a four-stage pipeline. Design principle: the
 disk cache is the reference set of windows the plan reports; the bounded
@@ -201,7 +265,9 @@ snapshot covering every cache-known window means zero calls, while a
 cache-known scoped model missing from stdin (e.g. Fable) costs ≤1 call per
 TTL. A plan proven to have no scoped limits (`ScopedProbed`, no scoped keys)
 terminates the loop instead of polling forever. Both paths share the flock'd cache,
-   so the per-machine bound holds. The statusline path additionally dedupes
+   so the per-machine bound holds. Each provider has its own cache file and
+   lock, so the bound is per provider per machine; the Codex endpoint's 429
+   policy is unknown and gets the same TTL/cache-first treatment. The statusline path additionally dedupes
    fetches across concurrent ticks/sessions: `ClaimRefresh` is an atomic
    check-and-set under the write flock, so exactly one spawner wins per TTL even
    when several sessions cross the boundary at once — the old
@@ -211,7 +277,10 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
    `now`s a user actually runs; self-healing on the next store).
 2. **Token hygiene.** The OAuth token is read-only and in-memory only. It must
    never appear in logs, error messages, the cache file, test fixtures, or
-   `String()` output (creds redacts). The cache stores only
+   `String()` output (creds redacts). The Codex account id, user id and
+   e-mail (present in `auth.json` and in the `/wham/usage` response) are
+   treated the same way: `Credentials.String()` omits AccountID, the golden
+   fixture is redacted, and neither reaches the cache. The cache stores only
    `{fetched_at, attempted_at?, scoped_probed, drift?, payload}` where
    payload is a token-free usage snapshot, `attempted_at` is an optional
    refresh-attempt timestamp, and `drift` is an optional list of wire-shape
@@ -219,11 +288,19 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
 3. **No self refresh.** Never run an OAuth refresh grant. Refresh tokens may
    rotate; consuming one can invalidate Claude Code's stored refresh token and
    break the user's login. On expiry: re-read `~/.claude/.credentials.json`
-   (Claude Code refreshes it itself), else surface `auth: "expired"`.
-4. **Required request headers.** `Authorization: Bearer <token>`,
+   (Claude Code refreshes it itself), else surface `auth: "expired"`. The
+   same rule covers Codex: never call `auth.openai.com/oauth/token`; re-read
+   `~/.codex/auth.json` (Codex refreshes it on its own runs) or surface
+   `auth: "expired"` with the `codex login` hint.
+4. **Required request headers.** Claude: `Authorization: Bearer <token>`,
    `anthropic-beta: oauth-2025-04-20`, and `User-Agent: claude-code/<ver>`.
    Without the claude-code User-Agent the endpoint applies a far stricter
-   429 bucket.
+   429 bucket. Codex: `Authorization: Bearer <access_token>`,
+   `ChatGPT-Account-Id: <account_id>`, `originator: codex_cli_rs`,
+   `User-Agent: codex_cli_rs/<ver>`. The live check on 2026-09-10 returned
+   200 without originator/User-Agent, so those two mirror Codex by
+   convention rather than by necessity; keep them anyway so ccx is
+   indistinguishable from the CLI it piggybacks on.
 5. **Never blank-screen.** Every failure degrades to "last known truth +
    freshness marker" (`≈` prefix for stale, `⚠ login` for auth, `⛔` for
    limit-hit). statusline must never exit non-zero or print nothing.
@@ -236,7 +313,8 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
    the additive value `"stdin"` (statusline rate_limits path). `drift`
    (an optional `[]string` of wire-shape anomaly indicators) was added
    additively; it is omitted when the last live fetch matched expectations.
-7. **Transcript files are read-only.** Never write under `~/.claude/`.
+7. **Transcript files are read-only.** Never write under `~/.claude/` or
+   `~/.codex/`.
 
 ## Data source notes
 
@@ -281,6 +359,47 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
   model_scoped by display_name into ScopedLimits (seven_day_opus only
   backfills Opus); sonnet/oauth_apps/extra_usage are ignored, consistent
   with the API path.
+- Codex endpoint: `GET https://chatgpt.com/backend-api/wham/usage` —
+  **unofficial**, the call behind Codex CLI's `/status` and `/usage` (the
+  base URL is Codex's `chatgpt_base_url` default; ccx hardcodes it). Shape
+  confirmed live on 2026-09-10 (codex-cli 0.153.4, pro plan) and pinned by
+  `internal/codex/testdata/usage_2026-09-10.json`:
+  `rate_limit: {allowed, limit_reached, primary_window, secondary_window}`
+  where a window is `{used_percent, limit_window_seconds,
+  reset_after_seconds, reset_at (epoch s)}`; `additional_rate_limits[]` of
+  `{limit_name, metered_feature, normal_model_slug, rate_limit}` — per-model
+  pools (e.g. "GPT-5.3-Codex-Spark") that carry BOTH a 5h and a weekly
+  window, present even at 0%; plus `plan_type`, `credits`, `spend_control`,
+  `model_usage`, `rate_limit_reset_credits`, `code_review_rate_limit`,
+  `promo`, and the account's `user_id` / `account_id` / `email` (all
+  ignored; the last three are PII). `primary_window` is NOT always the 5h
+  window: an idle plan reports the weekly window alone as primary with
+  `secondary_window: null` (217 of ~1,000 local session-log samples, and the
+  live capture), so decode maps by `limit_window_seconds` (18000 →
+  `five_hour`, 604800 → `seven_day`); an unknown length falls back to the
+  position and records drift. `reset_at` wins over `reset_after_seconds`
+  (relative to the fetch clock). Bucket windows map their WEEKLY window into
+  `scoped_limits[limit_name]`, mirroring Claude's per-model weekly limits; a
+  bucket's 5h window is not represented (one window per scoped key).
+  The Codex protocol shape seen in `~/.codex/sessions/**/*.jsonl`
+  `token_count` events (`primary/secondary` with `window_minutes` and
+  `resets_at`) is accepted by the same decoder for tolerance, but the session
+  logs are not read (a Codex rollout probe is a deferred option; Codex is
+  migrating those jsonl rollouts to sqlite via `migrate-rollouts`).
+- Codex credentials: `~/.codex/auth.json` (0600; `CODEX_HOME` relocates it):
+  `{auth_mode: "chatgpt"|"apikey", OPENAI_API_KEY, tokens: {access_token,
+  refresh_token, id_token, account_id}, last_refresh}`. The access token is
+  a JWT (≈10-day lifetime) whose `exp` claim is the pre-check expiry and
+  whose `https://api.openai.com/auth.chatgpt_account_id` claim backs up a
+  missing `tokens.account_id`; the id_token expires hourly and is ignored.
+  `auth_mode: "apikey"` (or an API key without tokens) means Codex is on
+  usage-based billing with no plan windows — surfaced verbatim as the
+  auth-missing reason ("codex: logged in with an API key; plan limits do not
+  apply") instead of a misleading login hint.
+- Codex TUI: its own `tui.status_line` has `five-hour-limit` /
+  `weekly-limit` items and no external-command hook, so ccx's Codex value is
+  in Claude Code's statusline (Codex driven from inside Claude Code via the
+  codex plugin) and in `ccx now`, not inside Codex.
 - Local limit-hit signal: when a limit is hit, Claude Code writes a synthetic
   transcript message (`isApiErrorMessage: true`; its content is a plain
   string or an array of typed text blocks; text like
@@ -325,8 +444,16 @@ go vet ./... && gofmt -l .
   `go test ./...` never touch the endpoint. Run it deliberately with the
   access token from `~/.claude/.credentials.json`:
   `CCX_LIVE_TOKEN=<token> go test -run TestLiveSmoke -v ./internal/usage/`.
-  A dispatch-only GitHub workflow and golden fixtures of the captured shape
-  are deferred (see Roadmap).
+  The Codex counterpart is `TestLiveSmokeCodex` (`internal/codex/live_test.go`,
+  skipped unless both `CCX_LIVE_CODEX_TOKEN` and `CCX_LIVE_CODEX_ACCOUNT` are
+  set — `tokens.access_token` / `tokens.account_id` from `~/.codex/auth.json`):
+  `CCX_LIVE_CODEX_TOKEN=<token> CCX_LIVE_CODEX_ACCOUNT=<id> go test -run
+  TestLiveSmokeCodex -v ./internal/codex/`. Codex also has a redacted golden
+  fixture (`internal/codex/testdata/`) pinned by a decode test; when the live
+  shape changes, recapture with the curl in the Codex data-source notes,
+  redact `user_id` / `account_id` / `email`, and update the golden test.
+  A dispatch-only GitHub workflow and Claude golden fixtures are deferred
+  (see Roadmap).
 - Commands take a `resolver` interface; test command behavior (rendering,
   exit codes, flag handling) with a fake resolver returning canned States —
   see `cmd/ccx/commands_test.go`.
@@ -340,8 +467,14 @@ go vet ./... && gofmt -l .
 ## Exit codes
 
 - `now`: 0 on a snapshot State; 1 on an error State (message already printed
-  to stdout, `errSilentExit` suppresses duplicate stderr output).
-- `statusline`: always 0 — it must never break the statusline.
+  to stdout, `errSilentExit` suppresses duplicate stderr output). With several
+  providers every block prints and the exit code is 1 if ANY of them is an
+  error State. An unknown `--provider` name is a usage error (1, message on
+  stderr, nothing on stdout).
+- `statusline`: always 0 — it must never break the statusline. Unknown
+  provider names are skipped, not reported.
+- `refresh`: exactly one provider; unknown name or a list is an error (only
+  the detached child ever sees it).
 
 ## Roadmap & deferred decisions
 
@@ -525,6 +658,49 @@ go vet ./... && gofmt -l .
   (`internal/usage/live_test.go`, skipped unless `CCX_LIVE_TOKEN` is set, one
   API call per run) is the sanctioned way to check the real shape; a
   dispatch-only workflow and golden fixtures are deferred (see Roadmap).
+- provider abstraction is bounded and lives at the seams, not in a new layer:
+  the engine was already provider-neutral behind its ports, so adding Codex
+  meant (a) widening `Fetcher` to take `*creds.Credentials` (tenant header),
+  (b) an `engine.Provider{Name, LoginCommand}` descriptor that stamps
+  `State.provider` (additive; omitted only on States no engine produced) and
+  builds login hints, (c) one engine + one cache file per provider, and (d) a
+  `providers` map in the composition root selected by `--provider`. Claude's
+  packages keep their names (`creds`/`usage`/`transcript`) and also hold the
+  shared types; `internal/codex` holds only what differs. A generic
+  "windows[]" schema was rejected: Claude and Codex share the rolling
+  5h/7d + per-model-weekly model exactly, and quota models that don't fit
+  (Gemini daily requests, Copilot monthly premium requests) would force a
+  schema_version bump for no current consumer.
+- Codex windows map by length, never by position: session logs and the live
+  capture both show `primary_window` carrying the weekly window alone when
+  the 5h window is idle. Positional mapping would have rendered a week's
+  usage as the 5h gauge. Unknown lengths still surface (positional fallback +
+  drift) rather than being dropped.
+- Codex per-model buckets become scoped_limits, not drift: the plan
+  (docs/CODEX_SUPPORT.md D8) said "don't map, flag as drift", but the live
+  shape shows `additional_rate_limits` is a steady-state per-model pool with
+  5h + weekly windows present even at 0% — flagging it would print `drift:`
+  on every `now`. Mapping the weekly window under `limit_name` matches
+  Claude's per-model weekly limits semantically and reuses every consumer.
+  Known cost: the statusline renders the pool even at 0% with a long label
+  (`✧ gpt-5.3-codex-spark ▯▯▯▯▯ 0%`); hiding 0% scoped rows or shortening
+  labels is an open display decision that would also touch Claude's rows.
+- statusline groups: the claude group is untagged so the default output stays
+  byte-identical (regression tests unchanged), other groups get a gray name
+  tag, and stdin rate_limits are routed only to claude because they describe
+  the Claude plan. Non-claude providers use ResolveDetached so a second
+  provider never adds network latency to a tick — the same "detached, never
+  synchronous" rule the stdin path follows.
+- the Codex live capture is the source of truth for its decoder: unlike
+  Claude, the Codex client was written from a real response (2026-09-10),
+  redacted and checked in as a golden fixture, because the shape had only
+  been inferred from binary strings until then. The capture also showed the
+  response carries the account's e-mail/ids, which is why redaction is part
+  of the recapture procedure, and that `originator`/`User-Agent` are not
+  enforced (200 without them) — mirrored anyway.
+- ParseTolerantTime / ParseRetryAfter moved into `usage` because the Codex
+  decoder needed the same epoch-or-RFC3339 tolerance the stdin parser had;
+  one implementation, tested once, used by both providers.
 - comments are gone entirely, not merely discouraged: the policy's exceptions
   (package one-liners, short helper godocs, test scenario notes) kept
   attracting descriptive comments that duplicated names and drifted from the
