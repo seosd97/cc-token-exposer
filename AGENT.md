@@ -376,6 +376,12 @@ go vet ./... && gofmt -l .
   decode/reconcile/overlay pipeline stays tied to reality. Deliberately split
   out of the drift-indicator change (PR #10); until they land, the live check
   is the local, env-gated `TestLiveSmoke` only.
+- **Decode-failure drift (issue #11):** a response that fails to decode at
+  all (e.g. `resets_at` arriving as an epoch number) surfaces as a transient
+  error and a stale serve with no `drift` entry — the one silent-degrade
+  path the indicators cannot see. Plan: tolerant decode first (accept epoch
+  resets like the stdin parser does and flag the fallback as drift), and
+  surface decode errors as drift only if that proves insufficient.
 
 ## Decision log (abridged)
 
