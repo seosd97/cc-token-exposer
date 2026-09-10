@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 
 	"github.com/seosd97/cc-token-exposer/internal/cache"
+	"github.com/seosd97/cc-token-exposer/internal/codex"
 	"github.com/seosd97/cc-token-exposer/internal/creds"
 	"github.com/seosd97/cc-token-exposer/internal/engine"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
@@ -56,6 +57,13 @@ func productionProviders() providers {
 			Transcript: transcript.NewProbe(),
 			Refresher:  processRefresher{provider: schema.ProviderClaude},
 		}),
+		schema.ProviderCodex: engine.New(engine.Options{
+			Provider:  engine.Provider{Name: schema.ProviderCodex, LoginCommand: "codex login"},
+			Creds:     creds.NewResolver(&codex.AuthSource{}),
+			Fetcher:   codex.New(),
+			Cache:     engine.CacheFrom(openCache(schema.ProviderCodex)),
+			Refresher: processRefresher{provider: schema.ProviderCodex},
+		}),
 	}
 }
 
@@ -64,7 +72,7 @@ func main() {
 
 	root := &cobra.Command{
 		Use:           "ccx",
-		Short:         "Claude plan credit-limit window tracker",
+		Short:         "Claude and Codex plan credit-limit window tracker",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

@@ -1,0 +1,264 @@
+package codex
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/seosd97/cc-token-exposer/internal/creds"
+	"github.com/seosd97/cc-token-exposer/internal/schema"
+	"github.com/seosd97/cc-token-exposer/internal/usage"
+)
+
+const (
+	DefaultEndpoint = "https://chatgpt.com/backend-api/wham/usage"
+
+	DefaultUserAgent = "codex_cli_rs/0.153.4"
+
+	originator = "codex_cli_rs"
+
+	requestTimeout = 10 * time.Second
+
+	maxBodyBytes = 1 << 20
+
+	fiveHourWindowSeconds = 5 * 60 * 60
+
+	sevenDayWindowSeconds = 7 * 24 * 60 * 60
+)
+
+type Client struct {
+	http      *http.Client
+	endpoint  string
+	userAgent string
+	now       func() time.Time
+}
+
+type Option func(*Client)
+
+func WithHTTPClient(h *http.Client) Option {
+	return func(c *Client) {
+		if h != nil {
+			c.http = h
+		}
+	}
+}
+
+func WithEndpoint(endpoint string) Option {
+	return func(c *Client) {
+		if endpoint != "" {
+			c.endpoint = endpoint
+		}
+	}
+}
+
+func WithClock(now func() time.Time) Option {
+	return func(c *Client) {
+		if now != nil {
+			c.now = now
+		}
+	}
+}
+
+func New(opts ...Option) *Client {
+	c := &Client{
+		http:      &http.Client{Timeout: requestTimeout},
+		endpoint:  DefaultEndpoint,
+		userAgent: DefaultUserAgent,
+		now:       func() time.Time { return time.Now().UTC() },
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+func (c *Client) Fetch(ctx context.Context, cr *creds.Credentials) (*usage.FetchedSnapshot, error) {
+	if cr == nil || cr.AccessToken == "" {
+		return nil, fmt.Errorf("%w: empty token", usage.ErrAuth)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: build request: %v", usage.ErrTransient, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cr.AccessToken)
+	if cr.AccountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", cr.AccountID)
+	}
+	req.Header.Set("originator", originator)
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", usage.ErrTransient, err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return c.decode(resp.Body)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, fmt.Errorf("%w (status %d)", usage.ErrAuth, resp.StatusCode)
+	case http.StatusTooManyRequests:
+		return nil, &usage.RateLimitError{
+			RetryAfter: usage.ParseRetryAfter(resp.Header.Get("Retry-After"), c.now()),
+			StatusCode: resp.StatusCode,
+		}
+	default:
+		return nil, fmt.Errorf("%w: unexpected status %d", usage.ErrTransient, resp.StatusCode)
+	}
+}
+
+type apiResponse struct {
+	RateLimit            *rateLimitStatus  `json:"rate_limit"`
+	AdditionalRateLimits []additionalLimit `json:"additional_rate_limits"`
+}
+
+type rateLimitStatus struct {
+	PrimaryWindow   *windowSnapshot `json:"primary_window"`
+	SecondaryWindow *windowSnapshot `json:"secondary_window"`
+}
+
+type windowSnapshot struct {
+	UsedPercent        float64         `json:"used_percent"`
+	LimitWindowSeconds int64           `json:"limit_window_seconds"`
+	WindowMinutes      int64           `json:"window_minutes"`
+	ResetAfterSeconds  *int64          `json:"reset_after_seconds"`
+	ResetAt            json.RawMessage `json:"reset_at"`
+	ResetsAt           json.RawMessage `json:"resets_at"`
+}
+
+type additionalLimit struct {
+	LimitName      string           `json:"limit_name"`
+	MeteredFeature string           `json:"metered_feature"`
+	RateLimit      *rateLimitStatus `json:"rate_limit"`
+}
+
+func (w *windowSnapshot) lengthSeconds() int64 {
+	if w.LimitWindowSeconds > 0 {
+		return w.LimitWindowSeconds
+	}
+	return w.WindowMinutes * 60
+}
+
+func (w *windowSnapshot) resetTime(now time.Time) (time.Time, bool) {
+	if t := usage.ParseTolerantTime(w.ResetAt); !t.IsZero() {
+		return t, true
+	}
+	if t := usage.ParseTolerantTime(w.ResetsAt); !t.IsZero() {
+		return t, true
+	}
+	if w.ResetAfterSeconds != nil && *w.ResetAfterSeconds > 0 {
+		return now.Add(time.Duration(*w.ResetAfterSeconds) * time.Second), true
+	}
+	return time.Time{}, false
+}
+
+func (c *Client) decode(body io.Reader) (*usage.FetchedSnapshot, error) {
+	var r apiResponse
+	dec := json.NewDecoder(io.LimitReader(body, maxBodyBytes))
+	if err := dec.Decode(&r); err != nil {
+		return nil, fmt.Errorf("%w: decode usage response: %v", usage.ErrTransient, err)
+	}
+	now := c.now()
+	snap := &schema.Snapshot{FetchedAt: now}
+	var drift []string
+	if r.RateLimit != nil {
+		drift = placePlanWindows(snap, r.RateLimit, now, drift)
+	}
+	for i, b := range r.AdditionalRateLimits {
+		drift = placeBucket(snap, b, i, now, drift)
+	}
+	if snap.FiveHour == nil && snap.SevenDay == nil && len(snap.ScopedLimits) == 0 {
+		drift = append(drift, "empty usage payload")
+	}
+	return &usage.FetchedSnapshot{Snapshot: snap, ScopedProbed: true, Drift: drift}, nil
+}
+
+func placePlanWindows(snap *schema.Snapshot, rl *rateLimitStatus, now time.Time, drift []string) []string {
+	for _, e := range []struct {
+		label string
+		w     *windowSnapshot
+	}{{"primary_window", rl.PrimaryWindow}, {"secondary_window", rl.SecondaryWindow}} {
+		if e.w == nil {
+			continue
+		}
+		win := &schema.Window{Utilization: e.w.UsedPercent}
+		if t, ok := e.w.resetTime(now); ok {
+			win.ResetsAt = t
+		} else {
+			drift = append(drift, e.label+" missing reset")
+		}
+
+		byPosition := &snap.SevenDay
+		if e.label == "primary_window" {
+			byPosition = &snap.FiveHour
+		}
+		target := byPosition
+		switch secs := e.w.lengthSeconds(); secs {
+		case fiveHourWindowSeconds:
+			target = &snap.FiveHour
+		case sevenDayWindowSeconds:
+			target = &snap.SevenDay
+		case 0:
+			drift = append(drift, e.label+" missing length")
+		default:
+			drift = append(drift, fmt.Sprintf("%s unexpected length %ds", e.label, secs))
+		}
+		if *target != nil {
+			drift = append(drift, e.label+" duplicates an already mapped window")
+			continue
+		}
+		*target = win
+	}
+	return drift
+}
+
+func placeBucket(snap *schema.Snapshot, b additionalLimit, index int, now time.Time, drift []string) []string {
+	name := b.LimitName
+	if name == "" {
+		name = b.MeteredFeature
+	}
+	if name == "" {
+		return append(drift, fmt.Sprintf("rate limit bucket #%d missing limit_name", index))
+	}
+	if b.RateLimit == nil {
+		return drift
+	}
+
+	var weekly *windowSnapshot
+	for _, w := range []*windowSnapshot{b.RateLimit.PrimaryWindow, b.RateLimit.SecondaryWindow} {
+		if w != nil && w.lengthSeconds() == sevenDayWindowSeconds {
+			weekly = w
+			break
+		}
+	}
+	if weekly == nil {
+		if b.RateLimit.PrimaryWindow != nil || b.RateLimit.SecondaryWindow != nil {
+			drift = append(drift, fmt.Sprintf("rate limit bucket %q has no weekly window", name))
+		}
+		return drift
+	}
+
+	win := &schema.Window{Utilization: weekly.UsedPercent}
+	if t, ok := weekly.resetTime(now); ok {
+		win.ResetsAt = t
+	} else if weekly.UsedPercent > 0 {
+		drift = append(drift, fmt.Sprintf("rate limit bucket %q missing reset", name))
+	}
+	if snap.ScopedLimits == nil {
+		snap.ScopedLimits = make(map[string]*schema.Window)
+	}
+	if _, dup := snap.ScopedLimits[name]; dup {
+		return append(drift, fmt.Sprintf("duplicate rate limit bucket %q", name))
+	}
+	snap.ScopedLimits[name] = win
+	return drift
+}

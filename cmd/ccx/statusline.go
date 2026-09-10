@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/seosd97/cc-token-exposer/internal/schema"
+	"github.com/seosd97/cc-token-exposer/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -242,7 +243,7 @@ func (w *rlWindow) UnmarshalJSON(b []byte) error {
 	case raw.Utilization != nil:
 		w.used, w.hasUsed = *raw.Utilization, true
 	}
-	w.resetsAt = parseTolerantTime(raw.ResetsAt)
+	w.resetsAt = usage.ParseTolerantTime(raw.ResetsAt)
 	return nil
 }
 
@@ -254,27 +255,6 @@ func (w *rlWindow) toUsage() *schema.Window {
 		Utilization: w.used,
 		ResetsAt:    w.resetsAt,
 	}
-}
-
-func parseTolerantTime(raw json.RawMessage) time.Time {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return time.Time{}
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		if t, err := time.Parse(time.RFC3339, s); err == nil {
-			return t
-		}
-		return time.Time{}
-	}
-	var n float64
-	if json.Unmarshal(raw, &n) == nil && n > 0 {
-		if n > 1e12 {
-			return time.UnixMilli(int64(n)).UTC()
-		}
-		return time.Unix(int64(n), 0).UTC()
-	}
-	return time.Time{}
 }
 
 type rlScoped struct {
@@ -317,7 +297,7 @@ func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*schema.Snapsho
 		}
 		scoped[ms.DisplayName] = &schema.Window{
 			Utilization: *ms.Utilization,
-			ResetsAt:    parseTolerantTime(ms.ResetsAt),
+			ResetsAt:    usage.ParseTolerantTime(ms.ResetsAt),
 		}
 		n++
 	}

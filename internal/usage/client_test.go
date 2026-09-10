@@ -512,8 +512,8 @@ func TestParseRetryAfter(t *testing.T) {
 		{now.Add(-60 * time.Second).UTC().Format(http.TimeFormat), 0},
 	}
 	for _, tc := range cases {
-		if got := parseRetryAfter(tc.in, now); got != tc.want {
-			t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
+		if got := ParseRetryAfter(tc.in, now); got != tc.want {
+			t.Errorf("ParseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
