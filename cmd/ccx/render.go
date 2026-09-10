@@ -26,14 +26,7 @@ func renderHuman(st *schema.State, now time.Time) string {
 		return "⚠ no state\n"
 	}
 	if st.Type == schema.TypeError {
-		switch st.Auth {
-		case schema.AuthMissing:
-			return "⚠ no credentials — run `claude` to log in\n"
-		case schema.AuthExpired:
-			return "⚠ token expired — run `claude` to refresh\n"
-		default:
-			return "⚠ " + st.Error + "\n"
-		}
+		return "⚠ " + errorText(st) + "\n"
 	}
 
 	var b strings.Builder
@@ -63,6 +56,20 @@ func renderHuman(st *schema.State, now time.Time) string {
 
 	b.WriteString(freshnessFooter(st))
 	return b.String()
+}
+
+func errorText(st *schema.State) string {
+	if st.Error != "" {
+		return st.Error
+	}
+	switch st.Auth {
+	case schema.AuthMissing:
+		return "no credentials found"
+	case schema.AuthExpired:
+		return "token expired"
+	default:
+		return "unknown error"
+	}
 }
 
 func writeWindow(b *strings.Builder, label string, w *schema.Window, now time.Time) {

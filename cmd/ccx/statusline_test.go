@@ -343,3 +343,75 @@ func TestSnapshotFromRateLimits(t *testing.T) {
 		}
 	})
 }
+
+func TestFormatStatuslineGroups(t *testing.T) {
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	reset5h := now.Add(4*time.Hour + 12*time.Minute)
+	reset7d := now.Add(3 * 24 * time.Hour)
+	claudeOK := &schema.State{Auth: schema.AuthOK, Snapshot: &schema.Snapshot{FiveHour: win(23, reset5h), SevenDay: win(41, reset7d)}}
+	codexOK := &schema.State{Auth: schema.AuthOK, Snapshot: &schema.Snapshot{FiveHour: win(18, reset5h), SevenDay: win(60, reset7d)}}
+
+	cases := []struct {
+		name   string
+		groups []providerLine
+		want   string
+	}{
+		{
+			name:   "claude alone is untagged",
+			groups: []providerLine{{schema.ProviderClaude, claudeOK}},
+			want:   "◷ 5h ▮▯▯▯▯ 23% ↻ 4h12m · ◷ 7d ▮▮▯▯▯ 41% ↻ 3d0h",
+		},
+		{
+			name:   "second provider is tagged and separated",
+			groups: []providerLine{{schema.ProviderClaude, claudeOK}, {schema.ProviderCodex, codexOK}},
+			want:   "◷ 5h ▮▯▯▯▯ 23% ↻ 4h12m · ◷ 7d ▮▮▯▯▯ 41% ↻ 3d0h │ codex ◷ 5h ▮▯▯▯▯ 18% ↻ 4h12m · ◷ 7d ▮▮▮▯▯ 60% ↻ 3d0h",
+		},
+		{
+			name:   "codex alone keeps its tag",
+			groups: []providerLine{{schema.ProviderCodex, codexOK}},
+			want:   "codex ◷ 5h ▮▯▯▯▯ 18% ↻ 4h12m · ◷ 7d ▮▮▮▯▯ 60% ↻ 3d0h",
+		},
+		{
+			name: "stale and login markers stay per group",
+			groups: []providerLine{
+				{schema.ProviderClaude, &schema.State{Auth: schema.AuthOK, Stale: true, Snapshot: &schema.Snapshot{FiveHour: win(50, reset5h)}}},
+				{schema.ProviderCodex, &schema.State{Auth: schema.AuthMissing, Type: schema.TypeError}},
+			},
+			want: "≈ ◷ 5h ▮▮▮▯▯ 50% ↻ 4h12m │ codex ⚠ login",
+		},
+		{
+			name: "empty groups are dropped",
+			groups: []providerLine{
+				{schema.ProviderClaude, claudeOK},
+				{schema.ProviderCodex, &schema.State{Auth: schema.AuthOK, Type: schema.TypeError, Error: "usage refresh in progress; no cache yet"}},
+			},
+			want: "◷ 5h ▮▯▯▯▯ 23% ↻ 4h12m · ◷ 7d ▮▮▯▯▯ 41% ↻ 3d0h",
+		},
+		{
+			name:   "all groups empty falls back to the generic marker",
+			groups: []providerLine{{schema.ProviderClaude, nil}, {schema.ProviderCodex, &schema.State{Auth: schema.AuthOK}}},
+			want:   "⚠ ccx",
+		},
+		{
+			name:   "no groups at all",
+			groups: nil,
+			want:   "⚠ ccx",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatStatuslineGroups(tc.groups, now, false); got != tc.want {
+				t.Errorf("formatStatuslineGroups = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatStatuslineGroupsPaintsTheTagGray(t *testing.T) {
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	st := &schema.State{Auth: schema.AuthOK, Snapshot: &schema.Snapshot{FiveHour: win(18, now.Add(time.Hour))}}
+	line := formatStatuslineGroups([]providerLine{{schema.ProviderCodex, st}}, now, true)
+	if !strings.HasPrefix(line, ansiGray+"codex"+ansiReset+" ") {
+		t.Fatalf("tag should be gray chrome: %q", line)
+	}
+}

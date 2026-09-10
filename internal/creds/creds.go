@@ -12,6 +12,7 @@ var ErrNotFound = errors.New("creds: no credentials found in any source")
 
 type Credentials struct {
 	AccessToken string
+	AccountID   string
 	ExpiresAt   time.Time
 	SourceName  string
 }

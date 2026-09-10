@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/seosd97/cc-token-exposer/internal/schema"
+	"github.com/seosd97/cc-token-exposer/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -38,16 +39,24 @@ or carries without a usable reset time — are filled from the disk cache. A
 window the cache knows but stdin lacks or carries reset-less triggers at most
 one bounded usage API refresh per cache TTL, so it still tracks the real value.
 
+--provider claude,codex appends a second group for the Codex plan, separated by
+"│" and tagged with the provider name. Providers other than claude are served
+from their own cache and healed by a detached background refresh, so the line
+never waits on the network.
+
 Install: add to ~/.claude/settings.json
 
     { "statusLine": { "type": "command", "command": "ccx statusline" } }`
 
-func newStatuslineCmd(res resolver) *cobra.Command {
-	return &cobra.Command{
-		Use:   "statusline",
-		Short: "Print a one-line plan-usage status for the Claude Code statusline",
-		Long:  statuslineLong,
-		Args:  cobra.NoArgs,
+func newStatuslineCmd(ps providers) *cobra.Command {
+	var providerFlag string
+	cmd := &cobra.Command{
+		Use:           "statusline",
+		Short:         "Print a one-line plan-usage status for the Claude Code statusline",
+		Long:          statuslineLong,
+		Args:          cobra.NoArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			now := time.Now().UTC()
 			out := cmd.OutOrStdout()
@@ -66,15 +75,59 @@ func newStatuslineCmd(res resolver) *cobra.Command {
 			ctx, cancel := context.WithTimeout(cmd.Context(), statuslineTimeout)
 			defer cancel()
 
-			fmt.Fprintln(out, formatStatusline(res.ResolveStdin(ctx, stdinSnap), now, colored))
+			var groups []providerLine
+			for _, name := range parseProviderList(providerFlag) {
+				r, ok := ps[name]
+				if !ok {
+					continue
+				}
+				var st *schema.State
+				if name == schema.ProviderClaude {
+					st = r.ResolveStdin(ctx, stdinSnap)
+				} else {
+					st = r.ResolveDetached(ctx)
+				}
+				groups = append(groups, providerLine{name: name, state: st})
+			}
+
+			fmt.Fprintln(out, formatStatuslineGroups(groups, now, colored))
 			return nil
 		},
 	}
+	addProviderFlag(cmd, &providerFlag, "provider(s) to show, comma-separated (claude, codex)")
+	return cmd
+}
+
+type providerLine struct {
+	name  string
+	state *schema.State
 }
 
 func formatStatusline(st *schema.State, now time.Time, colored bool) string {
-	if st == nil {
+	return formatStatuslineGroups([]providerLine{{name: schema.ProviderClaude, state: st}}, now, colored)
+}
+
+func formatStatuslineGroups(groups []providerLine, now time.Time, colored bool) string {
+	var rendered []string
+	for _, g := range groups {
+		line, ok := statuslineGroup(g.state, now, colored)
+		if !ok {
+			continue
+		}
+		if g.name != schema.ProviderClaude {
+			line = paint(g.name, ansiGray, colored) + " " + line
+		}
+		rendered = append(rendered, line)
+	}
+	if len(rendered) == 0 {
 		return "⚠ ccx"
+	}
+	return strings.Join(rendered, " │ ")
+}
+
+func statuslineGroup(st *schema.State, now time.Time, colored bool) (string, bool) {
+	if st == nil {
+		return "", false
 	}
 	authBroken := st.Auth == schema.AuthExpired || st.Auth == schema.AuthMissing
 	paintWindows := colored && !st.Stale
@@ -102,15 +155,15 @@ func formatStatusline(st *schema.State, now time.Time, colored bool) string {
 
 	if len(parts) == 0 {
 		if authBroken {
-			return paint("⚠ login", ansiYellow, colored)
+			return paint("⚠ login", ansiYellow, colored), true
 		}
 		if lh := st.LimitHit; lh != nil {
 			if lh.ResetsAt != nil && lh.ResetsAt.After(now) {
-				return paint("⛔ ↻ "+humanizeDuration(lh.ResetsAt.Sub(now)), ansiRed, colored)
+				return paint("⛔ ↻ "+humanizeDuration(lh.ResetsAt.Sub(now)), ansiRed, colored), true
 			}
-			return paint("⛔ limit", ansiRed, colored)
+			return paint("⛔ limit", ansiRed, colored), true
 		}
-		return "⚠ ccx"
+		return "", false
 	}
 
 	if authBroken {
@@ -121,7 +174,7 @@ func formatStatusline(st *schema.State, now time.Time, colored bool) string {
 	if st.Stale {
 		line = paint("≈ "+line, ansiGray, colored)
 	}
-	return line
+	return line, true
 }
 
 func statusSegment(icon, label string, w *schema.Window, now time.Time, colored bool) string {
@@ -190,7 +243,7 @@ func (w *rlWindow) UnmarshalJSON(b []byte) error {
 	case raw.Utilization != nil:
 		w.used, w.hasUsed = *raw.Utilization, true
 	}
-	w.resetsAt = parseTolerantTime(raw.ResetsAt)
+	w.resetsAt = usage.ParseTolerantTime(raw.ResetsAt)
 	return nil
 }
 
@@ -202,27 +255,6 @@ func (w *rlWindow) toUsage() *schema.Window {
 		Utilization: w.used,
 		ResetsAt:    w.resetsAt,
 	}
-}
-
-func parseTolerantTime(raw json.RawMessage) time.Time {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return time.Time{}
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		if t, err := time.Parse(time.RFC3339, s); err == nil {
-			return t
-		}
-		return time.Time{}
-	}
-	var n float64
-	if json.Unmarshal(raw, &n) == nil && n > 0 {
-		if n > 1e12 {
-			return time.UnixMilli(int64(n)).UTC()
-		}
-		return time.Unix(int64(n), 0).UTC()
-	}
-	return time.Time{}
 }
 
 type rlScoped struct {
@@ -265,7 +297,7 @@ func snapshotFromRateLimits(raw json.RawMessage, now time.Time) (*schema.Snapsho
 		}
 		scoped[ms.DisplayName] = &schema.Window{
 			Utilization: *ms.Utilization,
-			ResetsAt:    parseTolerantTime(ms.ResetsAt),
+			ResetsAt:    usage.ParseTolerantTime(ms.ResetsAt),
 		}
 		n++
 	}

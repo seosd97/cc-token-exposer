@@ -8,9 +8,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/seosd97/cc-token-exposer/internal/creds"
 )
 
 const testToken = "synthetic-test-token-DO-NOT-LEAK"
+
+var testCreds = &creds.Credentials{AccessToken: testToken}
 
 func fixedClock(t time.Time) func() time.Time {
 	return func() time.Time { return t }
@@ -46,7 +50,7 @@ func TestFetchOK(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, now)
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
@@ -113,7 +117,7 @@ func TestFetchParsesScopedLimits(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, now)
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -147,7 +151,7 @@ func TestFetchScopedLimitsAbsentLeavesWindowsNil(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, now)
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -175,7 +179,7 @@ func TestFetchDynamicScopedModels(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, now)
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -192,7 +196,7 @@ func TestFetchDynamicScopedModels(t *testing.T) {
 
 func TestFetchEmptyToken(t *testing.T) {
 	c := New()
-	_, err := c.Fetch(context.Background(), "")
+	_, err := c.Fetch(context.Background(), &creds.Credentials{})
 	if !errors.Is(err, ErrAuth) {
 		t.Fatalf("err = %v, want ErrAuth", err)
 	}
@@ -214,7 +218,7 @@ func TestFetchReportsDriftIndicators(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -247,7 +251,7 @@ func TestFetchEmptyPayloadFlagsDrift(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -263,7 +267,7 @@ func TestFetchCleanResponseHasNoDrift(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -282,7 +286,7 @@ func TestFetchGroupScopedOnlyPayloadFlagsEmptyDrift(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -301,7 +305,7 @@ func TestFetchEmptyExtraUsageFlagsEmptyDrift(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -317,7 +321,7 @@ func TestFetchLegacyOpusMissingResetsFlagsDrift(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -342,7 +346,7 @@ func TestFetchShadowedLegacyOpusNotFlagged(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	snap, err := c.Fetch(context.Background(), testToken)
+	snap, err := c.Fetch(context.Background(), testCreds)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -360,7 +364,7 @@ func TestFetchAuthErrors(t *testing.T) {
 			w.WriteHeader(status)
 		}))
 		c := newTestClient(t, srv, time.Now())
-		_, err := c.Fetch(context.Background(), testToken)
+		_, err := c.Fetch(context.Background(), testCreds)
 		if !errors.Is(err, ErrAuth) {
 			t.Errorf("status %d: err = %v, want ErrAuth", status, err)
 		}
@@ -377,7 +381,7 @@ func TestFetchRateLimitedSeconds(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	_, err := c.Fetch(context.Background(), testToken)
+	_, err := c.Fetch(context.Background(), testCreds)
 	if !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("err = %v, want ErrRateLimited", err)
 	}
@@ -401,7 +405,7 @@ func TestFetchRateLimitedHTTPDate(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, now)
-	_, err := c.Fetch(context.Background(), testToken)
+	_, err := c.Fetch(context.Background(), testCreds)
 	var rle *RateLimitError
 	if !errors.As(err, &rle) {
 		t.Fatalf("err = %v, want *RateLimitError", err)
@@ -418,7 +422,7 @@ func TestFetchRateLimitedNoHeader(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	_, err := c.Fetch(context.Background(), testToken)
+	_, err := c.Fetch(context.Background(), testCreds)
 	var rle *RateLimitError
 	if !errors.As(err, &rle) {
 		t.Fatalf("err = %v, want *RateLimitError", err)
@@ -434,7 +438,7 @@ func TestFetchServerErrorsTransient(t *testing.T) {
 			w.WriteHeader(status)
 		}))
 		c := newTestClient(t, srv, time.Now())
-		_, err := c.Fetch(context.Background(), testToken)
+		_, err := c.Fetch(context.Background(), testCreds)
 		if !errors.Is(err, ErrTransient) {
 			t.Errorf("status %d: err = %v, want ErrTransient", status, err)
 		}
@@ -449,7 +453,7 @@ func TestFetchMalformedJSON(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, time.Now())
-	_, err := c.Fetch(context.Background(), testToken)
+	_, err := c.Fetch(context.Background(), testCreds)
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("err = %v, want ErrTransient for malformed JSON", err)
 	}
@@ -462,7 +466,7 @@ func TestFetchNetworkErrorTransient(t *testing.T) {
 	srv.Close()
 
 	c := New(WithEndpoint(url), WithHTTPClient(client))
-	_, err := c.Fetch(context.Background(), testToken)
+	_, err := c.Fetch(context.Background(), testCreds)
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("err = %v, want ErrTransient for network failure", err)
 	}
@@ -478,7 +482,7 @@ func TestFetchContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	c := newTestClient(t, srv, time.Now())
-	_, err := c.Fetch(ctx, testToken)
+	_, err := c.Fetch(ctx, testCreds)
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("err = %v, want ErrTransient for canceled context", err)
 	}
@@ -508,8 +512,8 @@ func TestParseRetryAfter(t *testing.T) {
 		{now.Add(-60 * time.Second).UTC().Format(http.TimeFormat), 0},
 	}
 	for _, tc := range cases {
-		if got := parseRetryAfter(tc.in, now); got != tc.want {
-			t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
+		if got := ParseRetryAfter(tc.in, now); got != tc.want {
+			t.Errorf("ParseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }

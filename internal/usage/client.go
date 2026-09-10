@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seosd97/cc-token-exposer/internal/creds"
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
@@ -94,10 +95,11 @@ func New(opts ...Option) *Client {
 	return c
 }
 
-func (c *Client) Fetch(ctx context.Context, token string) (*FetchedSnapshot, error) {
-	if token == "" {
+func (c *Client) Fetch(ctx context.Context, cr *creds.Credentials) (*FetchedSnapshot, error) {
+	if cr == nil || cr.AccessToken == "" {
 		return nil, fmt.Errorf("%w: empty token", ErrAuth)
 	}
+	token := cr.AccessToken
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
 	if err != nil {
@@ -124,7 +126,7 @@ func (c *Client) Fetch(ctx context.Context, token string) (*FetchedSnapshot, err
 		return nil, fmt.Errorf("%w (status %d)", ErrAuth, resp.StatusCode)
 	case http.StatusTooManyRequests:
 		return nil, &RateLimitError{
-			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), c.now()),
+			RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After"), c.now()),
 			StatusCode: resp.StatusCode,
 		}
 	default:
@@ -224,7 +226,7 @@ func decodeScopedLimits(limits []limitEntry) map[string]*schema.Window {
 	return m
 }
 
-func parseRetryAfter(v string, now time.Time) time.Duration {
+func ParseRetryAfter(v string, now time.Time) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0

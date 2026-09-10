@@ -14,6 +14,11 @@ const (
 )
 
 const (
+	ProviderClaude = "claude"
+	ProviderCodex  = "codex"
+)
+
+const (
 	SourceOAuth      = "oauth"
 	SourceCache      = "cache"
 	SourceTranscript = "transcript"
@@ -81,6 +86,7 @@ type LimitHit struct {
 
 type State struct {
 	SchemaVersion int        `json:"schema_version"`
+	Provider      string     `json:"provider,omitempty"`
 	Type          string     `json:"type"`
 	Source        string     `json:"source"`
 	Stale         bool       `json:"stale"`
