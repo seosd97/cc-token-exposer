@@ -16,8 +16,6 @@ import (
 
 var baseTime = time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 
-// --- fakes -----------------------------------------------------------------
-
 type fakeClock struct{ t time.Time }
 
 func (c *fakeClock) Now() time.Time { return c.t }
@@ -127,8 +125,6 @@ type fakeTranscript struct {
 
 func (f *fakeTranscript) Probe(time.Time) (*schema.LimitHit, error) { return f.lh, nil }
 
-// --- helpers ---------------------------------------------------------------
-
 func okCreds(token string) *fakeCreds {
 	return &fakeCreds{results: []credResult{{c: &creds.Credentials{AccessToken: token}}}}
 }
@@ -166,13 +162,11 @@ func resolve(t *testing.T, o engine.Options) *schema.State {
 	return st
 }
 
-// --- tests -----------------------------------------------------------------
-
 func TestFreshCacheServedWithoutFetch(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cache := &fakeCache{
 		payload:  mustMarshal(t, snapWith(23, baseTime.Add(time.Hour))),
-		storedAt: baseTime.Add(-30 * time.Second), // within 120s TTL
+		storedAt: baseTime.Add(-30 * time.Second),
 		has:      true,
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
@@ -197,7 +191,7 @@ func TestStaleCacheTriggersFetchAndStore(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cache := &fakeCache{
 		payload:  mustMarshal(t, snapWith(10, baseTime.Add(time.Hour))),
-		storedAt: baseTime.Add(-10 * time.Minute), // older than TTL
+		storedAt: baseTime.Add(-10 * time.Minute),
 		has:      true,
 	}
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
@@ -225,7 +219,6 @@ func TestReconcileGuardRetainsSuspectValue(t *testing.T) {
 		storedAt: baseTime.Add(-10 * time.Minute),
 		has:      true,
 	}
-	// Fresh value drops 40 points within the same (not-yet-reset) window.
 	fetch := &fakeFetcher{fn: func(string) (*schema.Snapshot, error) {
 		return snapWith(40, reset), nil
 	}}
@@ -473,8 +466,6 @@ func TestStdinCompleteSnapshotServedNoIO(t *testing.T) {
 	if st.Snapshot.ScopedLimits["Fable"] == nil || st.Snapshot.ScopedLimits["Fable"].Utilization != 55 {
 		t.Fatalf("Fable = %+v, want stdin value 55 to win over cached 40", st.Snapshot.ScopedLimits["Fable"])
 	}
-	// The fable alias is a wire-level concern: it must appear when the State is
-	// marshaled to JSON, not as a struct field.
 	b, err := json.Marshal(st.Snapshot)
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
@@ -504,11 +495,9 @@ func TestStdinMissingCachedScopedModelSpawnsRefresh(t *testing.T) {
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
 	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
 
-	// The parent must never fetch: it claims a slot and spawns the refresher.
 	if ref.spawns != 1 || len(fetch.calls) != 0 || cache.claims != 1 {
 		t.Fatalf("expected one claim+spawn and no parent fetch, got spawn=%d fetch=%d claims=%d", ref.spawns, len(fetch.calls), cache.claims)
 	}
-	// This tick honestly serves the stale cached Fable until the child lands.
 	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 40 {
 		t.Fatalf("Fable = %+v, want cached 40 until the detached refresh lands", f)
 	}
@@ -519,7 +508,6 @@ func TestStdinMissingCachedScopedModelSpawnsRefresh(t *testing.T) {
 		t.Fatalf("stdin must still win for the windows it carries: %+v", st.Snapshot)
 	}
 
-	// Model the detached refresher completing: it stores the fetched snapshot.
 	if err := cache.Store(engine.CacheEntry{
 		Payload:      mustMarshal(t, fetched),
 		StoredAt:     clk.Now(),
@@ -527,7 +515,7 @@ func TestStdinMissingCachedScopedModelSpawnsRefresh(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("model detached child store: %v", err)
 	}
-	cache.claimResult = false // fetched_at is now fresh within the TTL
+	cache.claimResult = false
 	clk.t = baseTime.Add(3 * time.Second)
 	st = resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
 	if f := st.Snapshot.ScopedLimits["Fable"]; f == nil || f.Utilization != 62 {
@@ -593,7 +581,6 @@ func TestStdinWithoutCacheBootstrapsOnce(t *testing.T) {
 		t.Fatal("stdin-only serve should not be stale")
 	}
 
-	// Model the detached refresher completing, then the next tick.
 	if err := cache.Store(engine.CacheEntry{Payload: mustMarshal(t, fetched), StoredAt: clk.Now(), ScopedProbed: true}); err != nil {
 		t.Fatalf("model detached child store: %v", err)
 	}
@@ -641,7 +628,7 @@ func TestStdinGapsFilledFromFreshCacheNotStale(t *testing.T) {
 	}
 	cache := &fakeCache{
 		payload:      mustMarshal(t, cached),
-		storedAt:     baseTime.Add(-30 * time.Second), // within TTL
+		storedAt:     baseTime.Add(-30 * time.Second),
 		scopedProbed: true,
 		has:          true,
 	}
@@ -662,8 +649,6 @@ func TestStdinGapsFilledFromFreshCacheNotStale(t *testing.T) {
 	if st.Stale {
 		t.Fatal("cache within TTL should not mark the state stale")
 	}
-	// Incomplete stdin asks for a claim, but the fresh fetched_at means the
-	// real cache declines it — here the fake's claimResult=false models that.
 	if cache.claims != 1 || ref.spawns != 0 {
 		t.Fatalf("fresh-cache incomplete stdin should claim-but-not-spawn, got claims=%d spawn=%d", cache.claims, ref.spawns)
 	}
@@ -677,7 +662,7 @@ func TestStdinIncompleteClaimsRefreshSlot(t *testing.T) {
 	}
 	cache := &fakeCache{
 		payload:      mustMarshal(t, cached),
-		storedAt:     baseTime.Add(-10 * time.Minute), // stale
+		storedAt:     baseTime.Add(-10 * time.Minute),
 		scopedProbed: true,
 		claimResult:  true,
 		has:          true,
@@ -844,8 +829,6 @@ func TestStdinClaimFalseThrottlesSpawn(t *testing.T) {
 	stdin := snapWith(18, baseTime.Add(time.Hour))
 
 	resolveStdin(t, o, stdin)
-	// A second tick while the claim is still outstanding (cache says no slot)
-	// must not spawn again.
 	cache.claimResult = false
 	clk.t = baseTime.Add(3 * time.Second)
 	resolveStdin(t, o, stdin)
@@ -853,7 +836,6 @@ func TestStdinClaimFalseThrottlesSpawn(t *testing.T) {
 		t.Fatalf("an unelapsed claim must throttle re-spawn, got spawn=%d, want 1", ref.spawns)
 	}
 
-	// Once the claim elapses, an incomplete stdin re-spawns.
 	cache.claimResult = true
 	clk.t = baseTime.Add(3*time.Second + engine.DefaultTTL)
 	resolveStdin(t, o, stdin)
@@ -867,7 +849,7 @@ func TestStdinScopedEmptyIsIncompleteAndSpawnsRefresh(t *testing.T) {
 	cached := snapWith(99, baseTime.Add(time.Hour))
 	cache := &fakeCache{
 		payload:     mustMarshal(t, cached),
-		storedAt:    baseTime.Add(-10 * time.Minute), // stale
+		storedAt:    baseTime.Add(-10 * time.Minute),
 		claimResult: true,
 		has:         true,
 	}
@@ -893,14 +875,11 @@ func TestStdinScopedEmptyIsIncompleteAndSpawnsRefresh(t *testing.T) {
 }
 
 func TestStdinResetlessWindowIsIncompleteAndBackfilled(t *testing.T) {
-	// CC can pipe five_hour utilization with no usable resets_at; the served
-	// line must borrow the cached reset, and the gate must open the bounded
-	// refresh so the gap heals.
 	clk := &fakeClock{t: baseTime}
 	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
 	cache := &fakeCache{
 		payload:      mustMarshal(t, cached),
-		storedAt:     baseTime.Add(-30 * time.Second), // within TTL
+		storedAt:     baseTime.Add(-30 * time.Second),
 		scopedProbed: true,
 		claimResult:  true,
 		has:          true,
@@ -912,7 +891,7 @@ func TestStdinResetlessWindowIsIncompleteAndBackfilled(t *testing.T) {
 	ref := &fakeRefresher{}
 
 	stdin := fullSnap(18, 41, baseTime.Add(time.Hour))
-	stdin.FiveHour.ResetsAt = time.Time{} // resets_at: null on the wire
+	stdin.FiveHour.ResetsAt = time.Time{}
 	st := resolveStdin(t, engine.Options{Clock: clk, Creds: okCreds("tok"), Fetcher: fetch, Cache: cache, Refresher: ref}, stdin)
 
 	if ref.spawns != 1 || cache.claims != 1 {
@@ -930,13 +909,11 @@ func TestStdinResetlessWindowIsIncompleteAndBackfilled(t *testing.T) {
 }
 
 func TestStdinElapsedResetIsIncompleteAndHeals(t *testing.T) {
-	// Right after a window reset CC keeps piping the previous (elapsed)
-	// resets_at; the line keeps its countdown via the cache and a refresh heals.
 	clk := &fakeClock{t: baseTime}
 	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
 	cache := &fakeCache{
 		payload:      mustMarshal(t, cached),
-		storedAt:     baseTime.Add(-10 * time.Minute), // stale
+		storedAt:     baseTime.Add(-10 * time.Minute),
 		scopedProbed: true,
 		claimResult:  true,
 		has:          true,
@@ -963,8 +940,6 @@ func TestStdinElapsedResetIsIncompleteAndHeals(t *testing.T) {
 }
 
 func TestStdinResetlessWindowNeedsNoHealWhenCacheLacksIt(t *testing.T) {
-	// A probed cache without the window means the API reports none — nothing
-	// to heal, so the refresh loop stays closed.
 	clk := &fakeClock{t: baseTime}
 	cached := fullSnap(99, 30, baseTime.Add(time.Hour))
 	cached.FiveHour = nil
@@ -1003,9 +978,6 @@ func TestErrorStateCarriesNoSnapshot(t *testing.T) {
 	}
 }
 
-// Wire-drift indicators ride the live fetch into the State and persist
-// through the cache, so a later fresh-cache serve still reports last-seen
-// drift instead of silently dropping it.
 func TestDriftIndicatorsRideLiveFetchAndCache(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	const wantDrift = "five_hour missing resets_at"
@@ -1050,8 +1022,6 @@ func TestNoDriftOnCleanFetch(t *testing.T) {
 	}
 }
 
-// A stale-cache serve after a failed fetch still reports the drift persisted
-// by the last successful fetch.
 func TestStaleCacheServeCarriesPersistedDrift(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	const wantDrift = "seven_day missing resets_at"
@@ -1074,8 +1044,6 @@ func TestStaleCacheServeCarriesPersistedDrift(t *testing.T) {
 	}
 }
 
-// A clean fetch stores no drift, so previously persisted indicators clear
-// instead of lingering in the cache.
 func TestCleanFetchClearsPersistedDrift(t *testing.T) {
 	clk := &fakeClock{t: baseTime}
 	cache := &fakeCache{

@@ -29,8 +29,9 @@ housekeeping.**
   (download the matching release archive, verify its SHA-256 against
   `checksums.txt`, atomically replace the running binary). `--check` only
   reports whether a newer version exists. Homebrew installs defer to
-  `brew upgrade`. This is a *binary* update; it never touches OAuth
-  credentials (unrelated to invariant #3's "no self refresh").
+  `brew upgrade`. A dev build (unparseable version) counts as older than
+  any release, so it always updates. This is a *binary* update; it never
+  touches OAuth credentials (unrelated to invariant #3's "no self refresh").
 
 Removed from v1 after working implementations existed (preserved in git
 history, planned to return in v2): `ccx watch` (NDJSON polling stream),
@@ -47,7 +48,11 @@ cmd/ccx/main.go      composition root: builds the ONE production engine and
                      spawner) and the embedded release-signature public key
 cmd/ccx/now.go       rendering + exit-code policy
 cmd/ccx/statusline.go  statusline formatting + stdin rate_limits parsing
-                     (rate_limits -> schema.Snapshot -> engine.ResolveStdin)
+                     (rate_limits -> schema.Snapshot -> engine.ResolveStdin).
+                     Stdin is read only when it is not a terminal, so a manual
+                     run never blocks. Colors are alert-only: none below 60%,
+                     muted yellow from 60%, muted red above 85%; a stale line
+                     renders all gray; NO_COLOR yields plain text.
 cmd/ccx/refresh.go   hidden `ccx refresh` (internal): runs the ladder once,
                      discards the State — the detached statusline refresher
 cmd/ccx/update.go    self-update command (thin) over internal/selfupdate
@@ -60,6 +65,8 @@ internal/
                key) -> VerifyChecksum (checksums.txt) -> ExtractBinary
                (tar.gz) -> Apply (atomic rename over os.Executable). Stdlib
                only; injectable http client + apiBase + platform for tests.
+               Archive names follow goreleaser's `ccx_<os>_<arch>.tar.gz`
+               template; checksums.txt lines are `<sha256>  <name>`.
   engine/      THE BRAIN. Resolve(ctx) and ResolveStdin(ctx, snap) ->
                *schema.State, runs the degrade ladder. Depends only on 6
                consumer-side interfaces it defines:
@@ -100,7 +107,10 @@ internal/
                ClaimRefresh(now, backoff) atomically claims a refresh slot
                (check-and-set of attempted_at under the write lock, keyed off
                the later of fetched_at/attempted_at), returning whether the
-               caller may spawn a refresher.
+               caller may spawn a refresher. Load stat-checks the file before
+               taking the flock, so a cold start with no cache file is a miss
+               without locking; readEntryLocked/writeEntryLocked run only
+               under a held flock (the Locked suffix is the contract).
   transcript/  last-resort fallback: parses limit-hit messages from
                ~/.claude/projects/**/*.jsonl (read-only, best-effort).
                FindTranscripts keeps only the k newest files via a bounded
@@ -258,8 +268,9 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
 - statusline stdin: Claude Code pipes session JSON. A `rate_limits` field
   appears intermittently across versions (#40094); when present it is parsed
   tolerantly (`used_percentage` or `utilization`; resets_at as ISO string or
-  epoch) into a usage.Snapshot and fed to `engine.ResolveStdin`. Never depend
-  on it. Confirmed shape (CC 2.1.217): `five_hour` / `seven_day` /
+  epoch seconds, or milliseconds when large) into a usage.Snapshot and fed
+  to `engine.ResolveStdin`. Never depend on it. Confirmed shape (CC
+  2.1.217): `five_hour` / `seven_day` /
   `seven_day_oauth_apps` / `seven_day_opus` / `seven_day_sonnet` windows,
   `model_scoped: [{display_name, utilization|null, resets_at ISO|null}]`
   (projected by CC from the server limits[] overage-included-models
@@ -271,26 +282,31 @@ terminates the loop instead of polling forever. Both paths share the flock'd cac
   backfills Opus); sonnet/oauth_apps/extra_usage are ignored, consistent
   with the API path.
 - Local limit-hit signal: when a limit is hit, Claude Code writes a synthetic
-  transcript message (`isApiErrorMessage: true`, text like
+  transcript message (`isApiErrorMessage: true`; its content is a plain
+  string or an array of typed text blocks; text like
   "You've hit your session limit · resets 4:50pm (Asia/Seoul)"). The
   transcript probe parses the reset time (am/pm, explicit IANA tz honored,
   rolled forward to the future).
 
 ## Comment policy
 
-**Comments are forbidden.** The code must be readable enough to stand alone;
-design rationale, invariants, and external constraints live in this file
-(AGENT.md), not in code.
+**No comments.** The code must stand alone: names, types, structure,
+subtests, and test failure messages carry the meaning; design rationale,
+invariants, contracts, and external constraints live in this file
+(AGENT.md), not in code. A comment that merely describes what code does —
+package docs, godocs, inline notes, section separators, labels on magic
+values, test scenario notes — is deleted on sight, in production code and
+tests alike. The repo is swept clean; keep it that way.
 
-Two narrow exceptions:
+The only `//` lines allowed are compiler and tool directives (`//go:build`,
+`//go:embed`, `//go:generate`, `//nolint`). When something genuinely needs
+explaining, do one of these instead of writing a comment:
 
-- A one-line package comment on each package.
-- A concise godoc (1–2 lines) on shared util/helper functions whose behavior
-  is not fully visible in the signature — parsers, formatters, and the like
-  (e.g. `parseRetryAfter`, `ParseReset`, `humanizeDuration`). Domain and flow
-  functions, types, fields, constants, and errors get no comment.
-
-Test files may keep short scenario notes (they document expected behavior).
+- Encode a contract in the name or the type (`readEntryLocked` for "caller
+  holds the flock").
+- Put a test's scenario in its name, a subtest name, or the failure message.
+- Record the rationale, invariant, or wire fact in the relevant section of
+  this file.
 
 ## Development
 
@@ -503,3 +519,13 @@ go vet ./... && gofmt -l .
   (`internal/usage/live_test.go`, skipped unless `CCX_LIVE_TOKEN` is set, one
   API call per run) is the sanctioned way to check the real shape; a
   dispatch-only workflow and golden fixtures are deferred (see Roadmap).
+- comments are gone entirely, not merely discouraged: the policy's exceptions
+  (package one-liners, short helper godocs, test scenario notes) kept
+  attracting descriptive comments that duplicated names and drifted from the
+  code. The repo was swept with a go/scanner-based strip that keeps only
+  compiler/tool directives, the two flock-precondition helpers became
+  `readEntryLocked`/`writeEntryLocked` so the contract lives in the name, and
+  every rationale the stripped comments carried now lives in this file (color
+  thresholds, stdin terminal skip, cache stat pre-check, goreleaser naming,
+  dev-build update rule, transcript content shapes). Tests express their
+  scenario through names and failure messages.

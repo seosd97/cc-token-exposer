@@ -1,4 +1,3 @@
-// Package cache is a file-backed, flock-protected store for one opaque JSON payload.
 package cache
 
 import (
@@ -56,26 +55,21 @@ func (c *Cache) Store(payload json.RawMessage, fetchedAt time.Time, scopedProbed
 		return errors.New("cache: payload is not valid JSON")
 	}
 	return c.withWriteLock(func() error {
-		return c.writeEntry(Entry{FetchedAt: fetchedAt, ScopedProbed: scopedProbed, Drift: drift, Payload: payload})
+		return c.writeEntryLocked(Entry{FetchedAt: fetchedAt, ScopedProbed: scopedProbed, Drift: drift, Payload: payload})
 	})
 }
 
-// ClaimRefresh atomically claims a refresh slot: it records an attempt at now
-// only when the last attempt (the later of fetched_at and attempted_at) is
-// absent or older than backoff, reporting whether a slot was claimed. The
-// check-and-set runs under the write flock, so concurrent claimants across
-// processes are deduplicated.
 func (c *Cache) ClaimRefresh(now time.Time, backoff time.Duration) (bool, error) {
 	var claimed bool
 	err := c.withWriteLock(func() error {
-		e, err := c.readEntry()
+		e, err := c.readEntryLocked()
 		if err != nil {
 			if !errors.Is(err, ErrMiss) {
 				return err
 			}
 			claimed = true
 			at := now
-			return c.writeEntry(Entry{AttemptedAt: &at, Payload: json.RawMessage("null")})
+			return c.writeEntryLocked(Entry{AttemptedAt: &at, Payload: json.RawMessage("null")})
 		}
 		last := e.FetchedAt
 		if e.AttemptedAt != nil && e.AttemptedAt.After(last) {
@@ -87,14 +81,12 @@ func (c *Cache) ClaimRefresh(now time.Time, backoff time.Duration) (bool, error)
 		claimed = true
 		at := now
 		e.AttemptedAt = &at
-		return c.writeEntry(*e)
+		return c.writeEntryLocked(*e)
 	})
 	return claimed, err
 }
 
 func (c *Cache) Load() (*Entry, error) {
-	// A stat pre-check lets the cold-start hot path (no cache file at all)
-	// skip the flock entirely and return a miss fast.
 	if _, err := os.Stat(c.path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrMiss
@@ -108,7 +100,7 @@ func (c *Cache) Load() (*Entry, error) {
 	}
 	defer func() { _ = lock.Unlock() }()
 
-	return c.readEntry()
+	return c.readEntryLocked()
 }
 
 func (c *Cache) withWriteLock(fn func() error) error {
@@ -123,9 +115,7 @@ func (c *Cache) withWriteLock(fn func() error) error {
 	return fn()
 }
 
-// readEntry reads and decodes the on-disk entry without locking; callers must
-// already hold the appropriate flock.
-func (c *Cache) readEntry() (*Entry, error) {
+func (c *Cache) readEntryLocked() (*Entry, error) {
 	f, err := os.Open(c.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -147,9 +137,7 @@ func (c *Cache) readEntry() (*Entry, error) {
 	return &e, nil
 }
 
-// writeEntry atomically replaces the cache file with e; callers must already
-// hold the write flock and have ensured the parent directory exists.
-func (c *Cache) writeEntry(e Entry) error {
+func (c *Cache) writeEntryLocked(e Entry) error {
 	dir := filepath.Dir(c.path)
 	data, err := json.Marshal(e)
 	if err != nil {

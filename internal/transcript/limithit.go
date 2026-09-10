@@ -1,4 +1,3 @@
-// Package transcript detects session-limit events in Claude Code's local JSONL transcripts.
 package transcript
 
 import (
@@ -30,9 +29,6 @@ var limitRe = regexp.MustCompile(`(?i)\bsession limit\b`)
 
 var tzRe = regexp.MustCompile(`\(([A-Za-z]+(?:/[A-Za-z0-9_+\-]+)+)\)`)
 
-// ParseReset parses a "resets H[:MM]am/pm" clock time out of text and resolves
-// it to the next future instant in loc relative to ref, rolling forward one day
-// if needed; an explicit "(Area/City)" timezone annotation overrides loc.
 func ParseReset(text string, ref time.Time, loc *time.Location) (time.Time, bool) {
 	if loc == nil {
 		loc = time.Local
@@ -116,10 +112,6 @@ func ScanFile(path string, now time.Time, loc *time.Location) (*LimitHit, error)
 	return ScanReader(f, now, loc)
 }
 
-// scanTail reads the last tailChunkBytes of a file and scans only that region,
-// skipping the partial leading line. A limit-hit message is appended near the
-// end of a transcript, so this covers the common case without reading the whole
-// file; ScanFile falls back to a full scan when the tail finds nothing.
 func scanTail(f *os.File, size int64, now time.Time, loc *time.Location) (*LimitHit, error) {
 	off := size - tailChunkBytes
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
@@ -137,10 +129,6 @@ func scanTail(f *os.File, size int64, now time.Time, loc *time.Location) (*Limit
 	return ScanReader(bytes.NewReader(data), now, loc)
 }
 
-// ScanLatest scans files (newest first) and returns the limit hit with the
-// newest DetectedAt. It stops as soon as a file can no longer contain a newer
-// hit: a hit's timestamp never exceeds the mtime of the file holding it, so a
-// file whose mtime is no later than the newest hit found so far can be skipped.
 func ScanLatest(files []TranscriptFile, now time.Time, loc *time.Location) (*LimitHit, error) {
 	var latest *LimitHit
 	for _, f := range files {
@@ -192,8 +180,6 @@ func detectLine(raw []byte, now time.Time, loc *time.Location) *LimitHit {
 	return hit
 }
 
-// messageText extracts the text of a transcript message, whose content may be
-// a plain string or an array of typed blocks; returns "" when neither.
 func messageText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""

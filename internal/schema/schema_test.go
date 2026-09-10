@@ -63,7 +63,6 @@ func TestStateJSONShape(t *testing.T) {
 			t.Fatalf("missing key %q in %s", k, b)
 		}
 	}
-	// Optional fields absent when empty.
 	if _, ok := generic["stale_age"]; ok {
 		t.Fatalf("stale_age should be omitted when nil")
 	}
@@ -79,10 +78,6 @@ func TestSuspectOmittedWhenFalse(t *testing.T) {
 	}
 }
 
-// TestSnapshotMarshalEmitsAliases guards the wire contract: legacy
-// seven_day_opus / seven_day_fable aliases must be emitted from ScopedLimits at
-// marshal time (only for those two models), and must round-trip through the
-// Snapshot type without leaking into internal state.
 func TestSnapshotMarshalEmitsAliases(t *testing.T) {
 	reset := time.Date(2026, 6, 12, 16, 0, 0, 0, time.UTC)
 	s := &Snapshot{

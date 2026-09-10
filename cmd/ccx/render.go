@@ -108,8 +108,6 @@ func staleSuffix(st *schema.State) string {
 	return " (" + humanizeDuration(time.Duration(*st.StaleAge)) + " old)"
 }
 
-// humanizeDuration formats a duration like "4h12m", "3d5h", "45s"; non-positive
-// durations render as "now".
 func humanizeDuration(d time.Duration) string {
 	if d <= 0 {
 		return "now"

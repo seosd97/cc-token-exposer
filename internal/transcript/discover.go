@@ -21,9 +21,6 @@ type TranscriptFile struct {
 	ModTime time.Time
 }
 
-// minModHeap keeps the newest k files seen during a traversal, evicting the
-// oldest on overflow; a bounded heap avoids collecting and sorting every
-// transcript in the tree (which can be large on long-lived machines).
 type minModHeap []TranscriptFile
 
 func (h minModHeap) Len() int           { return len(h) }
@@ -38,8 +35,6 @@ func (h *minModHeap) Pop() any {
 	return item
 }
 
-// FindTranscripts returns the k most recently modified *.jsonl files under
-// projectsDir, newest first. k <= 0 collects everything.
 func FindTranscripts(projectsDir string, k int) ([]TranscriptFile, error) {
 	var h minModHeap
 

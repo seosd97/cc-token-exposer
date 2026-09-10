@@ -5,9 +5,6 @@ import (
 	"strings"
 )
 
-// IsNewer reports whether release version latest is strictly greater than the
-// installed version current; an unparseable current (e.g. a "dev" build) is
-// treated as older than any real release.
 func IsNewer(latest, current string) bool {
 	return compare(latest, current) > 0
 }

@@ -30,7 +30,6 @@ func TestKeychainParsesBlob(t *testing.T) {
 }
 
 func TestKeychainItemNotFound(t *testing.T) {
-	// Produce a real *exec.ExitError with code 44.
 	notFound := exec.Command("/bin/sh", "-c", "exit 44").Run()
 	src := &KeychainSource{
 		run: func(string) ([]byte, error) { return nil, notFound },

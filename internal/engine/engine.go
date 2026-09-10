@@ -1,4 +1,3 @@
-// Package engine resolves the current State via the degrade ladder.
 package engine
 
 import (
@@ -46,10 +45,6 @@ type Cache interface {
 	ClaimRefresh(now time.Time, backoff time.Duration) (bool, error)
 }
 
-// Refresher starts a detached background refresh of the shared disk cache. The
-// statusline path never blocks on the network: it claims a slot, spawns the
-// refresher, and serves immediately; the refresher updates the cache for
-// subsequent ticks.
 type Refresher interface {
 	Spawn(ctx context.Context) error
 }
@@ -139,9 +134,6 @@ func (e *Engine) Resolve(ctx context.Context) *schema.State {
 	return e.degradeNoData(now, schema.AuthOK, "usage fetch failed and no cache is available")
 }
 
-// resolveToken resolves usable credentials, re-reading once when the first read
-// is expired. Returns (nil, AuthMissing) with no token and (nil, AuthExpired)
-// when an expired token can't be replaced by a re-read.
 func (e *Engine) resolveToken(now time.Time) (*creds.Credentials, schema.AuthStatus) {
 	cr, err := e.creds.Resolve()
 	if err != nil || cr == nil || cr.AccessToken == "" {
@@ -156,9 +148,6 @@ func (e *Engine) resolveToken(now time.Time) (*creds.Credentials, schema.AuthSta
 	return cr, schema.AuthOK
 }
 
-// fetchWithToken fetches a snapshot, retrying once with a fresh token on a 401
-// if Claude Code has rotated it meanwhile. It returns the original error when
-// the retry is not applicable or also fails.
 func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now time.Time) (*usage.FetchedSnapshot, error) {
 	snap, err := e.fetcher.Fetch(ctx, cr.AccessToken)
 	if err == nil || !errors.Is(err, usage.ErrAuth) {
@@ -173,18 +162,6 @@ func (e *Engine) fetchWithToken(ctx context.Context, cr *creds.Credentials, now 
 	return snap, err
 }
 
-// ResolveStdin serves a snapshot piped in by Claude Code's statusline, overlaid
-// on the disk cache. Stdin counts as incomplete while it misses any window the
-// cache carries — crucially a scoped model CC's projection omits, like Fable —
-// or carries a cached window without a still-future reset time (CC pipes
-// null or lagging resets_at), or while no probed cache exists to judge
-// against, so those gaps heal instead of freezing. When incomplete, it claims
-// a refresh slot (claim + spawn are atomic and deduped against concurrent
-// invocations via the cache flock), spawns the detached refresher, and serves
-// the overlay immediately — the statusline path never blocks on the network.
-// A spawn failure falls back to one bounded synchronous refresh. No suspect
-// guard runs here — the statusline mirrors Claude Code's own values; the guard
-// and its marker live on the ladder.
 func (e *Engine) ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *schema.State {
 	if stdin == nil {
 		return e.Resolve(ctx)
@@ -213,9 +190,6 @@ func (e *Engine) ResolveStdin(ctx context.Context, stdin *schema.Snapshot) *sche
 	return snapshotState(merged, schema.SourceStdin, stale, age, schema.AuthOK)
 }
 
-// refreshSnapshot performs a best-effort fresh fetch, reconciles it against the
-// cached snapshot, stores the result, and returns it. Returns nil on any
-// failure (missing ports, no usable credentials, fetch error).
 func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap *schema.Snapshot) *schema.Snapshot {
 	if e.creds == nil || e.fetcher == nil {
 		return nil
@@ -235,13 +209,6 @@ func (e *Engine) refreshSnapshot(ctx context.Context, now time.Time, cachedSnap 
 	return merged
 }
 
-// stdinComplete reports whether stdin covers every window the cache knows:
-// present AND carrying a still-future reset time — a null, missing or already
-// elapsed resets_at leaves the served countdown missing, which is a gap the
-// bounded refresh must heal. Without a probed cache it stays incomplete so the
-// first tick bootstraps one: that seeds the cache (and surfaces scoped models
-// CC never pipes), and the cache without scoped limits then proves the plan
-// has none — ending the loop.
 func stdinComplete(s, base *schema.Snapshot, probed bool, now time.Time) bool {
 	if s == nil || base == nil {
 		return false
@@ -266,9 +233,6 @@ func stdinComplete(s, base *schema.Snapshot, probed bool, now time.Time) bool {
 	return true
 }
 
-// coversWindow reports whether the stdin window fully covers what the cache
-// reports for one window: the cache side absent, or the stdin side present
-// with a still-future reset time.
 func coversWindow(stdinW, baseW *schema.Window, now time.Time) bool {
 	if baseW == nil {
 		return true

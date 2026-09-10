@@ -11,9 +11,6 @@ import (
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
-// Live smoke against the real endpoint. Skipped unless CCX_LIVE_TOKEN is set;
-// the live-smoke workflow (manual dispatch only) injects it from a repo
-// secret, so regular CI and local `go test ./...` never touch the API.
 func TestLiveSmoke(t *testing.T) {
 	token := os.Getenv("CCX_LIVE_TOKEN")
 	if token == "" {

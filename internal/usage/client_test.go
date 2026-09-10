@@ -10,8 +10,6 @@ import (
 	"time"
 )
 
-// testToken is a synthetic, non-secret value used purely to assert it never
-// leaks into errors. It is not a real credential.
 const testToken = "synthetic-test-token-DO-NOT-LEAK"
 
 func fixedClock(t time.Time) func() time.Time {
@@ -27,9 +25,6 @@ func newTestClient(t *testing.T, srv *httptest.Server, now time.Time) *Client {
 	)
 }
 
-// sampleBody mirrors the live endpoint, which sends utilization as a JSON
-// float (e.g. 23.0) rather than an int (regression guard for the #5
-// live-checkpoint decode bug).
 const sampleBody = `{
   "five_hour":       {"utilization": 23.0, "resets_at": "2026-06-12T18:00:00Z"},
   "seven_day":       {"utilization": 41.0, "resets_at": "2026-06-18T00:00:00Z"},
@@ -56,7 +51,6 @@ func TestFetchOK(t *testing.T) {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
 
-	// Required headers.
 	if got := gotReq.Header.Get("Authorization"); got != "Bearer "+testToken {
 		t.Errorf("Authorization header = %q, want bearer token", got)
 	}
@@ -97,10 +91,6 @@ func TestFetchOK(t *testing.T) {
 	}
 }
 
-// scopedLimitsBody mirrors the current live endpoint, which no longer fills the
-// top-level seven_day_opus (it sends null) and instead carries per-model weekly
-// limits in a limits[] array keyed by scope.model.display_name. Fable has no
-// top-level field at all — limits[] is its only source.
 const scopedLimitsBody = `{
   "five_hour":      {"utilization": 19.0, "resets_at": "2026-07-06T07:19:59Z"},
   "seven_day":      {"utilization": 58.0, "resets_at": "2026-07-08T20:59:59Z"},
@@ -208,10 +198,6 @@ func TestFetchEmptyToken(t *testing.T) {
 	}
 }
 
-// driftBody simulates an endpoint whose shape has drifted: a five_hour window
-// that lost its reset time, a scoped entry that lost its display name, and a
-// model-scoped entry under an unknown kind. All three are indicators, but the
-// usable data must still decode.
 const driftBody = `{
   "five_hour": {"utilization": 23.0},
   "seven_day": {"utilization": 41.0, "resets_at": "2026-06-18T00:00:00Z"},
@@ -286,9 +272,6 @@ func TestFetchCleanResponseHasNoDrift(t *testing.T) {
 	}
 }
 
-// A payload whose only limits[] entries are group-scoped (scope: null) decodes
-// to zero usable windows even though the raw response is non-empty; the
-// empty-payload check must key off usable data, not field presence.
 func TestFetchGroupScopedOnlyPayloadFlagsEmptyDrift(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"limits": [
@@ -311,8 +294,6 @@ func TestFetchGroupScopedOnlyPayloadFlagsEmptyDrift(t *testing.T) {
 	}
 }
 
-// An empty extra_usage object is wire-present but carries no value, so a
-// response with only that must still flag the empty payload.
 func TestFetchEmptyExtraUsageFlagsEmptyDrift(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"extra_usage": {}}`))
@@ -329,9 +310,6 @@ func TestFetchEmptyExtraUsageFlagsEmptyDrift(t *testing.T) {
 	}
 }
 
-// A legacy seven_day_opus window that lost its reset time is backfilled into
-// ScopedLimits["Opus"] with a zero ResetsAt; the indicator must fire so the
-// silent degrade is detectable, without blocking the decode.
 func TestFetchLegacyOpusMissingResetsFlagsDrift(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"seven_day_opus": {"utilization": 10.0}}`))
@@ -351,9 +329,6 @@ func TestFetchLegacyOpusMissingResetsFlagsDrift(t *testing.T) {
 	}
 }
 
-// When limits[] carries an explicit Opus entry, the legacy seven_day_opus
-// field is not consumed (the backfill is skipped), so its missing reset time
-// is not an anomaly and must not be flagged.
 func TestFetchShadowedLegacyOpusNotFlagged(t *testing.T) {
 	body := `{
 	  "seven_day_opus": {"utilization": 10.0},
@@ -484,7 +459,7 @@ func TestFetchNetworkErrorTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	url := srv.URL
 	client := srv.Client()
-	srv.Close() // server is down: Do will fail at the transport layer.
+	srv.Close()
 
 	c := New(WithEndpoint(url), WithHTTPClient(client))
 	_, err := c.Fetch(context.Background(), testToken)
@@ -509,7 +484,6 @@ func TestFetchContextCanceled(t *testing.T) {
 	}
 }
 
-// assertNoTokenLeak ensures the token never appears in an error string.
 func assertNoTokenLeak(t *testing.T, err error) {
 	t.Helper()
 	if err != nil && strings.Contains(err.Error(), testToken) {
@@ -531,7 +505,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{" 30 ", 30 * time.Second},
 		{"not-a-number", 0},
 		{now.Add(60 * time.Second).UTC().Format(http.TimeFormat), 60 * time.Second},
-		{now.Add(-60 * time.Second).UTC().Format(http.TimeFormat), 0}, // past date
+		{now.Add(-60 * time.Second).UTC().Format(http.TimeFormat), 0},
 	}
 	for _, tc := range cases {
 		if got := parseRetryAfter(tc.in, now); got != tc.want {

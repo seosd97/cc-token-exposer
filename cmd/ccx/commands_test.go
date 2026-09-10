@@ -13,8 +13,6 @@ import (
 	"github.com/seosd97/cc-token-exposer/internal/schema"
 )
 
-// fakeResolver returns a canned State, exercising the full command path
-// (flags, rendering, exit codes) without any real IO.
 type fakeResolver struct {
 	st    *schema.State
 	stdin *schema.Snapshot
@@ -103,8 +101,6 @@ func TestNowJSONEmitsVersionedState(t *testing.T) {
 	}
 }
 
-// Drift indicators from the last live fetch render as a line in `now` output,
-// where the marker is visible.
 func TestNowRendersDriftIndicators(t *testing.T) {
 	st := snapshotState(47, 23, time.Now().UTC().Add(2*time.Hour))
 	st.Drift = []string{"five_hour missing resets_at", `unknown scoped limits kind "x"`}
@@ -144,7 +140,7 @@ func TestStatuslineUsesInjectedResolver(t *testing.T) {
 	cmd := newStatuslineCmd(&fakeResolver{st: st})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
-	cmd.SetIn(bytes.NewBufferString("{}")) // no rate_limits → engine path
+	cmd.SetIn(bytes.NewBufferString("{}"))
 	cmd.SetArgs(nil)
 
 	if err := cmd.Execute(); err != nil {
@@ -160,8 +156,6 @@ func TestStatuslineUsesInjectedResolver(t *testing.T) {
 }
 
 func TestStatuslinePipesStdinSnapshotToResolver(t *testing.T) {
-	// When stdin carries rate_limits, the parsed snapshot must reach the
-	// resolver's stdin path, not the fetch ladder.
 	t.Setenv("NO_COLOR", "1")
 	res := &fakeResolver{st: snapshotState(18, 0, time.Now().UTC().Add(2*time.Hour))}
 	cmd := newStatuslineCmd(res)
@@ -200,9 +194,6 @@ func TestStatuslineNoRateLimitsYieldsNilStdin(t *testing.T) {
 	}
 }
 
-// The statusline mirrors Claude Code's own displayed values, so drift markers
-// stay on the `now` path where they are visible (same rule as the suspect
-// guard); a drift-carrying state must not change the statusline output.
 func TestStatuslineOmitsDriftMarkers(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	st := snapshotState(47, 23, time.Now().UTC().Add(2*time.Hour))
@@ -222,8 +213,6 @@ func TestStatuslineOmitsDriftMarkers(t *testing.T) {
 }
 
 func TestStatuslineRendersScopedModelsFromStdin(t *testing.T) {
-	// Regression: model_scoped in stdin must survive to the rendered line
-	// through the real engine (previously dropped by the stdin shortcut).
 	t.Setenv("NO_COLOR", "1")
 	cmd := newStatuslineCmd(engine.New(engine.Options{}))
 	var out bytes.Buffer
@@ -243,7 +232,6 @@ func TestStatuslineRendersScopedModelsFromStdin(t *testing.T) {
 }
 
 func TestFormatStatuslineColorsByThreshold(t *testing.T) {
-	// Alert-only coloring: 91% → muted red, 72% → muted yellow.
 	now := time.Now().UTC()
 	st := snapshotState(91, 72, now.Add(2*time.Hour))
 
@@ -255,7 +243,6 @@ func TestFormatStatuslineColorsByThreshold(t *testing.T) {
 		t.Fatalf("missing yellow gauge for 72%%: %q", line)
 	}
 
-	// Healthy windows (<60%) get no alert color; only gray icon/label chrome.
 	calm := snapshotState(23, 41, now.Add(2*time.Hour))
 	line = formatStatusline(calm, now, true)
 	if strings.Contains(line, ansiRed) || strings.Contains(line, ansiYellow) {
@@ -265,7 +252,6 @@ func TestFormatStatuslineColorsByThreshold(t *testing.T) {
 		t.Fatalf("missing gray chrome with plain gauge: %q", line)
 	}
 
-	// Stale renders the whole line gray with no per-window colors.
 	st.Stale = true
 	line = formatStatusline(st, now, true)
 	if !strings.HasPrefix(line, ansiGray+"≈ ") {
@@ -275,7 +261,6 @@ func TestFormatStatuslineColorsByThreshold(t *testing.T) {
 		t.Fatalf("stale line should not keep window colors: %q", line)
 	}
 
-	// colored=false yields plain text only.
 	st.Stale = false
 	line = formatStatusline(st, now, false)
 	if strings.Contains(line, "\x1b[") {

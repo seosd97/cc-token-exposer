@@ -1,4 +1,3 @@
-// Package selfupdate replaces the running ccx binary with the latest GitHub release.
 package selfupdate
 
 import (
@@ -105,8 +104,6 @@ func New(owner, repo string, opts ...Option) *Client {
 	return c
 }
 
-// BinaryAsset is the release archive name for the client's platform,
-// e.g. "ccx_darwin_arm64.tar.gz" (matching the goreleaser name template).
 func (c *Client) BinaryAsset() string {
 	return fmt.Sprintf("%s_%s_%s.tar.gz", binaryName, c.goos, c.goarch)
 }
@@ -158,8 +155,6 @@ func (c *Client) get(ctx context.Context, url, accept string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes))
 }
 
-// VerifyChecksum confirms data's SHA-256 matches the entry for name in a
-// goreleaser checksums.txt ("<hex>␠␠<filename>" per line).
 func VerifyChecksum(data []byte, name string, checksums []byte) error {
 	want := ""
 	for _, line := range strings.Split(string(checksums), "\n") {
@@ -179,11 +174,6 @@ func VerifyChecksum(data []byte, name string, checksums []byte) error {
 	return nil
 }
 
-// VerifySignedChecksums confirms checksums carries a valid ed25519 signature
-// by the release public key: the .sig file holds base64(ed25519.Signature) of
-// the checksums bytes. This anchors trust beyond transit integrity — checksums
-// and archives come from the same release, so signature verification is what
-// stops a tampered release from installing arbitrary code.
 func VerifySignedChecksums(checksums, sig []byte, pub ed25519.PublicKey) error {
 	if len(pub) != ed25519.PublicKeySize {
 		return fmt.Errorf("selfupdate: invalid public key length %d", len(pub))
@@ -201,7 +191,6 @@ func VerifySignedChecksums(checksums, sig []byte, pub ed25519.PublicKey) error {
 	return nil
 }
 
-// ExtractBinary returns the ccx executable bytes from a .tar.gz release archive.
 func ExtractBinary(targz []byte) ([]byte, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(targz))
 	if err != nil {

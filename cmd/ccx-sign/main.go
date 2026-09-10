@@ -1,7 +1,3 @@
-// Command ccx-sign signs a checksums.txt with the release ed25519 key and
-// writes checksums.txt.sig (base64 signature). It runs only in the release
-// workflow; the binary itself is never shipped (goreleaser builds only
-// ./cmd/ccx). It is not part of the ccx CLI.
 package main
 
 import (

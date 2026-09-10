@@ -19,8 +19,6 @@ func paint(s, color string, on bool) string {
 	return color + s + ansiReset
 }
 
-// utilColor returns the alert color for a 0–100 utilization: "" below 60,
-// muted yellow from 60, muted red above 85.
 func utilColor(u float64) string {
 	switch {
 	case u > 85:
@@ -32,7 +30,6 @@ func utilColor(u float64) string {
 	}
 }
 
-// gauge renders a 0–100 utilization as a five-cell bar like "▮▮▯▯▯".
 func gauge(u float64) string {
 	filled := int(math.Round(u / 20))
 	if filled < 0 {

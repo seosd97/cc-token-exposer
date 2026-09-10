@@ -177,8 +177,6 @@ func (c *Client) decode(body io.Reader) (*FetchedSnapshot, error) {
 	return &FetchedSnapshot{Snapshot: snap, ScopedProbed: true, Drift: driftIndicators(&r, snap)}, nil
 }
 
-// driftIndicators lists wire-shape anomalies in a decoded response; they are
-// informational and never block the decode.
 func driftIndicators(r *apiResponse, snap *schema.Snapshot) []string {
 	var d []string
 	if snap.FiveHour == nil &&
@@ -226,8 +224,6 @@ func decodeScopedLimits(limits []limitEntry) map[string]*schema.Window {
 	return m
 }
 
-// parseRetryAfter interprets a Retry-After header (seconds or HTTP-date);
-// returns 0 when absent or unparseable.
 func parseRetryAfter(v string, now time.Time) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {

@@ -10,7 +10,6 @@ import (
 	"time"
 )
 
-// writeCredsFile writes a fixture credentials file with 0600 perms.
 func writeCredsFile(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -22,7 +21,6 @@ func writeCredsFile(t *testing.T, content string) string {
 }
 
 func TestFileSourceValid(t *testing.T) {
-	// expiresAt = 2026-06-12T12:00:00Z in epoch millis.
 	expMs := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC).UnixMilli()
 	content := `{"claudeAiOauth":{"accessToken":"tok-abc","refreshToken":"rt-ignored","expiresAt":` +
 		strconv.FormatInt(expMs, 10) + `,"scopes":["a"],"subscriptionType":"max"}}`
@@ -71,8 +69,6 @@ func TestFileSourceNoToken(t *testing.T) {
 }
 
 func TestFileSourceErrorDoesNotLeakToken(t *testing.T) {
-	// A type mismatch on a non-token field should still parse the structure
-	// without exposing the token; ensure error text carries no token.
 	path := writeCredsFile(t, `{"claudeAiOauth":{"accessToken":"leaky-token","expiresAt":"not-a-number"}}`)
 	src := &FileSource{Path: path}
 	_, err := src.Load()

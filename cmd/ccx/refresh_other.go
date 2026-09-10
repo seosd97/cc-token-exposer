@@ -7,8 +7,6 @@ import (
 	"errors"
 )
 
-// processRefresher is a no-op on platforms without Unix Setsid semantics; the
-// statusline path falls back to a synchronous refresh when spawning fails.
 type processRefresher struct{}
 
 func (processRefresher) Spawn(ctx context.Context) error {
